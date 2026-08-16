@@ -6,7 +6,7 @@ All example directories are ordinary Go packages. Build Lifeline once from the r
 go build -o ./bin/lifeline ./cmd/lifeline
 ```
 
-Then run any row below. A clean example prints `no lifecycle diagnostics`.
+Then run any row below. A clean example prints `no lifecycle diagnostics`, followed by a parenthetical noting how many cancel bindings, goroutines, and groups were actually checked — see `docs/limitations.md` for what that count does and does not cover.
 
 | Example | Expected result | Demonstrates |
 |---|---|---|

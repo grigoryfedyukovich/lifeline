@@ -116,7 +116,7 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 	start := time.Now()
-	diags, err := analyzePatterns(ctx, patterns, cfg)
+	diags, coverage, err := analyzePatterns(ctx, patterns, cfg)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			diags = append(diags, timeoutDiagnostic(cfg, time.Since(start)))
@@ -126,7 +126,7 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 		}
 	}
 	cwd, _ := os.Getwd()
-	if err := report.Write(stdout, cfg.Format, diags, cwd); err != nil {
+	if err := report.Write(stdout, cfg.Format, diags, coverage, cwd); err != nil {
 		fmt.Fprintf(stderr, "lifeline: render report: %v\n", err)
 		return ExitInternal
 	}

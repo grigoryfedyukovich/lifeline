@@ -55,10 +55,10 @@ type loadedPackage struct {
 	Info  *types.Info
 }
 
-func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, error) {
+func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, error) {
 	packages, err := listPackages(ctx, patterns)
 	if err != nil {
-		return nil, err
+		return nil, engine.Coverage{}, err
 	}
 	exports := map[string]string{}
 	for _, p := range packages {
@@ -72,7 +72,7 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 			continue
 		}
 		if p.Error != nil {
-			return nil, fmt.Errorf("package %s: %s", p.ImportPath, p.Error.Err)
+			return nil, engine.Coverage{}, fmt.Errorf("package %s: %s", p.ImportPath, p.Error.Err)
 		}
 		if len(p.GoFiles)+len(p.CgoFiles) == 0 {
 			continue
@@ -82,6 +82,7 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 	sort.Slice(roots, func(i, j int) bool { return roots[i].ImportPath < roots[j].ImportPath })
 	type packageResult struct {
 		diagnostics []engine.Diagnostic
+		coverage    engine.Coverage
 	}
 	results := make([]packageResult, len(roots))
 	workCtx, cancel := context.WithCancel(ctx)
@@ -128,22 +129,25 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 					return
 				}
 				results[i].diagnostics = engine.Analyze(program, cfg)
+				results[i].coverage = engine.Summarize(program)
 			}
 		}()
 	}
 	wg.Wait()
 
 	var all []engine.Diagnostic
+	var totalCoverage engine.Coverage
 	for i := range results {
 		all = append(all, results[i].diagnostics...)
+		totalCoverage = totalCoverage.Add(results[i].coverage)
 	}
 	if firstErr != nil {
-		return all, firstErr
+		return all, totalCoverage, firstErr
 	}
 	if err := ctx.Err(); err != nil {
-		return all, err
+		return all, totalCoverage, err
 	}
-	return all, nil
+	return all, totalCoverage, nil
 }
 
 func listPackages(ctx context.Context, patterns []string) ([]listedPackage, error) {

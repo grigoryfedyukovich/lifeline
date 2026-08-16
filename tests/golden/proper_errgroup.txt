@@ -1,1 +1,1 @@
-no lifecycle diagnostics
+no lifecycle diagnostics (checked 0 cancel binding(s), 0 goroutine(s), 1 group(s))

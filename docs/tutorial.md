@@ -95,7 +95,7 @@ Run it:
 Expected output:
 
 ```text
-no lifecycle diagnostics
+no lifecycle diagnostics (checked 0 cancel binding(s), 1 goroutine(s), 0 group(s))
 ```
 
 The accepted evidence is deliberately modest: Lifeline recognizes a `select` case that receives from `ctx.Done()` and returns. It does not prove that cancellation eventually occurs.
@@ -241,8 +241,10 @@ Run without configuration:
 Expected result:
 
 ```text
-no lifecycle diagnostics
+no lifecycle diagnostics (checked 0 cancel binding(s), 1 goroutine(s), 0 group(s))
 ```
+
+Note what the coverage figures do and do not tell you here: `0 cancel binding(s)` is not "checked and found compliant" — it means the recognizer never matched `ProjectWithCancel` as a cancel factory at all, so there was nothing to check. The `1 goroutine(s)` comes from the unrelated `go run(ctx)` call, which the recognizer does understand independent of any wrapper configuration. A nonzero coverage count in a function is not a signal that every relevant construct in it was found.
 
 Now declare the wrapper using its canonical package path:
 
@@ -293,6 +295,13 @@ Without configuration, the call is not assumed to start a worker:
 ```bash
 ./bin/lifeline ./examples/custom_start_wrapper
 ```
+
+```text
+no lifecycle diagnostics (checked 0 cancel binding(s), 1 goroutine(s), 0 group(s)); 1 goroutine target(s) could not be analyzed and are excluded from this result:
+  examples/custom_start_wrapper/main.go:7:2  goroutine target body is not statically identifiable
+```
+
+That goroutine and its unsupported target are `Launch`'s own `go worker()` statement, found regardless of whether `Launch` is configured anywhere: `worker` is a `func()` parameter, not a statically resolvable declaration, so Lifeline can see the start site but not what it does. This is unrelated to `Start`'s call to `Launch` — that call still is not recognized as a goroutine start at all until `Launch` is declared as a `start_wrapper` below.
 
 The supplied configuration declares its canonical name:
 

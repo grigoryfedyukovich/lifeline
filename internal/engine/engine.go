@@ -165,6 +165,79 @@ func ignored(list []string, id string) bool {
 	return false
 }
 
+// UnsupportedTarget describes a goroutine start site whose target body could
+// not be inspected, so it contributes no lifecycle evidence and can never
+// produce an LL1002 finding either way. These are distinct from constructs
+// that were never recognized at all (see Coverage.NothingRecognized): a
+// start site *was* found, but its body is opaque to this analysis.
+type UnsupportedTarget struct {
+	Function string     `json:"function"`
+	Position model.Span `json:"position"`
+	Message  string     `json:"message"`
+}
+
+// Coverage summarizes how many lifecycle-relevant constructs this run
+// actually recognized and modeled, independent of whether any of them
+// produced a diagnostic. It exists so a clean result can be told apart from
+// a package with nothing recognized in it, and so goroutine targets that
+// were found but could not be inspected are visible rather than silently
+// absent. See docs/limitations.md for the constructs this cannot detect at
+// all (for example, a wrapper function not declared in configuration never
+// creates a binding to summarize in the first place).
+type Coverage struct {
+	CancelBindings     int                 `json:"cancel_bindings"`
+	Goroutines         int                 `json:"goroutines"`
+	Groups             int                 `json:"groups"`
+	UnsupportedTargets []UnsupportedTarget `json:"unsupported_targets,omitempty"`
+}
+
+// Recognized reports whether any lifecycle-relevant construct was found at
+// all, regardless of whether it was fully inspectable.
+func (c Coverage) Recognized() int {
+	return c.CancelBindings + c.Goroutines + c.Groups
+}
+
+func (c Coverage) Add(other Coverage) Coverage {
+	return Coverage{
+		CancelBindings:     c.CancelBindings + other.CancelBindings,
+		Goroutines:         c.Goroutines + other.Goroutines,
+		Groups:             c.Groups + other.Groups,
+		UnsupportedTargets: append(append([]UnsupportedTarget{}, c.UnsupportedTargets...), other.UnsupportedTargets...),
+	}
+}
+
+// Summarize computes Coverage for a single package's model. It reads only
+// evidence the frontend already records (see the "unsupported" Kind
+// produced by buildGoroutine in internal/frontend) and adds no new
+// detection of its own.
+func Summarize(program model.Program) Coverage {
+	var c Coverage
+	for _, fn := range program.Functions {
+		c.CancelBindings += len(fn.Cancels)
+		c.Groups += len(fn.Groups)
+		c.Goroutines += len(fn.Goroutines)
+		for _, g := range fn.Goroutines {
+			msg, unsupported := unsupportedReason(g)
+			if !unsupported {
+				continue
+			}
+			c.UnsupportedTargets = append(c.UnsupportedTargets, UnsupportedTarget{
+				Function: fn.Name, Position: g.Span, Message: msg,
+			})
+		}
+	}
+	return c
+}
+
+func unsupportedReason(g model.Goroutine) (string, bool) {
+	for _, e := range g.Evidence {
+		if e.Kind == "unsupported" {
+			return e.Message, true
+		}
+	}
+	return "", false
+}
+
 func FailsPolicy(diags []Diagnostic, failOn []string) bool {
 	if len(failOn) == 0 {
 		return false
