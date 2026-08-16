@@ -1,0 +1,18 @@
+schema_version: 1
+format: text
+ci_exit_code: 7
+timeout: 5s
+max_functions: 10000
+include_tests: false
+fail_on:
+  - LL1001
+  - LL1002
+ignore: []
+context_wrappers:
+  - example.com/project/lifecycle.WithCancel
+start_wrappers:
+  - example.com/project/workers.Start
+join_wrappers:
+  - example.com/project/workers.Group.Wait
+stop_wrappers:
+  - example.com/project/workers.Stopped

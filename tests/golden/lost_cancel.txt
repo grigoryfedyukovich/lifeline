@@ -1,0 +1,5 @@
+examples/lost_cancel/main.go:6:2: [LL1001] cancel function returned by context.WithCancel is discarded; a child goroutine uses the derived context and may retain resources until parent cancellation
+  evidence: the cancellation result is assigned to the blank identifier
+  evidence: derived context is used by a child goroutine
+  action: call the cancellation function on every path, usually with defer immediately after construction
+  model: local-ast-types-ssa-summary/v2; max_functions=10000; timeout=5s

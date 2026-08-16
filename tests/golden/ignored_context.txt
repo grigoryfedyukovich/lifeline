@@ -1,0 +1,4 @@
+examples/ignored_context/worker.go:10:2: [LL1002] goroutine has an unconditional loop and no recognized termination path; available cancellation source: ctx.Done()
+  evidence: unconditional for loop
+  action: select on the available context's Done channel and return
+  model: local-ast-types-ssa-summary/v2; max_functions=10000; timeout=5s

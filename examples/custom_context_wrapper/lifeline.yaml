@@ -1,0 +1,13 @@
+schema_version: 1
+format: text
+ci_exit_code: 7
+timeout: 5s
+max_functions: 10000
+include_tests: false
+fail_on: []
+ignore: []
+context_wrappers:
+  - github.com/gfedyukovich/lifeline/examples/custom_context_wrapper.ProjectWithCancel
+start_wrappers: []
+join_wrappers: []
+stop_wrappers: []
