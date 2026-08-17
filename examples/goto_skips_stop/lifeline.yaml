@@ -1,0 +1,3 @@
+schema_version: 1
+stop_wrappers:
+  - github.com/gfedyukovich/lifeline/examples/cfg_diff_explicit.stopWorker

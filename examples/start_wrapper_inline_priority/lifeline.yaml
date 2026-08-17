@@ -1,0 +1,3 @@
+schema_version: 1
+start_wrappers:
+  - github.com/gfedyukovich/lifeline/examples/start_wrapper_inline_priority.Launch

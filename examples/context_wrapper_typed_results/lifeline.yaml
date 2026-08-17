@@ -1,0 +1,3 @@
+schema_version: 1
+context_wrappers:
+  - github.com/gfedyukovich/lifeline/examples/context_wrapper_typed_results.Make

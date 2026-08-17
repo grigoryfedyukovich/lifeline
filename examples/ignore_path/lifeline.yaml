@@ -1,0 +1,3 @@
+schema_version: 1
+ignore_paths:
+  - ignored.go
