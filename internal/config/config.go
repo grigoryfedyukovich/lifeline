@@ -25,6 +25,7 @@ type Config struct {
 	IncludeTests    bool     `json:"include_tests"`
 	FailOn          []string `json:"fail_on"`
 	Ignore          []string `json:"ignore"`
+	IgnorePaths     []string `json:"ignore_paths"`
 	ContextWrappers []string `json:"context_wrappers"`
 	StartWrappers   []string `json:"start_wrappers"`
 	JoinWrappers    []string `json:"join_wrappers"`
@@ -40,11 +41,30 @@ func Default() Config {
 		MaxFunctions:    10000,
 		FailOn:          []string{},
 		Ignore:          []string{},
+		IgnorePaths:     []string{},
 		ContextWrappers: []string{},
 		StartWrappers:   []string{},
 		JoinWrappers:    []string{},
 		StopWrappers:    []string{},
 	}
+}
+
+// MatchesIgnorePath reports whether relPath should be excluded from
+// analysis under IgnorePaths. Each pattern is tried against both the full
+// path and its base filename, using filepath.Match semantics: a single "*"
+// or "?" does not cross a "/" separator. There is no "**" support; a
+// pattern intended to match at any depth should target the base filename
+// instead (e.g. "*.pb.go" rather than a directory-spanning pattern).
+func (c Config) MatchesIgnorePath(relPath string) bool {
+	for _, pattern := range c.IgnorePaths {
+		if matched, _ := filepath.Match(pattern, relPath); matched {
+			return true
+		}
+		if matched, _ := filepath.Match(pattern, filepath.Base(relPath)); matched {
+			return true
+		}
+	}
+	return false
 }
 
 func (c Config) Duration() (time.Duration, error) {
@@ -190,6 +210,7 @@ var setters = map[string]func(*Config, any) error{
 	"include_tests":    func(c *Config, v any) error { b, e := asBool(v); c.IncludeTests = b; return e },
 	"fail_on":          func(c *Config, v any) error { s, e := asStrings(v); c.FailOn = s; return e },
 	"ignore":           func(c *Config, v any) error { s, e := asStrings(v); c.Ignore = s; return e },
+	"ignore_paths":     func(c *Config, v any) error { s, e := asStrings(v); c.IgnorePaths = s; return e },
 	"context_wrappers": func(c *Config, v any) error { s, e := asStrings(v); c.ContextWrappers = s; return e },
 	"start_wrappers":   func(c *Config, v any) error { s, e := asStrings(v); c.StartWrappers = s; return e },
 	"join_wrappers":    func(c *Config, v any) error { s, e := asStrings(v); c.JoinWrappers = s; return e },

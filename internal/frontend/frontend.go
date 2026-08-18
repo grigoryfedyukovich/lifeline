@@ -6,7 +6,9 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/gfedyukovich/lifeline/internal/config"
 	"github.com/gfedyukovich/lifeline/internal/localssa"
@@ -45,6 +47,103 @@ type builder struct {
 	stopWrappers     map[string]struct{}
 }
 
+// generatedFilePattern matches the standard Go convention for marking a
+// source file as generated: https://go.dev/s/generatedcode. Tools that
+// modify or lint source are expected to recognize and skip such files.
+var generatedFilePattern = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
+
+// IsGeneratedFile reports whether file carries the standard generated-code
+// marker comment. It checks parsed comments rather than raw source text, so
+// it works from an already-parsed *ast.File without re-reading the file.
+func IsGeneratedFile(file *ast.File) bool {
+	if file == nil {
+		return false
+	}
+	for _, group := range file.Comments {
+		for _, c := range group.List {
+			if generatedFilePattern.MatchString(strings.TrimSpace(c.Text)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// FilterFiles narrows files to those that should actually be walked for
+// lifecycle constructs: it excludes files matching cfg.IgnorePaths (matched
+// against the file's path relative to cwd, falling back to the absolute
+// path if cwd is empty or unrelated) and files carrying the standard
+// generated-code marker (see IsGeneratedFile). This is meant to run after
+// type-checking, not before: type-checking should still see every file in
+// the package, since excluding a file there could break resolution of
+// symbols other files in the same package legitimately depend on. Only the
+// lifecycle analysis pass itself skips them.
+func FilterFiles(fset *token.FileSet, files []*ast.File, cfg config.Config, cwd string) []*ast.File {
+	out := files[:0:0]
+	for _, f := range files {
+		if IsGeneratedFile(f) {
+			continue
+		}
+		if len(cfg.IgnorePaths) > 0 {
+			path := fset.Position(f.Pos()).Filename
+			rel := path
+			if cwd != "" {
+				if r, err := filepath.Rel(cwd, path); err == nil {
+					rel = r
+				}
+			}
+			if cfg.MatchesIgnorePath(rel) {
+				continue
+			}
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// suppressionPattern matches an inline suppression directive within a
+// comment, e.g. "//lifeline:ignore" (suppresses every rule reported on that
+// line) or "//lifeline:ignore LL1001,LL1002" (suppresses only those rules).
+// Free text may follow, e.g. "//lifeline:ignore LL1002 -- see TICKET-123".
+var suppressionPattern = regexp.MustCompile(`lifeline:ignore(?:\s+([A-Za-z0-9,]+))?`)
+
+// collectSuppressions scans every comment in files for a suppression
+// directive and returns a file -> line -> rule-IDs index. A bare directive
+// with no rule list is recorded as "*", meaning every rule is suppressed on
+// that line. The directive is matched by the comment's own line, so it is
+// expected on the same source line as the construct it applies to (the
+// convention golangci-lint's "//nolint" uses), not the line before it.
+func collectSuppressions(fset *token.FileSet, files []*ast.File) map[string]map[int][]string {
+	out := map[string]map[int][]string{}
+	for _, file := range files {
+		for _, group := range file.Comments {
+			for _, c := range group.List {
+				m := suppressionPattern.FindStringSubmatch(c.Text)
+				if m == nil {
+					continue
+				}
+				pos := fset.Position(c.Pos())
+				byLine := out[pos.Filename]
+				if byLine == nil {
+					byLine = map[int][]string{}
+					out[pos.Filename] = byLine
+				}
+				if m[1] == "" {
+					byLine[pos.Line] = append(byLine[pos.Line], "*")
+					continue
+				}
+				for _, id := range strings.Split(m[1], ",") {
+					id = strings.ToUpper(strings.TrimSpace(id))
+					if id != "" {
+						byLine[pos.Line] = append(byLine[pos.Line], id)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
 func Build(in Input, cfg config.Config) (model.Program, error) {
 	if in.Fset == nil || in.Pkg == nil || in.Info == nil {
 		return model.Program{}, fmt.Errorf("frontend requires file set, package, and type information")
@@ -76,7 +175,7 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		}
 	}
 
-	program := model.Program{PackagePath: in.Pkg.Path(), FunctionCount: len(sources)}
+	program := model.Program{PackagePath: in.Pkg.Path(), FunctionCount: len(sources), Suppressions: collectSuppressions(in.Fset, in.Files)}
 	limit := len(sources)
 	if limit > cfg.MaxFunctions {
 		limit = cfg.MaxFunctions
@@ -162,6 +261,68 @@ func (b *builder) collectContextParams(ft *ast.FuncType, contexts map[types.Obje
 // collectBindings combines cancellation and join-group definition discovery in
 // one traversal. Nested function literals have independent locals and are not
 // folded into the enclosing function's ownership model.
+// isCancelFuncType reports whether t is context.CancelFunc, context's
+// related CancelCauseFunc, or a plausible stand-in for one: any function
+// type with no results and at most one parameter. The permissive fallback
+// exists because a configured context_wrapper is not required to use the
+// named context types, only to behave like context.WithCancel: return a
+// context alongside a callable that ends it.
+func isCancelFuncType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if named, ok := t.(*types.Named); ok {
+		if obj := named.Obj(); obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "context" &&
+			(obj.Name() == "CancelFunc" || obj.Name() == "CancelCauseFunc") {
+			return true
+		}
+	}
+	sig, ok := t.Underlying().(*types.Signature)
+	return ok && sig.Results().Len() == 0 && sig.Params().Len() <= 1
+}
+
+// contextFactoryRoles finds which results of a context-factory call are the
+// context and the cancel function by their static types rather than by
+// position. context.WithCancel's own signature happens to return them in
+// (context, cancel) order, which is also the near-universal convention for
+// wrapper functions that mimic it, but nothing here assumes that order: a
+// wrapper is free to return them in either order, and free to return
+// additional results (e.g. a trailing error) as long as exactly one result
+// is context-typed and exactly one other result looks like a cancel
+// function. Returns -1, -1 if the roles can't be identified with
+// confidence; collectBindings treats that as "not a recognized factory
+// shape" and does not guess.
+func contextFactoryRoles(callType types.Type, contextInterface *types.Interface) (ctxIdx, cancelIdx int) {
+	ctxIdx, cancelIdx = -1, -1
+	tuple, ok := callType.(*types.Tuple)
+	if !ok {
+		return
+	}
+	for i := 0; i < tuple.Len(); i++ {
+		if isContextType(tuple.At(i).Type(), contextInterface) {
+			ctxIdx = i
+			break
+		}
+	}
+	if ctxIdx == -1 {
+		return
+	}
+	if tuple.Len() == 2 {
+		cancelIdx = 1 - ctxIdx
+		return
+	}
+	for i := 0; i < tuple.Len(); i++ {
+		if i == ctxIdx {
+			continue
+		}
+		if isCancelFuncType(tuple.At(i).Type()) {
+			cancelIdx = i
+			return
+		}
+	}
+	return
+}
+
 func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]string) ([]*cancelState, []*groupState) {
 	var states []*cancelState
 	var groups []*groupState
@@ -185,8 +346,12 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 			if !b.isContextFactory(factory) {
 				break
 			}
-			ctxID, ctxOK := x.Lhs[0].(*ast.Ident)
-			cancelID, cancelOK := x.Lhs[1].(*ast.Ident)
+			ctxIdx, cancelIdx := contextFactoryRoles(b.in.Info.TypeOf(call), b.contextInterface)
+			if ctxIdx == -1 || cancelIdx == -1 || ctxIdx >= len(x.Lhs) || cancelIdx >= len(x.Lhs) {
+				break // roles could not be identified by type; do not guess positionally
+			}
+			ctxID, ctxOK := x.Lhs[ctxIdx].(*ast.Ident)
+			cancelID, cancelOK := x.Lhs[cancelIdx].(*ast.Ident)
 			if !ctxOK || !cancelOK {
 				break // field/container ownership is explicit and not guessed
 			}
@@ -249,6 +414,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 	// from inheriting loops or exits from nested function literals.
 	funcDepth := 0
 	var nodeIsFuncLit []bool
+	labels := labeledLoops(body)
 	ast.Inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			last := len(nodeIsFuncLit) - 1
@@ -266,14 +432,14 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 			funcDepth++
 		}
 		if funcDepth == 0 {
-			b.observeLifecycleNode(n, contexts, &fn.BodyLifecycle)
+			b.observeLifecycleNode(n, contexts, labels, &fn.BodyLifecycle)
 		}
 		switch x := n.(type) {
 		case *ast.CallExpr:
 			b.observeCall(x, cancels, groups)
 			if b.isConfigured(x, b.startWrappers) {
-				if lit := firstFuncLiteral(x.Args); lit != nil {
-					g := b.buildGoroutine(x, &ast.CallExpr{Fun: lit}, contexts, "configured-start")
+				if target := firstStartTarget(x.Args, b.in.Info); target != nil {
+					g := b.buildGoroutine(x, &ast.CallExpr{Fun: target}, contexts, "configured-start")
 					fn.Goroutines = append(fn.Goroutines, g)
 					b.markChildUses(x, cancels)
 				}
@@ -486,52 +652,150 @@ func (b *builder) analyzeLifecycleBody(body *ast.BlockStmt, contexts map[types.O
 	if body == nil {
 		return g
 	}
+	labels := labeledLoops(body)
 	ast.Inspect(body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
-		b.observeLifecycleNode(n, contexts, &g)
+		b.observeLifecycleNode(n, contexts, labels, &g)
 		return true
 	})
 	return g
 }
 
-func (b *builder) observeLifecycleNode(n ast.Node, contexts map[types.Object]string, g *model.Goroutine) {
+// labeledLoops maps each *ast.ForStmt in body that carries a Go label
+// (e.g. "Loop: for { ... }") to that label's name, so a labeled break found
+// deeper in the tree can be matched back to the specific loop it targets.
+// Nested function literals are excluded: a label inside a closure cannot
+// target a loop outside it under Go's own scoping rules.
+func labeledLoops(body ast.Node) map[*ast.ForStmt]string {
+	labels := map[*ast.ForStmt]string{}
+	if body == nil {
+		return labels
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if ls, ok := n.(*ast.LabeledStmt); ok {
+			if forStmt, ok := ls.Stmt.(*ast.ForStmt); ok {
+				labels[forStmt] = ls.Label.Name
+			}
+		}
+		return true
+	})
+	return labels
+}
+
+// loopExitEvidence walks a single unconditional for-loop's own body for a
+// recognized way out of it, scoped strictly to that loop. This replaces
+// treating any break, return, channel range, or stop call anywhere in the
+// enclosing goroutine body as evidence for every loop in it, regardless of
+// whether the two are related.
+//
+// break is scoped to Go's own static target rules: an unlabeled break
+// found inside a nested loop, switch, or select targets that construct,
+// not this loop, so it is excluded unless it carries a label matching this
+// loop's own label. return always exits the whole function regardless of
+// nesting, so it counts wherever it is lexically found within this loop's
+// body. A stop-wrapper call or a context passed to a called operation is
+// treated the same way return is: an ordinary statement, not subject to
+// break-target scoping, so any nesting depth within the loop counts.
+//
+// This is lexical containment plus Go's static break-target rules, not
+// reachability analysis: it does not prove the identified path is
+// reachable from every entry into the loop. See docs/limitations.md.
+func (b *builder) loopExitEvidence(loop *ast.ForStmt, label string, contexts map[types.Object]string) (hasReturn, contextStop, channelStop, explicitStop bool, evidence []model.Evidence) {
+	if loop.Body == nil {
+		return
+	}
+	breakDepth := 0
+	var breakable []bool
+	ast.Inspect(loop.Body, func(n ast.Node) bool {
+		if n == nil {
+			if last := len(breakable) - 1; last >= 0 {
+				if breakable[last] {
+					breakDepth--
+				}
+				breakable = breakable[:last]
+			}
+			return true
+		}
+		switch x := n.(type) {
+		case *ast.FuncLit:
+			breakable = append(breakable, false)
+			return false
+		case *ast.SelectStmt:
+			breakable = append(breakable, true)
+			breakDepth++
+			var sub model.Goroutine
+			b.inspectSelect(x, contexts, &sub)
+			if sub.ContextStop {
+				contextStop = true
+			}
+			if sub.ChannelStop {
+				channelStop = true
+			}
+			evidence = append(evidence, sub.Evidence...)
+			return true
+		case *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt:
+			breakable = append(breakable, true)
+			breakDepth++
+			return true
+		case *ast.ReturnStmt:
+			hasReturn = true
+			evidence = append(evidence, model.Evidence{Kind: "loop-exit", Message: "a return provides a loop exit", Span: ptrSpan(b.span(x))})
+			breakable = append(breakable, false)
+			return true
+		case *ast.BranchStmt:
+			if x.Tok == token.BREAK {
+				targetsThisLoop := breakDepth == 0
+				if x.Label != nil {
+					targetsThisLoop = label != "" && x.Label.Name == label
+				}
+				if targetsThisLoop {
+					hasReturn = true
+					evidence = append(evidence, model.Evidence{Kind: "loop-exit", Message: "an explicit break provides a possible loop exit", Span: ptrSpan(b.span(x))})
+				}
+			}
+			breakable = append(breakable, false)
+			return true
+		case *ast.CallExpr:
+			callName := b.callName(x)
+			if b.hasWrapper(b.stopWrappers, callName) {
+				explicitStop = true
+				evidence = append(evidence, model.Evidence{Kind: "configured-stop", Message: "configured stop operation: " + callName, Span: ptrSpan(b.span(x))})
+			}
+			args := objectsUsedInExpressions(x.Args, b.in.Info, true)
+			for obj := range contexts {
+				if hasObject(args, obj) {
+					contextStop = true
+					evidence = append(evidence, model.Evidence{Kind: "context-delegation", Message: "context is delegated to a called operation", Span: ptrSpan(b.span(x))})
+					break
+				}
+			}
+			breakable = append(breakable, false)
+			return true
+		default:
+			breakable = append(breakable, false)
+			return true
+		}
+	})
+	return
+}
+
+func (b *builder) observeLifecycleNode(n ast.Node, contexts map[types.Object]string, labels map[*ast.ForStmt]string, g *model.Goroutine) {
 	switch x := n.(type) {
 	case *ast.ForStmt:
 		if x.Cond == nil {
 			g.InfiniteLoop = true
 			g.Evidence = append(g.Evidence, model.Evidence{Kind: "infinite-loop", Message: "unconditional for loop", Span: ptrSpan(b.span(x))})
-		}
-	case *ast.RangeStmt:
-		if t := b.in.Info.TypeOf(x.X); t != nil {
-			if _, ok := t.Underlying().(*types.Chan); ok {
-				g.ChannelStop = true
-				g.Evidence = append(g.Evidence, model.Evidence{Kind: "channel-close", Message: "range loop terminates when the channel closes", Span: ptrSpan(b.span(x))})
-			}
-		}
-	case *ast.ReturnStmt:
-		g.HasReturn = true
-	case *ast.BranchStmt:
-		if x.Tok == token.BREAK {
-			g.HasReturn = true
-			g.Evidence = append(g.Evidence, model.Evidence{Kind: "loop-exit", Message: "an explicit break provides a possible loop exit", Span: ptrSpan(b.span(x))})
-		}
-	case *ast.SelectStmt:
-		b.inspectSelect(x, contexts, g)
-	case *ast.CallExpr:
-		callName := b.callName(x)
-		if b.hasWrapper(b.stopWrappers, callName) {
-			g.ExplicitStop = true
-			g.Evidence = append(g.Evidence, model.Evidence{Kind: "configured-stop", Message: "configured stop operation: " + callName, Span: ptrSpan(b.span(x))})
-		}
-		args := objectsUsedInExpressions(x.Args, b.in.Info, true)
-		for obj := range contexts {
-			if hasObject(args, obj) {
-				g.ContextStop = true
-				g.Evidence = append(g.Evidence, model.Evidence{Kind: "context-delegation", Message: "context is delegated to a called operation", Span: ptrSpan(b.span(x))})
-				break
-			}
+			hasReturn, contextStop, channelStop, explicitStop, loopEvidence := b.loopExitEvidence(x, labels[x], contexts)
+			g.HasReturn = g.HasReturn || hasReturn
+			g.ContextStop = g.ContextStop || contextStop
+			g.ChannelStop = g.ChannelStop || channelStop
+			g.ExplicitStop = g.ExplicitStop || explicitStop
+			g.Evidence = append(g.Evidence, loopEvidence...)
 		}
 	}
 }
@@ -792,10 +1056,31 @@ func hasObject(set map[types.Object]struct{}, obj types.Object) bool {
 	return ok
 }
 
-func firstFuncLiteral(args []ast.Expr) *ast.FuncLit {
+// firstStartTarget finds the first argument to a configured start-wrapper
+// call that can represent a goroutine's entry point: either an inline
+// function literal, or a reference whose static type is a function type
+// (e.g. Launch(myWorker) where myWorker is a top-level declared function).
+// A function literal is preferred over a function-typed reference when both
+// are present, matching the argument priority the closure-only version of
+// this check used. Whether a function-typed reference can actually be
+// resolved to a specific declaration (as opposed to, say, a local variable
+// or struct field of function type, which is not resolved) is decided by
+// buildGoroutine itself, via the same calledObject resolution it already
+// applies to `go` statements — this keeps both call sites conservative in
+// exactly the same way rather than duplicating that decision here.
+func firstStartTarget(args []ast.Expr, info *types.Info) ast.Expr {
 	for _, arg := range args {
-		if lit, ok := arg.(*ast.FuncLit); ok {
-			return lit
+		if _, ok := arg.(*ast.FuncLit); ok {
+			return arg
+		}
+	}
+	for _, arg := range args {
+		t := info.TypeOf(arg)
+		if t == nil {
+			continue
+		}
+		if _, ok := t.Underlying().(*types.Signature); ok {
+			return arg
 		}
 	}
 	return nil

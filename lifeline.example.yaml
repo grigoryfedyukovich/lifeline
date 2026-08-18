@@ -8,6 +8,8 @@ fail_on:
   - LL1001
   - LL1002
 ignore: []
+ignore_paths:
+  - "*.pb.go"
 context_wrappers:
   - example.com/project/lifecycle.WithCancel
 start_wrappers:

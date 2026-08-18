@@ -129,8 +129,8 @@ Supported keys:
 
 ```text
 schema_version, format, ci_exit_code, timeout, max_functions,
-include_tests, fail_on, ignore, context_wrappers, start_wrappers,
-join_wrappers, stop_wrappers
+include_tests, fail_on, ignore, ignore_paths, context_wrappers,
+start_wrappers, join_wrappers, stop_wrappers
 ```
 
 Wrapper names use canonical forms:
@@ -141,6 +141,8 @@ import/path.Type.Method
 ```
 
 The YAML/TOML parser deliberately supports a strict flat subset: scalar values, quoted inline string arrays, and YAML string lists. JSON uses the standard library decoder with unknown-field rejection.
+
+`ignore_paths` excludes files by path from analysis (not just from reported output): each pattern is matched with `filepath.Match` semantics against both the file's path relative to the working directory and its base filename. A file carrying the standard `// Code generated ... DO NOT EDIT.` marker is excluded automatically, unconditionally of config. A specific finding can additionally be suppressed inline with a `//lifeline:ignore` (optionally `//lifeline:ignore LL1001,LL1002`) comment; see `docs/limitations.md` for exact matching rules.
 
 ## 10. Output contract
 

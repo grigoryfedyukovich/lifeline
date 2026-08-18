@@ -92,4 +92,9 @@ type Program struct {
 	Functions     []Function `json:"functions"`
 	FunctionCount int        `json:"function_count"`
 	Truncated     bool       `json:"truncated"`
+	// Suppressions maps file -> source line -> suppressed rule IDs, derived
+	// from "//lifeline:ignore" comments. "*" means every rule is suppressed
+	// on that line. This is an internal control input for the engine, not
+	// part of the public report, so it is excluded from JSON output.
+	Suppressions map[string]map[int][]string `json:"-"`
 }

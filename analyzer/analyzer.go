@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -93,8 +94,9 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 			ExplicitStop: fact.ExplicitStop,
 		}, true
 	}
+	cwd, _ := os.Getwd()
 	program, err := frontend.Build(frontend.Input{
-		Fset: pass.Fset, Files: pass.Files, Pkg: pass.Pkg, Info: pass.TypesInfo,
+		Fset: pass.Fset, Files: frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd), Pkg: pass.Pkg, Info: pass.TypesInfo,
 		LookupFunctionSummary: lookup,
 	}, cfg)
 	if err != nil {

@@ -56,6 +56,7 @@ type loadedPackage struct {
 }
 
 func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, error) {
+	cwd, _ := os.Getwd()
 	packages, err := listPackages(ctx, patterns)
 	if err != nil {
 		return nil, engine.Coverage{}, err
@@ -123,7 +124,7 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 					fail(fmt.Errorf("load %s: %w", p.ImportPath, err))
 					return
 				}
-				program, err := frontend.Build(frontend.Input{Fset: loaded.Fset, Files: loaded.Files, Pkg: loaded.Pkg, Info: loaded.Info}, cfg)
+				program, err := frontend.Build(frontend.Input{Fset: loaded.Fset, Files: frontend.FilterFiles(loaded.Fset, loaded.Files, cfg, cwd), Pkg: loaded.Pkg, Info: loaded.Info}, cfg)
 				if err != nil {
 					fail(fmt.Errorf("analyze %s: %w", p.ImportPath, err))
 					return

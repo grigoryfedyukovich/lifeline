@@ -131,6 +131,9 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 		if ignored(cfg.Ignore, d.RuleID) {
 			continue
 		}
+		if d.RuleID != "LL9001" && suppressedByComment(program.Suppressions, d) {
+			continue
+		}
 		filtered = append(filtered, d)
 	}
 	sort.SliceStable(filtered, func(i, j int) bool {
@@ -159,6 +162,38 @@ func base(program model.Program, fn model.Function, rule string, verdict Verdict
 func ignored(list []string, id string) bool {
 	for _, item := range list {
 		if item == "all" || item == id {
+			return true
+		}
+	}
+	return false
+}
+
+// suppressedByComment reports whether an inline "//lifeline:ignore" comment
+// suppresses this diagnostic. It checks the diagnostic's own reported line
+// as well as every evidence span's line, not just the former: LL1002's
+// reported position is the goroutine's start site, which is often a
+// different line than the specific loop a reviewer would naturally
+// annotate, and that loop's own position is carried as evidence. This lets
+// a suppression comment go on whichever line is most natural for the
+// specific construct, matching how most inline-suppression comments read
+// in practice. suppressions is Program.Suppressions, a pure file -> line ->
+// rule-IDs index computed once during parsing (see internal/frontend);
+// this is a lookup only and performs no I/O of its own.
+func suppressedByComment(suppressions map[string]map[int][]string, d Diagnostic) bool {
+	if lineSuppressed(suppressions, d.Position.File, d.Position.StartLine, d.RuleID) {
+		return true
+	}
+	for _, ev := range d.Evidence {
+		if ev.Span != nil && lineSuppressed(suppressions, ev.Span.File, ev.Span.StartLine, d.RuleID) {
+			return true
+		}
+	}
+	return false
+}
+
+func lineSuppressed(suppressions map[string]map[int][]string, file string, line int, ruleID string) bool {
+	for _, id := range suppressions[file][line] {
+		if id == "*" || id == ruleID {
 			return true
 		}
 	}
