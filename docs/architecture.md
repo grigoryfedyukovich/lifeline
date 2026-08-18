@@ -17,7 +17,11 @@ flowchart LR
     DIAG --> SARIF[SARIF 2.1.0]
     VET <--> FACT[Versioned function object facts]
     FACT --> FE
+    PARSE -.-> CFGB[CFG builder]
+    CFGB -.-> CFGDUMP[-dump cfg: text or dot]
 ```
+
+The dotted edges are deliberate: `internal/cfg` is built from the same typed AST as the frontend, but as of this writing nothing in `MODEL`/`ENG` consumes it yet. See "Control-flow graph" below.
 
 ## Packages
 
@@ -25,10 +29,11 @@ flowchart LR
 |---|---|
 | `cmd/lifeline` | Detect standalone versus vet protocol and dispatch. |
 | `analyzer` | `go/analysis` adapter, versioned function facts, categories, source-position indexing, and suggested edits. |
-| `internal/standalone` | Package discovery, bounded parallel loading, export-data importer, type checking, flags, and exit policy. |
+| `internal/standalone` | Package discovery, bounded parallel loading, export-data importer, type checking, flags, exit policy, and `-dump cfg`. |
 | `internal/frontend` | Typed Go recognition, lifecycle summaries, nested-function isolation, and lowering. |
 | `internal/localssa` | Deterministic, narrow SSA-like instruction summary with canonical callees. |
-| `internal/model` | Parser-independent spans, instructions, and lifecycle records. |
+| `internal/cfg` | Control-flow graph construction and text/DOT rendering from a typed AST body. Not yet consumed by any rule; see "Control-flow graph" below. |
+| `internal/model` | Parser-independent spans, instructions, lifecycle records, and CFG types. |
 | `internal/engine` | Rule evaluation, assumptions, bounds, and CI policy matching. |
 | `internal/report` | Buffered text, JSON, and SARIF rendering. |
 | `internal/config` | Strict JSON and flat YAML/TOML configuration plus shared CLI list parsing. |
@@ -69,7 +74,17 @@ Wrapper names are compiled into maps once per package. Object-use sets are colle
 
 ## Internal API boundary
 
-The engine imports neither `go/ast` nor `go/types`. All parser-specific reasoning is confined to the frontend and local SSA builder. The model contains source spans rather than AST node identities, allowing deterministic engine tests and leaving room for a future alternative frontend or full-SSA backend.
+The engine imports neither `go/ast` nor `go/types`. All parser-specific reasoning is confined to the frontend, the local SSA builder, and the CFG builder. The model contains source spans rather than AST node identities, allowing deterministic engine tests and leaving room for a future alternative frontend or full-SSA backend.
+
+## Control-flow graph
+
+`internal/cfg` builds a parser-independent `model.CFG` (explicit basic blocks and edges: `if`/`for`/`range`/`switch`/`select` branches, loop back-edges, `break`/`continue`/`goto` resolved to their actual targets under Go's own scoping rules, `return`/`panic` routed to a function's exit block) from the same typed AST the frontend already walks. It is a structural pass only: nothing in `internal/engine` consumes a CFG today, and building one does not change any diagnostic.
+
+This exists to replace `internal/frontend`'s flat, body-wide "does this contain a return/break/select-with-ctx.Done() anywhere" boolean summaries with true reachability over an explicit graph. The flat summaries can be — and were, prior to loop-scoping added in an earlier release — wrong in a specific, demonstrable way: evidence found anywhere in a goroutine body could suppress a finding about a completely unrelated loop in the same body. Loop-scoping closed the common cases of that class of bug without a graph (see `docs/limitations.md`), but one case remains structurally unfixable without one: a goroutine with two separate unconditional loops where only one has its own exit still clears the finding for both, because exit status is tracked per goroutine, not per loop. `tests/differential/cfg_ast_test.go` captures this exact case as an explicit fixture, verifying both that today's engine still has the gap (so a future fix is provable rather than assumed) and that the CFG already carries the correct answer for it (`TestKnownFalseNegative_NestedLoopsMixedResolution`).
+
+Inspect a CFG directly with `lifeline -dump cfg [-dump-format text|dot] ./...`. This walks every named function and every nested function literal (goroutine bodies overwhelmingly being the latter) and bypasses the normal diagnostic pipeline entirely — it is a development aid, not a report format, and applies no `ignore_paths`/generated-file filtering.
+
+No rule currently reads a CFG. Migrating a diagnostic (starting with `LL1002`, since it is the most direct fit — reachability of a function's exit from a persistent strongly-connected component) onto CFG/SCC-based reasoning is a distinct, deliberately separate piece of work from building and validating the graph itself.
 
 ## Caching
 

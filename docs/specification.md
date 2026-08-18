@@ -1,7 +1,7 @@
 # Lifeline — validated implementation specification
 
 **Specification version:** 0.1.1  
-**Primary language:** Go 1.23+  
+**Primary language:** Go 1.25+  
 **Category:** conservative goroutine lifecycle analyzer  
 **Report schema:** `lifeline.report/v1`  
 **Fact schema:** version 2  
@@ -46,9 +46,13 @@ lifeline -config lifeline.yaml ./internal/...
 lifeline -format json ./... > lifeline.json
 lifeline -format sarif ./... > lifeline.sarif
 go vet -vettool="$(which lifeline)" ./...
+lifeline -dump cfg ./...
+lifeline -dump cfg -dump-format dot ./... | dot -Tpng -o cfg.png
 ```
 
 Standalone diagnostics do not fail the command by default. `-fail-on` enables an explicit policy failure using `-ci-exit-code`.
+
+`-dump cfg` bypasses the normal diagnostic pipeline: it builds and prints a control-flow graph (see `docs/architecture.md`) for every named function and function literal instead of running any rule, and always exits `0` on success. It is a development/debugging aid, not a report format, and is not subject to `-fail-on`/`-ci-exit-code`.
 
 Exit codes:
 
@@ -115,6 +119,7 @@ Counts are qualitative in v0.1.1; Lifeline does not prove `Add`/`Done` balance.
 - Root packages are analyzed concurrently with a worker count bounded by `GOMAXPROCS`; output remains sorted deterministically.
 - The typed frontend lowers parser objects into `internal/model` records containing spans, lifecycle facts, and SSA-like instructions.
 - `internal/localssa` versions local definitions and records lifecycle-relevant operations and canonical callees.
+- `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. It is not yet consumed by `internal/engine` or any diagnostic rule; see `docs/architecture.md`.
 - `internal/engine` imports neither `go/ast` nor `go/types`.
 - Vet mode exports and imports versioned object facts for named function lifecycle summaries.
 - Rendering is isolated in `internal/report`.

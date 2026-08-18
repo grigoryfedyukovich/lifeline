@@ -162,7 +162,7 @@ go test ./...
 go build ./cmd/lifeline
 ```
 
-Dependencies needed by the analyzer driver are vendored so normal builds and analysis do not require network access. The project currently targets Go 1.23 or newer. Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
+Dependencies needed by the analyzer driver are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
 
 See:
 
@@ -173,6 +173,7 @@ See:
 - [Runnable examples](examples/README.md)
 - [Semantics](docs/semantics.md)
 - [Architecture](docs/architecture.md)
+- [AST/CFG migration plan](docs/cfg-migration-plan.md)
 - [Limitations](docs/limitations.md)
 - [Evaluation](docs/evaluation.md)
 - [Roadmap](docs/roadmap.md)

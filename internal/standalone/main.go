@@ -34,6 +34,8 @@ type options struct {
 	includeTests bool
 	printConfig  bool
 	showVersion  bool
+	dump         string
+	dumpFormat   string
 }
 
 func Main(args []string, stdout, stderr io.Writer) (exit int) {
@@ -55,6 +57,8 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	fs.BoolVar(&opts.includeTests, "tests", false, "include same-package _test.go files")
 	fs.BoolVar(&opts.printConfig, "print-config", false, "print effective configuration and exit")
 	fs.BoolVar(&opts.showVersion, "version", false, "print version and exit")
+	fs.StringVar(&opts.dump, "dump", "", "bypass diagnostics and dump an intermediate representation instead; currently only \"cfg\" is supported")
+	fs.StringVar(&opts.dumpFormat, "dump-format", "text", "format for -dump: text or dot")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: lifeline [flags] [package patterns]\n\n")
 		fs.PrintDefaults()
@@ -107,6 +111,28 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	patterns := fs.Args()
 	if len(patterns) == 0 {
 		patterns = []string{"./..."}
+	}
+	if opts.dump != "" {
+		if opts.dump != "cfg" {
+			fmt.Fprintf(stderr, "lifeline: unsupported -dump value %q (supported: cfg)\n", opts.dump)
+			return ExitInvalid
+		}
+		if opts.dumpFormat != "text" && opts.dumpFormat != "dot" {
+			fmt.Fprintf(stderr, "lifeline: unsupported -dump-format value %q (supported: text, dot)\n", opts.dumpFormat)
+			return ExitInvalid
+		}
+		duration, err := cfg.Duration()
+		if err != nil {
+			fmt.Fprintf(stderr, "lifeline: invalid effective configuration: %v\n", err)
+			return ExitInvalid
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), duration)
+		defer cancel()
+		if err := dumpCFGs(ctx, patterns, cfg, opts.dumpFormat, stdout); err != nil {
+			fmt.Fprintf(stderr, "lifeline: %v\n", err)
+			return ExitInvalid
+		}
+		return ExitOK
 	}
 	duration, err := cfg.Duration()
 	if err != nil {

@@ -186,6 +186,44 @@ func TestVetImportsVersionedFunctionFacts(t *testing.T) {
 	}
 }
 
+func TestDumpCFG(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+
+	out, code := run(t, root, binary, "-dump", "cfg", "./examples/proper_context")
+	if code != 0 {
+		t.Fatalf("exit code %d\n%s", code, out)
+	}
+	// The goroutine closure's own control flow (the loop and select) is
+	// what -dump cfg exists to show; the top-level named function that
+	// merely starts it isn't the interesting part.
+	for _, want := range []string{
+		"func github.com/gfedyukovich/lifeline/examples/proper_context.Start.func1",
+		"loop-header",
+		"comm-case",
+		"loop-back",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dump output does not contain %q\n%s", want, out)
+		}
+	}
+
+	dot, code := run(t, root, binary, "-dump", "cfg", "-dump-format", "dot", "./examples/proper_context")
+	if code != 0 {
+		t.Fatalf("dot dump exit code %d\n%s", code, dot)
+	}
+	if !strings.Contains(dot, "digraph") || !strings.Contains(dot, "->") {
+		t.Fatalf("dot output does not look like a digraph\n%s", dot)
+	}
+
+	if _, code := run(t, root, binary, "-dump", "bogus", "./examples/proper_context"); code == 0 {
+		t.Fatalf("expected a nonzero exit for an unsupported -dump value")
+	}
+	if _, code := run(t, root, binary, "-dump", "cfg", "-dump-format", "bogus", "./examples/proper_context"); code == 0 {
+		t.Fatalf("expected a nonzero exit for an unsupported -dump-format value")
+	}
+}
+
 func TestParallelPackageAnalysisIsDeterministic(t *testing.T) {
 	root := repositoryRoot(t)
 	binary := buildBinary(t, root)
