@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -221,6 +222,76 @@ func TestDumpCFG(t *testing.T) {
 	}
 	if _, code := run(t, root, binary, "-dump", "cfg", "-dump-format", "bogus", "./examples/proper_context"); code == 0 {
 		t.Fatalf("expected a nonzero exit for an unsupported -dump-format value")
+	}
+}
+
+func TestDumpFacts(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+
+	// ignored_context: a context is captured (stop.available) but never
+	// checked (stop.consumed stays false), and its persistent SCC is
+	// unresolved -- the exact case LL1002 fires on. Checking both together
+	// here guards against these two computations (StopCapabilityDataflow
+	// and SummarizeTermination, which share no code path other than both
+	// reading the same *model.CFG) silently drifting out of agreement with
+	// each other.
+	out, code := run(t, root, binary, "-dump", "facts", "-dump-format", "json", "./examples/ignored_context")
+	if code != 0 {
+		t.Fatalf("exit code %d\n%s", code, out)
+	}
+	var got struct {
+		Workers []struct {
+			Stop struct {
+				Available bool `json:"available"`
+				Consumed  bool `json:"consumed"`
+			} `json:"stop"`
+			Termination struct {
+				ExitReachable  bool `json:"exit_reachable"`
+				PersistentSCCs []struct {
+					Resolved bool `json:"resolved"`
+				} `json:"persistent_sccs"`
+			} `json:"termination"`
+			Join struct {
+				Analyzed bool `json:"analyzed"`
+			} `json:"join"`
+		} `json:"workers"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, out)
+	}
+	if len(got.Workers) != 1 {
+		t.Fatalf("expected exactly 1 worker, got %d\n%s", len(got.Workers), out)
+	}
+	w := got.Workers[0]
+	if !w.Stop.Available {
+		t.Fatalf("stop.available should be true: ctx is captured by the closure\n%s", out)
+	}
+	if w.Stop.Consumed {
+		t.Fatalf("stop.consumed should be false: ctx is never checked\n%s", out)
+	}
+	if w.Termination.ExitReachable {
+		t.Fatalf("termination.exit_reachable should be false: this is the LL1002 case\n%s", out)
+	}
+	if len(w.Termination.PersistentSCCs) != 1 || w.Termination.PersistentSCCs[0].Resolved {
+		t.Fatalf("expected exactly one unresolved persistent SCC\n%s", out)
+	}
+	if w.Join.Analyzed {
+		t.Fatalf("join.analyzed should be false: not wired to real bindings yet\n%s", out)
+	}
+
+	textOut, code := run(t, root, binary, "-dump", "facts", "./examples/proper_context")
+	if code != 0 {
+		t.Fatalf("text dump exit code %d\n%s", code, textOut)
+	}
+	for _, want := range []string{"stop: available=true consumed=true", "exit_reachable=true"} {
+		if !strings.Contains(textOut, want) {
+			t.Fatalf("text dump does not contain %q\n%s", want, textOut)
+		}
+	}
+
+	if _, code := run(t, root, binary, "-dump", "facts", "-dump-format", "dot", "./examples/proper_context"); code == 0 {
+		t.Fatalf("expected a nonzero exit for -dump facts with an unsupported -dump-format value")
 	}
 }
 

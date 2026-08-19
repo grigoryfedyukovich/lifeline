@@ -30,12 +30,12 @@ The dotted edge is deliberate: `-dump cfg` calls `internal/cfg` directly, with n
 |---|---|
 | `cmd/lifeline` | Detect standalone versus vet protocol and dispatch. |
 | `analyzer` | `go/analysis` adapter, versioned function facts, categories, source-position indexing, and suggested edits. |
-| `internal/standalone` | Package discovery, bounded parallel loading, export-data importer, type checking, flags, exit policy, and `-dump cfg`. |
+| `internal/standalone` | Package discovery, bounded parallel loading, export-data importer, type checking, flags, exit policy, `-dump cfg`, and `-dump facts`. |
 | `internal/frontend` | Typed Go recognition, lifecycle summaries, nested-function isolation, lowering, and CFG construction (with a trust predicate) for each goroutine body. |
 | `internal/localssa` | Deterministic, narrow SSA-like instruction summary with canonical callees. |
 | `internal/cfg` | Control-flow graph construction and text/DOT rendering from a typed AST body, given an optional trusted-terminator predicate. See "Control-flow graph" below. |
-| `internal/model` | Parser-independent spans, instructions, lifecycle records, and CFG types plus their graph algorithms (`Reachable`, `CanReach`, `SCCs`). |
-| `internal/engine` | Rule evaluation (including CFG/SCC-based `LL1002` verdicts, `cfg_verdict.go`), assumptions, bounds, and CI policy matching. |
+| `internal/model` | Parser-independent spans, instructions, lifecycle records, CFG types plus their graph algorithms (`Reachable`, `CanReach`, `SCCs`), and the generic dataflow worklist solver (`Solve`). |
+| `internal/engine` | Rule evaluation (including CFG/SCC-based `LL1002` verdicts, `cfg_verdict.go`), Phase 3 dataflow lattices (`dataflow_lattices.go`), assumptions, bounds, and CI policy matching. |
 | `internal/report` | Buffered text, JSON, and SARIF rendering. |
 | `internal/config` | Strict JSON and flat YAML/TOML configuration plus shared CLI list parsing. |
 
@@ -86,6 +86,16 @@ This replaced `internal/frontend`'s flat, body-wide "does this contain a return/
 This is not (yet) wired everywhere `LL1002` can fire: a cross-package goroutine target resolved through a `go vet` fact still uses the older flat evidence check, since facts currently carry only those booleans, not a CFG (see `docs/limitations.md`). No other rule (`LL1001`, `LL1003`, `LL1004`) reads a CFG at all.
 
 Inspect a CFG directly with `lifeline -dump cfg [-dump-format text|dot] ./...`. This walks every named function and every nested function literal (goroutine bodies overwhelmingly being the latter) and bypasses the normal diagnostic pipeline entirely — it is a development aid, not a report format, applies no `ignore_paths`/generated-file filtering, and (unlike the CFG `LL1002` actually uses) is built with no trust predicate, so it never shows a `trusted-stop` edge.
+
+## Dataflow (Phase 3)
+
+`internal/model/dataflow.go`'s `Solve` is a generic forward-dataflow worklist solver over `model.CFG`: given a join-semilattice type, a transfer function, and a join function, it iterates each block's in-state (the join of its predecessors' out-states) to a fixed point, re-queuing successors whenever a block's out-state changes. This exists because a "has this happened yet, on any path to here" fact — has a value's ownership transferred, has a join obligation been satisfied — cannot be computed correctly by a single forward pass when the CFG has a cycle: a fact established partway through a loop body must still be visible at the header once the loop's back-edge carries it around, which needs revisiting blocks, not visiting each one once. (Its first implementation had exactly this class of bug — computing "changed" relative to a bottom value that happened to coincide with the first real computed value — caught by `internal/model/dataflow_test.go`'s loop-propagation test before anything was built on top of it.)
+
+`internal/engine/dataflow_lattices.go` defines three lattices on top of `Solve`, per `docs/cfg-migration-plan.md`'s Phase 3 list: `StopCapability` (None/Available/ProvenConsumed), `JoinObligation` (None/Required/Satisfied/Escaped), `Ownership` (Local/Transferred/Unknown). All three share a `pointTransfer` shape: once a block matching some predicate is reached on a path, the state becomes resolved and stays resolved from there on, matching Lifeline's existing philosophy elsewhere in the codebase that evidence of resolution on any one path is credited, not required on every path. Only `StopCapability` is wired to a real predicate derived from CFG structure alone (a block's own outgoing edges: a trusted-stop, a return, or a panic — deliberately a local check, not `CanReach`, which would mark every branch of a select loop "resolved" just because a sibling branch happens to return). `JoinObligation` and `Ownership` are demonstrated only against synthetic fixtures for now; wiring them to real bindings needs the same kind of frontend-supplied trust predicate Phase 2 built (`internal/frontend`'s `trustedTerminator`), not yet built for these two dimensions. "Worker exit state" (termination), the fourth item in Phase 3's list, is deliberately not reimplemented here: it is naturally a backward question ("can this point reach Exit"), which Phase 2's SCC/reachability analysis (`internal/engine/cfg_verdict.go`) already answers correctly — recomputing it via forward propagation would be redundant at best.
+
+Inspect computed facts with `lifeline -dump facts [-dump-format text|json] ./...`, per `docs/cfg-migration-plan.md` §8.2. Per worker (goroutine): `stop` (available/consumed, from `StopCapability`), `termination` (exit-reachable and each persistent SCC's resolved status, from `internal/engine.SummarizeTermination`, the same computation `LL1002`'s verdict is derived from), and `join` (currently always `"analyzed": false` with an explanatory note, being honest about what isn't wired yet rather than showing fabricated data). Like `-dump cfg`, this bypasses the diagnostic pipeline and applies no file filtering.
+
+No diagnostic verdict was changed by any of this: `LL1002` still uses only `cfg_verdict.go` (Phase 2), and no other rule reads a CFG or a dataflow result at all.
 
 ## Caching
 

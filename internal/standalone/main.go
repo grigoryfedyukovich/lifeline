@@ -57,8 +57,8 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	fs.BoolVar(&opts.includeTests, "tests", false, "include same-package _test.go files")
 	fs.BoolVar(&opts.printConfig, "print-config", false, "print effective configuration and exit")
 	fs.BoolVar(&opts.showVersion, "version", false, "print version and exit")
-	fs.StringVar(&opts.dump, "dump", "", "bypass diagnostics and dump an intermediate representation instead; currently only \"cfg\" is supported")
-	fs.StringVar(&opts.dumpFormat, "dump-format", "text", "format for -dump: text or dot")
+	fs.StringVar(&opts.dump, "dump", "", "bypass diagnostics and dump an intermediate representation instead: \"cfg\" (control-flow graph, text or dot) or \"facts\" (per-worker lifecycle facts, text or json)")
+	fs.StringVar(&opts.dumpFormat, "dump-format", "text", "format for -dump: text always; cfg also accepts dot; facts also accepts json")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: lifeline [flags] [package patterns]\n\n")
 		fs.PrintDefaults()
@@ -113,14 +113,6 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 		patterns = []string{"./..."}
 	}
 	if opts.dump != "" {
-		if opts.dump != "cfg" {
-			fmt.Fprintf(stderr, "lifeline: unsupported -dump value %q (supported: cfg)\n", opts.dump)
-			return ExitInvalid
-		}
-		if opts.dumpFormat != "text" && opts.dumpFormat != "dot" {
-			fmt.Fprintf(stderr, "lifeline: unsupported -dump-format value %q (supported: text, dot)\n", opts.dumpFormat)
-			return ExitInvalid
-		}
 		duration, err := cfg.Duration()
 		if err != nil {
 			fmt.Fprintf(stderr, "lifeline: invalid effective configuration: %v\n", err)
@@ -128,8 +120,27 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), duration)
 		defer cancel()
-		if err := dumpCFGs(ctx, patterns, cfg, opts.dumpFormat, stdout); err != nil {
-			fmt.Fprintf(stderr, "lifeline: %v\n", err)
+		switch opts.dump {
+		case "cfg":
+			if opts.dumpFormat != "text" && opts.dumpFormat != "dot" {
+				fmt.Fprintf(stderr, "lifeline: unsupported -dump-format value %q for -dump cfg (supported: text, dot)\n", opts.dumpFormat)
+				return ExitInvalid
+			}
+			if err := dumpCFGs(ctx, patterns, cfg, opts.dumpFormat, stdout); err != nil {
+				fmt.Fprintf(stderr, "lifeline: %v\n", err)
+				return ExitInvalid
+			}
+		case "facts":
+			if opts.dumpFormat != "text" && opts.dumpFormat != "json" {
+				fmt.Fprintf(stderr, "lifeline: unsupported -dump-format value %q for -dump facts (supported: text, json)\n", opts.dumpFormat)
+				return ExitInvalid
+			}
+			if err := dumpFacts(ctx, patterns, cfg, opts.dumpFormat, stdout); err != nil {
+				fmt.Fprintf(stderr, "lifeline: %v\n", err)
+				return ExitInvalid
+			}
+		default:
+			fmt.Fprintf(stderr, "lifeline: unsupported -dump value %q (supported: cfg, facts)\n", opts.dump)
 			return ExitInvalid
 		}
 		return ExitOK

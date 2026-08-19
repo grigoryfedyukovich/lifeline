@@ -48,11 +48,12 @@ lifeline -format sarif ./... > lifeline.sarif
 go vet -vettool="$(which lifeline)" ./...
 lifeline -dump cfg ./...
 lifeline -dump cfg -dump-format dot ./... | dot -Tpng -o cfg.png
+lifeline -dump facts -dump-format json ./...
 ```
 
 Standalone diagnostics do not fail the command by default. `-fail-on` enables an explicit policy failure using `-ci-exit-code`.
 
-`-dump cfg` bypasses the normal diagnostic pipeline: it builds and prints a control-flow graph (see `docs/architecture.md`) for every named function and function literal instead of running any rule, and always exits `0` on success. It is a development/debugging aid, not a report format, and is not subject to `-fail-on`/`-ci-exit-code`.
+`-dump cfg` and `-dump facts` bypass the normal diagnostic pipeline: `-dump cfg` builds and prints a control-flow graph (see `docs/architecture.md`) for every named function and function literal; `-dump facts` prints, per goroutine, the computed stop-capability, termination, and (not yet fully wired, see `docs/architecture.md`) join facts from the Phase 3 dataflow solver. Neither runs any diagnostic rule, and both always exit `0` on success. Both are development/debugging aids, not report formats, and are not subject to `-fail-on`/`-ci-exit-code`.
 
 Exit codes:
 
@@ -122,6 +123,7 @@ Counts are qualitative in v0.1.1; Lifeline does not prove `Add`/`Done` balance.
 - The typed frontend lowers parser objects into `internal/model` records containing spans, lifecycle facts, and SSA-like instructions.
 - `internal/localssa` versions local definitions and records lifecycle-relevant operations and canonical callees.
 - `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. `internal/frontend` attaches one to each goroutine body, and `internal/engine` consumes it for `LL1002`'s verdict (`docs/architecture.md`) via `model.CFG`'s own graph algorithms, without importing `go/ast`/`go/types` itself.
+- `internal/model.Solve` is a generic forward-dataflow worklist solver over a CFG; `internal/engine`'s `StopCapability`/`JoinObligation`/`Ownership` lattices are built on it (`docs/cfg-migration-plan.md` Phase 3, `docs/architecture.md`), dumpable via `-dump facts`. Only `StopCapability` is wired to real goroutines as of this release; no diagnostic rule reads a dataflow result yet.
 - `internal/engine` imports neither `go/ast` nor `go/types`.
 - Vet mode exports and imports versioned object facts for named function lifecycle summaries.
 - Rendering is isolated in `internal/report`.
