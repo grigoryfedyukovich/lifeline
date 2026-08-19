@@ -29,14 +29,27 @@ import (
 // not affect graph structure. fset and info are required for spans and for
 // resolving call callees and range-over-channel detection.
 //
+// isTrustedTerminator, if non-nil, is consulted for every call expression
+// encountered as a statement (or as the right-hand side of an assignment or
+// send): if it reports true, that call is treated as terminating control
+// flow, with an edge straight to Exit (EdgeTrustedStop), the same way a
+// panic is. This exists for signals that are not visible in pure control
+// flow at all -- a configured stop-wrapper call, or a tracked context
+// passed to a called operation -- where the caller (internal/frontend,
+// which knows the relevant config and which objects are tracked contexts)
+// has already decided the call should be trusted to terminate. internal/cfg
+// itself has no notion of config or tracked contexts; it only acts on what
+// this predicate tells it. Pass nil for a purely structural CFG, e.g. for
+// -dump cfg, which has no such trust decision to apply.
+//
 // Nested function literals are not descended into, matching the rest of
 // Lifeline's architecture: each function literal has its own independent
 // CFG, built by a separate Build call when the caller needs one (e.g. for a
 // goroutine body). A `go`/`defer` statement whose argument is a FuncLit is
 // still recorded as a single instruction in the enclosing CFG; its body is
 // not inlined.
-func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.Info) *model.CFG {
-	b := &builder{fset: fset, info: info, labels: map[string]model.BlockID{}}
+func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.Info, isTrustedTerminator func(*ast.CallExpr) bool) *model.CFG {
+	b := &builder{fset: fset, info: info, labels: map[string]model.BlockID{}, isTrustedTerminator: isTrustedTerminator}
 	entry := b.newBlock("entry")
 	exit := b.newBlock("exit")
 	b.exit = exit
@@ -64,13 +77,14 @@ type frame struct {
 }
 
 type builder struct {
-	fset    *token.FileSet
-	info    *types.Info
-	blocks  []model.BasicBlock
-	current model.BlockID
-	frames  []frame
-	labels  map[string]model.BlockID // label name -> pre-allocated block, for break/continue/goto targets
-	exit    model.BlockID
+	fset                *token.FileSet
+	info                *types.Info
+	blocks              []model.BasicBlock
+	current             model.BlockID
+	frames              []frame
+	labels              map[string]model.BlockID // label name -> pre-allocated block, for break/continue/goto targets
+	exit                model.BlockID
+	isTrustedTerminator func(*ast.CallExpr) bool
 }
 
 func (b *builder) newBlock(kind string) model.BlockID {
@@ -210,13 +224,13 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 		b.current = target
 		b.stmt(x.Stmt, x.Label.Name)
 	case *ast.ExprStmt:
-		b.simpleStmt(x, x.X)
+		b.simpleStmt(x)
 	case *ast.AssignStmt:
-		b.simpleStmt(x, nil)
+		b.simpleStmt(x)
 	case *ast.IncDecStmt:
-		b.simpleStmt(x, x.X)
+		b.simpleStmt(x)
 	case *ast.SendStmt:
-		b.simpleStmt(x, nil)
+		b.simpleStmt(x)
 	case *ast.DeclStmt:
 		b.emit("decl", x, "", nil, nil)
 	case *ast.GoStmt:
@@ -251,12 +265,20 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 	}
 }
 
-func (b *builder) simpleStmt(s ast.Stmt, expr ast.Expr) {
-	if b.hasPanicCall(s, expr) {
+func (b *builder) simpleStmt(s ast.Stmt) {
+	if _, ok := b.findCall(s, b.isPanicCall); ok {
 		b.emit("panic", s, "panic", nil, nil)
 		b.addEdge(b.ensureCurrent(), b.exit, model.EdgePanic, "", b.spanOf(s))
 		b.current = invalidBlock
 		return
+	}
+	if b.isTrustedTerminator != nil {
+		if call, ok := b.findCall(s, b.isTrustedTerminator); ok {
+			b.emit("trusted-stop", s, calleeName(b.info, call), nil, nil)
+			b.addEdge(b.ensureCurrent(), b.exit, model.EdgeTrustedStop, "", b.spanOf(s))
+			b.current = invalidBlock
+			return
+		}
 	}
 	op := "stmt"
 	callee := ""
@@ -272,31 +294,29 @@ func (b *builder) simpleStmt(s ast.Stmt, expr ast.Expr) {
 	b.emit(op, s, callee, nil, nil)
 }
 
-// hasPanicCall reports whether s directly calls the builtin panic: either
-// expr itself is that call (the common case, an ExprStmt or IncDecStmt
-// operand), or s is an AssignStmt/SendStmt whose right-hand side is.
-func (b *builder) hasPanicCall(s ast.Stmt, expr ast.Expr) bool {
-	if call, ok := unwrapCall(expr); ok && b.isPanicCall(call) {
+// findCall looks anywhere within statement s (not just at its top level --
+// e.g. also inside a call's arguments) for a call expression matching
+// predicate, without descending into a nested function literal. This
+// matches the scope internal/frontend's loop-scoped evidence collection
+// already uses for the same kinds of calls (stop wrappers, context
+// delegation), so a CFG built with a trust predicate derived from that
+// mechanism recognizes exactly the same calls it does.
+func (b *builder) findCall(s ast.Stmt, predicate func(*ast.CallExpr) bool) (*ast.CallExpr, bool) {
+	var found *ast.CallExpr
+	ast.Inspect(s, func(n ast.Node) bool {
+		if found != nil {
+			return false
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if call, ok := n.(*ast.CallExpr); ok && predicate(call) {
+			found = call
+			return false
+		}
 		return true
-	}
-	switch x := s.(type) {
-	case *ast.AssignStmt:
-		for _, rhs := range x.Rhs {
-			if call, ok := unwrapCall(rhs); ok && b.isPanicCall(call) {
-				return true
-			}
-		}
-	case *ast.SendStmt:
-		if call, ok := unwrapCall(x.Value); ok && b.isPanicCall(call) {
-			return true
-		}
-	}
-	return false
-}
-
-func unwrapCall(expr ast.Expr) (*ast.CallExpr, bool) {
-	call, ok := expr.(*ast.CallExpr)
-	return call, ok
+	})
+	return found, found != nil
 }
 
 func (b *builder) isPanicCall(call *ast.CallExpr) bool {

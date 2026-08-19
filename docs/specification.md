@@ -93,17 +93,19 @@ A cancel value assigned to `_` is lost immediately. A suggested edit is emitted 
 
 ### Goroutine stop protocol
 
-`LL1002` is considered only when a modeled body contains an unconditional `for` loop. Accepted may-exit evidence is:
+`LL1002` is considered only when a modeled body contains an unconditional `for` loop, and is evaluated over a control-flow graph (`internal/cfg`), not flat per-body booleans: it fires when the loop forms a reachable, persistent (cyclic) strongly-connected component with no edge leaving it that can reach the function's exit block. Each such component is judged independently, so two separate unconditional loops in the same goroutine where only one has its own exit are evaluated separately, not conflated into one whole-body verdict. Accepted may-exit evidence, each represented as a real graph edge to the function's exit rather than a body-wide flag:
 
-- a `return` outside nested function bodies;
-- an explicit `break` outside nested function bodies;
-- channel range;
-- a select case that receives from `ctx.Done()` and returns;
-- a select case that receives from a channel and returns;
-- delegation of an available context to a called operation;
-- a configured stop operation.
+- a `return` (anywhere reachable from the loop, regardless of nesting inside further switch/select/inner-loop constructs, since `return` exits the function unconditionally wherever it occurs);
+- an explicit `break` or labeled `break`/`continue`/`goto`, resolved to its exact target under Go's own grammar (an unlabeled `break` inside a nested loop/switch/select targets that construct, not an outer loop, exactly as Go itself resolves it);
+- a channel range (exhausted/closed exits its own loop; this no longer double-counts as evidence for a separate, unrelated loop in the same body);
+- a `select` case whose body reaches the function's exit by any of the above means, not only a literal `return` immediately following a `ctx.Done()` receive;
+- delegation of an available context to a called operation, or a configured stop operation — both represented as a trusted edge straight to the function's exit (`internal/cfg`'s `trusted-stop` edge kind), since neither is otherwise visible in pure control flow; `internal/cfg` itself has no notion of config or tracked contexts, only the predicate `internal/frontend` derives from them and passes in.
 
-Nested function literals have independent lifecycle summaries. Their loops and stop paths cannot alter the enclosing goroutine's summary, although nested goroutine start sites are analyzed separately.
+All of the above is reachability over a graph, not a proof: a resolving edge means a recognized escape exists, not that every execution takes it, and delegation/configured-stop edges are trusted rather than verified.
+
+This applies whenever a body was available to build a CFG from. A cross-package goroutine target resolved through a `go vet` fact does not yet have one (facts still carry only flat per-body booleans) and uses the older flat check as a fallback; see `docs/limitations.md`.
+
+Nested function literals have independent lifecycle summaries and independent CFGs. Their loops and stop paths cannot alter the enclosing goroutine's summary, although nested goroutine start sites are analyzed separately.
 
 ### Join protocol
 
@@ -119,7 +121,7 @@ Counts are qualitative in v0.1.1; Lifeline does not prove `Add`/`Done` balance.
 - Root packages are analyzed concurrently with a worker count bounded by `GOMAXPROCS`; output remains sorted deterministically.
 - The typed frontend lowers parser objects into `internal/model` records containing spans, lifecycle facts, and SSA-like instructions.
 - `internal/localssa` versions local definitions and records lifecycle-relevant operations and canonical callees.
-- `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. It is not yet consumed by `internal/engine` or any diagnostic rule; see `docs/architecture.md`.
+- `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. `internal/frontend` attaches one to each goroutine body, and `internal/engine` consumes it for `LL1002`'s verdict (`docs/architecture.md`) via `model.CFG`'s own graph algorithms, without importing `go/ast`/`go/types` itself.
 - `internal/engine` imports neither `go/ast` nor `go/types`.
 - Vet mode exports and imports versioned object facts for named function lifecycle summaries.
 - Rendering is isolated in `internal/report`.

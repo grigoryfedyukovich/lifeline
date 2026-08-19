@@ -7,7 +7,9 @@ flowchart LR
     POOL --> PARSE[go/parser + go/types]
     VET[go vet unitchecker] --> FE[Typed frontend]
     PARSE --> FE
-    FE --> MODEL[Language-neutral lifecycle model]
+    FE --> CFGB[CFG builder]
+    CFGB --> MODEL[Language-neutral lifecycle model]
+    FE --> MODEL
     FE --> SSA[Local SSA-like summary]
     SSA --> MODEL
     MODEL --> ENG[Protocol recognizers]
@@ -17,11 +19,10 @@ flowchart LR
     DIAG --> SARIF[SARIF 2.1.0]
     VET <--> FACT[Versioned function object facts]
     FACT --> FE
-    PARSE -.-> CFGB[CFG builder]
     CFGB -.-> CFGDUMP[-dump cfg: text or dot]
 ```
 
-The dotted edges are deliberate: `internal/cfg` is built from the same typed AST as the frontend, but as of this writing nothing in `MODEL`/`ENG` consumes it yet. See "Control-flow graph" below.
+The dotted edge is deliberate: `-dump cfg` calls `internal/cfg` directly, with no trust predicate and outside the normal pipeline, purely to show the structural graph. The solid edges show the path an actual diagnostic (`LL1002`) takes: the frontend builds a CFG per goroutine body (with its trust predicate applied) and attaches it to the model, which `internal/engine` reads via `model.CFG`'s own graph algorithms — without needing to import `go/ast` or `go/types` itself, since `model.CFG` carries no parser dependency. See "Control-flow graph" below.
 
 ## Packages
 
@@ -30,11 +31,11 @@ The dotted edges are deliberate: `internal/cfg` is built from the same typed AST
 | `cmd/lifeline` | Detect standalone versus vet protocol and dispatch. |
 | `analyzer` | `go/analysis` adapter, versioned function facts, categories, source-position indexing, and suggested edits. |
 | `internal/standalone` | Package discovery, bounded parallel loading, export-data importer, type checking, flags, exit policy, and `-dump cfg`. |
-| `internal/frontend` | Typed Go recognition, lifecycle summaries, nested-function isolation, and lowering. |
+| `internal/frontend` | Typed Go recognition, lifecycle summaries, nested-function isolation, lowering, and CFG construction (with a trust predicate) for each goroutine body. |
 | `internal/localssa` | Deterministic, narrow SSA-like instruction summary with canonical callees. |
-| `internal/cfg` | Control-flow graph construction and text/DOT rendering from a typed AST body. Not yet consumed by any rule; see "Control-flow graph" below. |
-| `internal/model` | Parser-independent spans, instructions, lifecycle records, and CFG types. |
-| `internal/engine` | Rule evaluation, assumptions, bounds, and CI policy matching. |
+| `internal/cfg` | Control-flow graph construction and text/DOT rendering from a typed AST body, given an optional trusted-terminator predicate. See "Control-flow graph" below. |
+| `internal/model` | Parser-independent spans, instructions, lifecycle records, and CFG types plus their graph algorithms (`Reachable`, `CanReach`, `SCCs`). |
+| `internal/engine` | Rule evaluation (including CFG/SCC-based `LL1002` verdicts, `cfg_verdict.go`), assumptions, bounds, and CI policy matching. |
 | `internal/report` | Buffered text, JSON, and SARIF rendering. |
 | `internal/config` | Strict JSON and flat YAML/TOML configuration plus shared CLI list parsing. |
 
@@ -78,13 +79,13 @@ The engine imports neither `go/ast` nor `go/types`. All parser-specific reasonin
 
 ## Control-flow graph
 
-`internal/cfg` builds a parser-independent `model.CFG` (explicit basic blocks and edges: `if`/`for`/`range`/`switch`/`select` branches, loop back-edges, `break`/`continue`/`goto` resolved to their actual targets under Go's own scoping rules, `return`/`panic` routed to a function's exit block) from the same typed AST the frontend already walks. It is a structural pass only: nothing in `internal/engine` consumes a CFG today, and building one does not change any diagnostic.
+`internal/cfg` builds a parser-independent `model.CFG` (explicit basic blocks and edges: `if`/`for`/`range`/`switch`/`select` branches, loop back-edges, `break`/`continue`/`goto` resolved to their actual targets under Go's own scoping rules, `return`/`panic` routed to a function's exit block, plus a `trusted-stop` edge for a call `internal/frontend` has decided to trust as terminating even though it is not itself visible in pure control flow — a configured stop-wrapper call, or a tracked context passed to a called operation) from the same typed AST the frontend already walks.
 
-This exists to replace `internal/frontend`'s flat, body-wide "does this contain a return/break/select-with-ctx.Done() anywhere" boolean summaries with true reachability over an explicit graph. The flat summaries can be — and were, prior to loop-scoping added in an earlier release — wrong in a specific, demonstrable way: evidence found anywhere in a goroutine body could suppress a finding about a completely unrelated loop in the same body. Loop-scoping closed the common cases of that class of bug without a graph (see `docs/limitations.md`), but one case remains structurally unfixable without one: a goroutine with two separate unconditional loops where only one has its own exit still clears the finding for both, because exit status is tracked per goroutine, not per loop. `tests/differential/cfg_ast_test.go` captures this exact case as an explicit fixture, verifying both that today's engine still has the gap (so a future fix is provable rather than assumed) and that the CFG already carries the correct answer for it (`TestKnownFalseNegative_NestedLoopsMixedResolution`).
+This replaced `internal/frontend`'s flat, body-wide "does this contain a return/break/select-with-ctx.Done() anywhere" boolean summaries with true reachability over an explicit graph, for `LL1002`. The flat summaries could be — and were, prior to loop-scoping added in an earlier release — wrong in a specific, demonstrable way: evidence found anywhere in a goroutine body could suppress a finding about a completely unrelated loop in the same body. Loop-scoping closed the common cases of that class of bug without a graph; one case remained structurally unfixable without one: a goroutine with two separate unconditional loops where only one has its own exit still cleared the finding for both, because exit status was tracked per goroutine, not per loop. `internal/engine/cfg_verdict.go` closes this: `LL1002` now fires when a goroutine's CFG contains a reachable, persistent (cyclic) strongly-connected component with no edge leaving it that can reach the function's exit, with each such component judged independently. `tests/differential/cfg_ast_test.go` holds the exact former gap as a fixed regression fixture (`TestFixed_NestedLoopsMixedResolution`), verified both directly against the CFG and against the full engine.
 
-Inspect a CFG directly with `lifeline -dump cfg [-dump-format text|dot] ./...`. This walks every named function and every nested function literal (goroutine bodies overwhelmingly being the latter) and bypasses the normal diagnostic pipeline entirely — it is a development aid, not a report format, and applies no `ignore_paths`/generated-file filtering.
+This is not (yet) wired everywhere `LL1002` can fire: a cross-package goroutine target resolved through a `go vet` fact still uses the older flat evidence check, since facts currently carry only those booleans, not a CFG (see `docs/limitations.md`). No other rule (`LL1001`, `LL1003`, `LL1004`) reads a CFG at all.
 
-No rule currently reads a CFG. Migrating a diagnostic (starting with `LL1002`, since it is the most direct fit — reachability of a function's exit from a persistent strongly-connected component) onto CFG/SCC-based reasoning is a distinct, deliberately separate piece of work from building and validating the graph itself.
+Inspect a CFG directly with `lifeline -dump cfg [-dump-format text|dot] ./...`. This walks every named function and every nested function literal (goroutine bodies overwhelmingly being the latter) and bypasses the normal diagnostic pipeline entirely — it is a development aid, not a report format, applies no `ignore_paths`/generated-file filtering, and (unlike the CFG `LL1002` actually uses) is built with no trust predicate, so it never shows a `trusted-stop` edge.
 
 ## Caching
 

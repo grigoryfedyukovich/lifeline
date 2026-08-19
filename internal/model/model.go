@@ -64,6 +64,13 @@ type Goroutine struct {
 	AvailableContexts []string   `json:"available_contexts,omitempty"`
 	CapturedNames     []string   `json:"captured_names,omitempty"`
 	Evidence          []Evidence `json:"evidence,omitempty"`
+	// CFG is the control-flow graph this goroutine's body was analyzed
+	// with, when one was built (nil for cross-package fact-imported
+	// summaries, which carry no body to build one from). It is an internal
+	// analysis input, not part of the user-facing report -- see
+	// internal/cfg for construction and `-dump cfg` to inspect one
+	// directly -- so it is excluded from JSON.
+	CFG *CFG `json:"-"`
 }
 
 type JoinGroup struct {
@@ -88,17 +95,18 @@ type BlockID int
 type EdgeKind string
 
 const (
-	EdgeNormal      EdgeKind = "normal"      // unconditional fallthrough to the next block
-	EdgeTrue        EdgeKind = "true"        // if/for condition true
-	EdgeFalse       EdgeKind = "false"       // if/for condition false, or a range exhausted
-	EdgeCase        EdgeKind = "case"        // switch/type-switch/select case taken (see Edge.Label)
-	EdgeFallthrough EdgeKind = "fallthrough" // an explicit `fallthrough` statement
-	EdgeBreak       EdgeKind = "break"       // break, to the targeted loop/switch/select's successor
-	EdgeContinue    EdgeKind = "continue"    // continue, to the targeted loop's continuation point
-	EdgeLoopBack    EdgeKind = "loop-back"   // a loop's back-edge to its header (the edge that closes the cycle)
-	EdgeGoto        EdgeKind = "goto"        // an explicit goto to a labeled statement
-	EdgeReturn      EdgeKind = "return"      // return, to the function's Exit block
-	EdgePanic       EdgeKind = "panic"       // panic(...), to the function's Exit block
+	EdgeNormal      EdgeKind = "normal"       // unconditional fallthrough to the next block
+	EdgeTrue        EdgeKind = "true"         // if/for condition true
+	EdgeFalse       EdgeKind = "false"        // if/for condition false, or a range exhausted
+	EdgeCase        EdgeKind = "case"         // switch/type-switch/select case taken (see Edge.Label)
+	EdgeFallthrough EdgeKind = "fallthrough"  // an explicit `fallthrough` statement
+	EdgeBreak       EdgeKind = "break"        // break, to the targeted loop/switch/select's successor
+	EdgeContinue    EdgeKind = "continue"     // continue, to the targeted loop's continuation point
+	EdgeLoopBack    EdgeKind = "loop-back"    // a loop's back-edge to its header (the edge that closes the cycle)
+	EdgeGoto        EdgeKind = "goto"         // an explicit goto to a labeled statement
+	EdgeReturn      EdgeKind = "return"       // return, to the function's Exit block
+	EdgePanic       EdgeKind = "panic"        // panic(...), to the function's Exit block
+	EdgeTrustedStop EdgeKind = "trusted-stop" // a recognized stop-wrapper call or context delegation, trusted to terminate even though it is not itself a return, panic, or CFG-visible branch
 )
 
 // Edge is a directed control-flow edge between two blocks of the same CFG.
@@ -141,6 +149,124 @@ func (g *CFG) Block(id BlockID) *BasicBlock {
 		return nil
 	}
 	return &g.Blocks[id]
+}
+
+// Reachable returns every block reachable from start by following edges
+// forward, including start itself.
+func (g *CFG) Reachable(start BlockID) map[BlockID]bool {
+	seen := map[BlockID]bool{start: true}
+	stack := []BlockID{start}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, e := range g.Blocks[id].Successors {
+			if !seen[e.To] {
+				seen[e.To] = true
+				stack = append(stack, e.To)
+			}
+		}
+	}
+	return seen
+}
+
+// CanReach returns every block that can reach target by following edges
+// forward, equivalently every block reachable from target by following
+// Predecessors backward. Includes target itself.
+func (g *CFG) CanReach(target BlockID) map[BlockID]bool {
+	seen := map[BlockID]bool{target: true}
+	stack := []BlockID{target}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, pred := range g.Blocks[id].Predecessors {
+			if !seen[pred] {
+				seen[pred] = true
+				stack = append(stack, pred)
+			}
+		}
+	}
+	return seen
+}
+
+// SCCs returns the strongly connected components of g via Tarjan's
+// algorithm, each as a list of BlockIDs. Every block belongs to exactly
+// one SCC; a block with no cycle through it is a trivial singleton SCC of
+// its own. Use IsPersistentSCC to tell a genuine cycle apart from that
+// trivial case.
+func (g *CFG) SCCs() [][]BlockID {
+	n := len(g.Blocks)
+	index := make([]int, n)
+	low := make([]int, n)
+	onStack := make([]bool, n)
+	for i := range index {
+		index[i] = -1
+	}
+	var stack []BlockID
+	var result [][]BlockID
+	counter := 0
+
+	var strongConnect func(v BlockID)
+	strongConnect = func(v BlockID) {
+		index[v] = counter
+		low[v] = counter
+		counter++
+		stack = append(stack, v)
+		onStack[v] = true
+
+		for _, e := range g.Blocks[v].Successors {
+			w := e.To
+			if index[w] == -1 {
+				strongConnect(w)
+				if low[w] < low[v] {
+					low[v] = low[w]
+				}
+			} else if onStack[w] && index[w] < low[v] {
+				low[v] = index[w]
+			}
+		}
+
+		if low[v] == index[v] {
+			var scc []BlockID
+			for {
+				top := len(stack) - 1
+				w := stack[top]
+				stack = stack[:top]
+				onStack[w] = false
+				scc = append(scc, w)
+				if w == v {
+					break
+				}
+			}
+			result = append(result, scc)
+		}
+	}
+
+	for v := 0; v < n; v++ {
+		if index[v] == -1 {
+			strongConnect(BlockID(v))
+		}
+	}
+	return result
+}
+
+// IsPersistentSCC reports whether scc represents a genuine cycle: more
+// than one block, or a single block with a self-loop (an edge from itself
+// to itself). Tarjan's algorithm gives every block its own singleton SCC
+// when it isn't part of a real cycle; this is how a caller tells the two
+// apart.
+func (g *CFG) IsPersistentSCC(scc []BlockID) bool {
+	if len(scc) > 1 {
+		return true
+	}
+	if len(scc) == 1 {
+		v := scc[0]
+		for _, e := range g.Blocks[v].Successors {
+			if e.To == v {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type Function struct {

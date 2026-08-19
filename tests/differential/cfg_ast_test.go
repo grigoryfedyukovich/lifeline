@@ -1,12 +1,14 @@
-// Package differential captures Phase 0 of the AST->CFG migration: explicit
-// regression fixtures for the current AST-based engine's known behavior,
-// including its known false negative, plus a direct comparison against
-// what internal/cfg's graph already shows for the same code. Nothing here
-// changes any diagnostic; internal/engine does not consume a CFG yet. The
-// purpose is to freeze today's contract and prove, ahead of any rule
-// migration, that the CFG already carries the information a future rule
-// would need to close the gap -- so that migration can be verified against
-// a known-correct baseline instead of taken on faith.
+// Package differential holds fixtures from the AST->CFG migration
+// (docs/cfg-migration-plan.md): explicit regression tests for the engine's
+// lifecycle-diagnostic behavior, run directly against internal/cfg's graph
+// algorithms alongside the full engine, so a verdict change is provable
+// against a concrete before/after rather than taken on faith.
+//
+// TestFixed_NestedLoopsMixedResolution is the load-bearing case: it started
+// as a fixture documenting a known false negative in the AST-based engine
+// (see git history / CHANGELOG for the Phase 2 entry), and was updated in
+// place once the CFG/SCC-based verdict (internal/engine/cfg_verdict.go)
+// closed it, without ever changing what it asserts about the CFG itself.
 package differential
 
 import (
@@ -92,7 +94,7 @@ func exitReachable(t *testing.T, p parsed, funcName string) bool {
 		t.Fatalf("%s does not directly contain a goroutine closure (go func(){...}()); "+
 			"this helper does not resolve named-function goroutine targets", funcName)
 	}
-	g := flowgraph.Build(funcName, p.fset, litBody, p.info)
+	g := flowgraph.Build(funcName, p.fset, litBody, p.info, nil)
 	return reachable(g, g.Entry)[g.Exit]
 }
 
@@ -121,18 +123,23 @@ func hasRule(diags []engine.Diagnostic, ruleID string) bool {
 	return false
 }
 
-// TestKnownFalseNegative_NestedLoopsMixedResolution is the fixture for the
-// residual gap documented in docs/limitations.md: two unconditional loops
-// in the same goroutine, where only the inner one has its own break. The
-// current engine tracks exit status as a single flag per goroutine, not
-// per loop, so the inner loop's real exit incorrectly clears the finding
-// for the outer loop too, which never terminates.
+// TestFixed_NestedLoopsMixedResolution is the fixture for the residual gap
+// documented (until now) in docs/limitations.md: two unconditional loops in
+// the same goroutine, where only the inner one has its own break. Before
+// Phase 2 of the AST->CFG migration, the AST-based engine tracked exit
+// status as a single flag per goroutine, not per loop, so the inner loop's
+// real exit incorrectly cleared the finding for the outer loop too, which
+// never terminates. The CFG-based verdict (internal/engine/cfg_verdict.go)
+// judges each persistent SCC independently, closing this gap.
 //
-// This is deliberately asserted as *current, documented, unfixed*
-// behavior, not a bug to be silently patched here: fixing it is Phase 2+
-// work (CFG/SCC-based LL1002), which this fixture exists to make provable
-// once attempted, not to attempt itself.
-func TestKnownFalseNegative_NestedLoopsMixedResolution(t *testing.T) {
+// This fixture is deliberately paired with TestKnownFalseNegative-style
+// framing in its history: it existed first as a regression test proving
+// the gap was real and documented, then was updated (this version) to
+// prove the fix once Phase 2 landed. Keeping both the "still broken" and
+// "now fixed" assertions inline in the same file across that transition
+// (via the CFG-direct assertion, which never changed) is what made the fix
+// provable rather than assumed.
+func TestFixed_NestedLoopsMixedResolution(t *testing.T) {
 	p := parse(t, `package p
 func Start() {
 	go func() {
@@ -145,10 +152,10 @@ func Start() {
 }
 `)
 	diags := currentDiagnostics(t, p)
-	if hasRule(diags, "LL1002") {
-		t.Fatalf("current engine now reports LL1002 for the mixed-resolution case; "+
-			"if this is an intentional fix, update docs/limitations.md and this fixture together, "+
-			"not just one of them: diags=%#v", diags)
+	if !hasRule(diags, "LL1002") {
+		t.Fatalf("current engine should report LL1002: the inner break only exits the inner loop, "+
+			"the outer loop never terminates -- if this stops firing, the CFG/SCC verdict regressed "+
+			"back to the old flat-evidence behavior: diags=%#v", diags)
 	}
 
 	if exitReachable(t, p, "Start") {

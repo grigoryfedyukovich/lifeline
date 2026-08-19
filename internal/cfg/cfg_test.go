@@ -34,7 +34,7 @@ func build(t *testing.T, source, funcName string) *model.CFG {
 	if body == nil {
 		t.Fatalf("function %s not found", funcName)
 	}
-	return Build(funcName, fset, body, info)
+	return Build(funcName, fset, body, info, nil)
 }
 
 func edgesOfKind(g *model.CFG, kind model.EdgeKind) []model.Edge {

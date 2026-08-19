@@ -84,8 +84,25 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 			out = append(out, base(program, fn, "LL1001", Warning, msg, c.Span, "context-cancel", c.Evidence, suggestion, c.SuggestedFix, meta))
 		}
 		for _, g := range fn.Goroutines {
-			if !g.InfiniteLoop || g.HasReturn || g.ContextStop || g.ChannelStop || g.ExplicitStop {
-				continue
+			if g.CFG != nil {
+				// CFG/SCC-based verdict (Phase 2 of the AST->CFG migration,
+				// see docs/cfg-migration-plan.md): true reachability over
+				// explicit control flow, replacing the flat evidence-anywhere
+				// check below for every case that has a body to build a CFG
+				// from.
+				if !unresolvedLoop(g.CFG) {
+					continue
+				}
+			} else {
+				// No CFG available: a cross-package fact-imported goroutine,
+				// or an unsupported target with no body to analyze. Facts
+				// currently carry only the flat booleans (upgrading them to
+				// carry CFG-derived information is separate, later work); an
+				// unsupported target never reaches here in the first place,
+				// since InfiniteLoop is never set for it.
+				if !g.InfiniteLoop || g.HasReturn || g.ContextStop || g.ChannelStop || g.ExplicitStop {
+					continue
+				}
 			}
 			msg := "goroutine has an unconditional loop and no recognized termination path"
 			suggestion := "establish an explicit owner and stop protocol"

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	flowgraph "github.com/gfedyukovich/lifeline/internal/cfg"
 	"github.com/gfedyukovich/lifeline/internal/config"
 	"github.com/gfedyukovich/lifeline/internal/localssa"
 	"github.com/gfedyukovich/lifeline/internal/model"
@@ -215,6 +216,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	states, groups := b.collectBindings(fd, contexts)
 
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
+	fn.BodyLifecycle.CFG = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn)
 	if source.obj != nil {
 		b.summaries[source.obj] = cloneGoroutine(fn.BodyLifecycle)
@@ -652,6 +654,7 @@ func (b *builder) analyzeLifecycleBody(body *ast.BlockStmt, contexts map[types.O
 	if body == nil {
 		return g
 	}
+	g.CFG = flowgraph.Build(kind, b.in.Fset, body, b.in.Info, b.trustedTerminator(contexts))
 	labels := labeledLoops(body)
 	ast.Inspect(body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
@@ -705,6 +708,29 @@ func labeledLoops(body ast.Node) map[*ast.ForStmt]string {
 // This is lexical containment plus Go's static break-target rules, not
 // reachability analysis: it does not prove the identified path is
 // reachable from every entry into the loop. See docs/limitations.md.
+// trustedTerminator returns a predicate recognizing a call as a "trusted
+// terminator" for CFG construction: a configured stop-wrapper call, or a
+// call receiving one of contexts' tracked objects as an argument (context
+// delegation). This is exactly the call-recognition loopExitEvidence
+// already applies when collecting loop-scoped evidence, extracted into a
+// form internal/cfg can consult without needing to know about config or
+// tracked contexts itself -- internal/cfg only ever sees this predicate,
+// never the config or contexts map it was built from.
+func (b *builder) trustedTerminator(contexts map[types.Object]string) func(*ast.CallExpr) bool {
+	return func(call *ast.CallExpr) bool {
+		if b.hasWrapper(b.stopWrappers, b.callName(call)) {
+			return true
+		}
+		args := objectsUsedInExpressions(call.Args, b.in.Info, true)
+		for obj := range contexts {
+			if hasObject(args, obj) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
 func (b *builder) loopExitEvidence(loop *ast.ForStmt, label string, contexts map[types.Object]string) (hasReturn, contextStop, channelStop, explicitStop bool, evidence []model.Evidence) {
 	if loop.Body == nil {
 		return

@@ -89,7 +89,10 @@ func funcDisplayName(fd *ast.FuncDecl) string {
 }
 
 func dumpOne(w io.Writer, name string, body *ast.BlockStmt, fset *token.FileSet, info *types.Info, format string) {
-	g := flowgraph.Build(name, fset, body, info)
+	// nil: -dump cfg shows the purely structural graph, with no config- or
+	// tracked-context-driven trust decisions applied (see internal/frontend
+	// for where those get built and passed for the real analysis).
+	g := flowgraph.Build(name, fset, body, info, nil)
 	switch format {
 	case "dot":
 		fmt.Fprint(w, flowgraph.RenderDOT(g))
