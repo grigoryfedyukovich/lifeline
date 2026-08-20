@@ -187,6 +187,36 @@ func TestVetImportsVersionedFunctionFacts(t *testing.T) {
 	}
 }
 
+// TestVetCrossPackageFactCatchesMixedResolutionLoop is the cross-package
+// counterpart to tests/differential/cfg_ast_test.go's
+// TestFixed_NestedLoopsMixedResolution: two nested unconditional loops
+// where only the inner one has an exit, but this time the goroutine target
+// is a function in a different package, resolved through a go vet fact
+// rather than analyzed directly. Phase 2 alone did not fix this case: a
+// fact only carried the old flat booleans, and the inner loop's break set
+// the same HasReturn flag the whole function's summary shares, incorrectly
+// clearing the outer loop's finding. Phase 4 (FunctionFact.LoopUnresolved,
+// version.FactVersion 3) fixed it by exporting the fact's own CFG/SCC
+// verdict instead. If this test starts failing, that fix has regressed.
+func TestVetCrossPackageFactCatchesMixedResolutionLoop(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	cmd := exec.Command("go", "vet", "-vettool="+binary, "./tests/testdata/facts/mixed_consumer")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("go vet unexpectedly succeeded: the outer loop never terminates and should be flagged\n%s", out)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("go vet: %v\n%s", err, out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "[LL1002]") || !strings.Contains(text, "versioned lifecycle fact") {
+		t.Fatalf("cross-package fact diagnostic missing for the mixed-resolution loop\n%s", text)
+	}
+}
+
 func TestDumpCFG(t *testing.T) {
 	root := repositoryRoot(t)
 	binary := buildBinary(t, root)

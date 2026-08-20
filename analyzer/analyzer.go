@@ -36,6 +36,16 @@ type FunctionFact struct {
 	ContextStop  bool
 	ChannelStop  bool
 	ExplicitStop bool
+	// LoopUnresolved is this function's own CFG/SCC-derived LL1002 verdict
+	// (Phase 4, docs/cfg-migration-plan.md): whether its body, analyzed as
+	// a goroutine, has a reachable persistent loop with no edge reaching
+	// exit. This is the same computation internal/engine/cfg_verdict.go
+	// runs locally for a same-package or closure target; exporting it lets
+	// a cross-package target get the same precision instead of falling
+	// back to the coarser flat booleans above (see engine.go's LL1002
+	// loop). The prior booleans are kept for informational/JSON value and
+	// as a fallback for a fact whose Version predates this field.
+	LoopUnresolved bool
 }
 
 func (*FunctionFact) AFact() {}
@@ -86,12 +96,18 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
 			return model.Goroutine{}, false
 		}
+		loopUnresolved := fact.LoopUnresolved
 		return model.Goroutine{
 			InfiniteLoop: fact.InfiniteLoop,
 			HasReturn:    fact.HasReturn,
 			ContextStop:  fact.ContextStop,
 			ChannelStop:  fact.ChannelStop,
 			ExplicitStop: fact.ExplicitStop,
+			// ImportedUnresolvedLoop is always populated here rather than
+			// left nil, since ImportObjectFact already required an exact
+			// FactVersion match above: there's no "older fact" case to
+			// leave this nil for once this point is reached.
+			ImportedUnresolvedLoop: &loopUnresolved,
 		}, true
 	}
 	cwd, _ := os.Getwd()
@@ -159,6 +175,7 @@ func exportFunctionFacts(pass *analysis.Pass, program model.Program) {
 			pass.ExportObjectFact(obj, &FunctionFact{
 				Version: version.FactVersion, InfiniteLoop: summary.InfiniteLoop, HasReturn: summary.HasReturn,
 				ContextStop: summary.ContextStop, ChannelStop: summary.ChannelStop, ExplicitStop: summary.ExplicitStop,
+				LoopUnresolved: engine.UnresolvedLoop(summary.CFG),
 			})
 		}
 	}

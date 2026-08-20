@@ -125,7 +125,7 @@ Counts are qualitative in v0.1.1; Lifeline does not prove `Add`/`Done` balance.
 - `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. `internal/frontend` attaches one to each goroutine body, and `internal/engine` consumes it for `LL1002`'s verdict (`docs/architecture.md`) via `model.CFG`'s own graph algorithms, without importing `go/ast`/`go/types` itself.
 - `internal/model.Solve` is a generic forward-dataflow worklist solver over a CFG; `internal/engine`'s `StopCapability`/`JoinObligation`/`Ownership` lattices are built on it (`docs/cfg-migration-plan.md` Phase 3, `docs/architecture.md`), dumpable via `-dump facts`. Only `StopCapability` is wired to real goroutines as of this release; no diagnostic rule reads a dataflow result yet.
 - `internal/engine` imports neither `go/ast` nor `go/types`.
-- Vet mode exports and imports versioned object facts for named function lifecycle summaries.
+- Vet mode exports and imports versioned object facts for named function lifecycle summaries. As of fact schema version 3 (Phase 4, `docs/cfg-migration-plan.md`), the exported fact includes a CFG/SCC-derived `LoopUnresolved` verdict alongside the prior flat booleans, so a cross-package `LL1002` target gets the same precision a same-package or closure target has from `internal/cfg`/`internal/engine`. An incompatible fact version is unavailable, not reinterpreted.
 - Rendering is isolated in `internal/report`.
 
 There is no Lifeline-managed persistent result cache in v0.1.1. If one is introduced, its key must include the tool and fact versions, Go toolchain/build configuration, source and dependency digests, effective configuration, and backend mode.

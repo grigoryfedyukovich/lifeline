@@ -8,7 +8,7 @@ import (
 // single goroutine's CFG: whether Exit is reachable at all, and which
 // persistent (cyclic) strongly-connected components exist, each with its
 // own resolved/trapped status. This is the same information
-// unresolvedLoop's verdict is derived from, exposed in a form suitable for
+// UnresolvedLoop's verdict is derived from, exposed in a form suitable for
 // -dump facts (docs/cfg-migration-plan.md section 8.2) rather than folded
 // straight into a single bool.
 type TerminationFacts struct {
@@ -61,7 +61,7 @@ func SummarizeTermination(g *model.CFG) TerminationFacts {
 	return facts
 }
 
-// unresolvedLoop is the CFG/SCC replacement for the old flat "InfiniteLoop
+// UnresolvedLoop is the CFG/SCC replacement for the old flat "InfiniteLoop
 // && no evidence booleans anywhere in the body" check: it reports whether
 // g's control-flow graph contains a reachable, persistent (cyclic)
 // strongly connected component with no edge leaving it that can reach the
@@ -78,7 +78,12 @@ func SummarizeTermination(g *model.CFG) TerminationFacts {
 // other. tests/differential/cfg_ast_test.go holds this exact case as a
 // fixture, verified against both this function directly and the full
 // engine.
-func unresolvedLoop(g *model.CFG) bool {
+//
+// Exported so analyzer.go's cross-package fact export can compute exactly
+// the same verdict for a function's own body that this file computes for a
+// same-package or closure goroutine target, rather than duplicating the
+// logic (Phase 4, docs/cfg-migration-plan.md).
+func UnresolvedLoop(g *model.CFG) bool {
 	for _, scc := range SummarizeTermination(g).PersistentSCCs {
 		if !scc.Resolved {
 			return true

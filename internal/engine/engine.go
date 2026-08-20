@@ -84,22 +84,28 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 			out = append(out, base(program, fn, "LL1001", Warning, msg, c.Span, "context-cancel", c.Evidence, suggestion, c.SuggestedFix, meta))
 		}
 		for _, g := range fn.Goroutines {
-			if g.CFG != nil {
+			switch {
+			case g.CFG != nil:
 				// CFG/SCC-based verdict (Phase 2 of the AST->CFG migration,
 				// see docs/cfg-migration-plan.md): true reachability over
-				// explicit control flow, replacing the flat evidence-anywhere
-				// check below for every case that has a body to build a CFG
-				// from.
-				if !unresolvedLoop(g.CFG) {
+				// explicit control flow, for every case that has a body to
+				// build a CFG from.
+				if !UnresolvedLoop(g.CFG) {
 					continue
 				}
-			} else {
-				// No CFG available: a cross-package fact-imported goroutine,
-				// or an unsupported target with no body to analyze. Facts
-				// currently carry only the flat booleans (upgrading them to
-				// carry CFG-derived information is separate, later work); an
-				// unsupported target never reaches here in the first place,
-				// since InfiniteLoop is never set for it.
+			case g.ImportedUnresolvedLoop != nil:
+				// A cross-package go vet fact carrying its own CFG/SCC-
+				// derived verdict (Phase 4): the exporting package already
+				// computed this from its own CFG and is trusted here the
+				// same way any other cross-package fact is trusted.
+				if !*g.ImportedUnresolvedLoop {
+					continue
+				}
+			default:
+				// No CFG and no imported verdict available: an unsupported
+				// target with no body to analyze (InfiniteLoop is never set
+				// for these, so this always continues), or a fact from a
+				// version too old to carry ImportedUnresolvedLoop.
 				if !g.InfiniteLoop || g.HasReturn || g.ContextStop || g.ChannelStop || g.ExplicitStop {
 					continue
 				}

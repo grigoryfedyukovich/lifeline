@@ -71,6 +71,16 @@ type Goroutine struct {
 	// internal/cfg for construction and `-dump cfg` to inspect one
 	// directly -- so it is excluded from JSON.
 	CFG *CFG `json:"-"`
+	// ImportedUnresolvedLoop, when non-nil, is a cross-package go vet
+	// fact's own CFG/SCC-derived verdict for whether this goroutine's body
+	// has an unresolved persistent loop (Phase 4, docs/cfg-migration-plan.md).
+	// It exists because a fact-imported goroutine has no CFG of its own to
+	// compute this from directly (see CFG above) -- the exporting package
+	// already computed it there and is trusted to have done so correctly,
+	// the same way any other cross-package fact is trusted rather than
+	// re-derived. Excluded from JSON for the same reason CFG is: an
+	// internal analysis input, not part of the user-facing report.
+	ImportedUnresolvedLoop *bool `json:"-"`
 }
 
 type JoinGroup struct {
