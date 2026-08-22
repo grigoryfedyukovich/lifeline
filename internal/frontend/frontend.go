@@ -40,6 +40,35 @@ type builder struct {
 	funcs     map[*types.Func]*ast.FuncDecl
 	analyzed  map[*types.Func]bool
 	summaries map[*types.Func]model.Goroutine
+	// paramConsumption records, for a cancel-like or group-like function
+	// parameter's own *types.Var object, whether that function's own body
+	// consumes it (calls it, or further transfers it) -- Phase 5 of the
+	// AST->CFG migration (docs/cfg-migration-plan.md), "direct parameter
+	// passing", extended to multiple hops by a small interprocedural fixed
+	// point: Build calls computeParameterConsumption for every function
+	// repeatedly, not once, until no entry changes. A missing map entry
+	// means "not computed yet, possibly still converging", never "verified
+	// not consumed" -- see argumentConsumed's pending return value, which
+	// is what lets a chain resolve correctly regardless of which order
+	// functions are declared in, instead of only as far as a single
+	// declaration-order pass happens to have already reached a deeper
+	// callee. Once Build's fixed-point loop finishes, every lookup here is
+	// a pure, stable map read; argumentConsumed itself never triggers a
+	// fresh computation, which is what keeps it non-recursive.
+	paramConsumption map[types.Object]bool
+	// inParamPrepass is true only while computeParameterConsumption's own
+	// call into observeFunctionBody is on the stack. It tells observeCall
+	// to treat a "pending" dependency (argumentConsumed's third return
+	// value: a real, resolvable same-package callee whose own summary
+	// merely hasn't been computed by this iteration yet) as "no answer
+	// yet, try again next sweep" rather than falling back to "assume
+	// transferred" -- that fallback is correct once and for all for a
+	// callee that can never be resolved (a different package, an
+	// interface method, a function value, a `...` spread), but would
+	// wrongly freeze a same-package chain's result at whatever the first
+	// sweep happened to see, reintroducing the exact declaration-order
+	// dependence the fixed point exists to remove.
+	inParamPrepass bool
 
 	contextInterface *types.Interface
 	contextFactories map[string]struct{}
@@ -155,6 +184,7 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		funcs:            map[*types.Func]*ast.FuncDecl{},
 		analyzed:         map[*types.Func]bool{},
 		summaries:        map[*types.Func]model.Goroutine{},
+		paramConsumption: map[types.Object]bool{},
 		contextInterface: findContextInterface(in.Pkg),
 		contextFactories: stringSet(cfg.ContextWrappers),
 		startWrappers:    stringSet(cfg.StartWrappers),
@@ -185,6 +215,45 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	for _, source := range sources[:limit] {
 		if source.obj != nil {
 			b.analyzed[source.obj] = true
+		}
+	}
+	// Pre-pass (Phase 5, docs/cfg-migration-plan.md): compute which
+	// cancel-like/group-like parameters each function's own body consumes,
+	// before any buildFunction call cross-references another function's
+	// result. This must run as its own pass, not be folded into
+	// buildFunction's main loop below: a caller earlier in file order than
+	// its callee would otherwise see an empty result for that callee
+	// purely due to processing order, not because the callee is genuinely
+	// unanalyzable.
+	//
+	// A single sweep over sources[:limit] is not enough on its own: a
+	// chain like A(c){B(c)}, B(c){C(c)}, C(c){/* consume */} needs C's
+	// result before B's can be computed, and B's before A's, so one pass
+	// only resolves as deep as declaration order happens to already
+	// support -- the exact "different analysis result purely from source
+	// order" problem this loop exists to remove. So this keeps re-running
+	// computeParameterConsumption for every function, in the same order
+	// each time, until a full sweep changes nothing: each sweep can only
+	// ever add information (a param's own recorded value can go from
+	// absent to known, or from known-false to known-true, never back --
+	// see argumentConsumed's "pending" case and inParamPrepass), so this
+	// is a small monotone fixed point over a lattice with two possible
+	// rises per parameter, guaranteeing termination in at most that many
+	// sweeps, and it converges to the same result regardless of which
+	// order the functions happen to be declared in. See argumentConsumed
+	// for how a lookup degrades safely (falls back to the prior
+	// unconditional-escape behavior) once the fixed point is reached and a
+	// callee still has no entry at all -- max_functions truncation being
+	// the main reason that would happen.
+	for {
+		changed := false
+		for _, source := range sources[:limit] {
+			if b.computeParameterConsumption(source.decl) {
+				changed = true
+			}
+		}
+		if !changed {
+			break
 		}
 	}
 	for _, source := range sources[:limit] {
@@ -463,6 +532,191 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 	})
 }
 
+// computeParameterConsumption (re)computes, for every cancel-like or
+// group-like parameter of fd, whether fd's own body consumes it, by
+// running the same Called/Escapes detection machinery used for
+// locally-declared cancel and group bindings (observeFunctionBody)
+// against fd's own body, with those parameters standing in for what would
+// otherwise be locally-declared bindings. This is Phase 5's "direct
+// parameter passing" support (docs/cfg-migration-plan.md): it lets
+// argumentConsumed later tell whether a cancel/group value passed as an
+// argument is actually consumed by the callee, rather than unconditionally
+// trusting that passing it anywhere discharges the caller's own
+// obligation.
+//
+// Build calls this once per function per sweep, as part of a fixed-point
+// loop, not once ever: fd's own body may itself pass a parameter on to
+// another function whose result isn't known yet on an early sweep, in
+// which case that call contributes nothing this time (see inParamPrepass
+// and argumentConsumed's pending result) and fd's recorded value may still
+// rise on a later sweep once that dependency resolves. Recording is
+// monotone -- merged with whatever was already there, via OR, never
+// overwritten with a lower value -- both because that is the only
+// direction new information moves in this analysis (something already
+// shown to be consumed stays consumed) and because it is what makes the
+// fixed point well-defined regardless of how many times or in what order
+// this runs. reportChanged is true iff this call caused any entry to
+// change (including a first-time recording of "false"; recording that a
+// callee's result is known, even if the answer is "not consumed", is
+// itself new information a caller depends on -- see argumentConsumed's
+// pending case), which is what tells Build's loop whether another sweep
+// is needed.
+//
+// The resulting model.Function is discarded: this call exists only for
+// its side effect on b.paramConsumption, not to produce a second copy of
+// fd's own diagnostics (buildFunction does that, separately, for fd's own
+// locally-declared bindings, once the fixed point above has fully
+// converged).
+func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) (reportChanged bool) {
+	if fd.Type.Params == nil {
+		return false
+	}
+	var paramCancels []*cancelState
+	var paramGroups []*groupState
+	for _, field := range fd.Type.Params.List {
+		for _, name := range field.Names {
+			obj := b.in.Info.ObjectOf(name)
+			if obj == nil || name.Name == "_" {
+				continue
+			}
+			if isCancelFuncType(obj.Type()) {
+				paramCancels = append(paramCancels, &cancelState{cancelObj: obj, binding: model.CancelBinding{CancelName: name.Name}})
+				continue
+			}
+			if kind := groupKind(obj.Type()); kind != "" {
+				paramGroups = append(paramGroups, &groupState{obj: obj, group: model.JoinGroup{Kind: kind, Name: name.Name}})
+			}
+		}
+	}
+	if len(paramCancels) == 0 && len(paramGroups) == 0 {
+		return false
+	}
+	contexts := map[types.Object]string{}
+	b.collectContextParams(fd.Type, contexts)
+	var scratch model.Function
+	b.inParamPrepass = true
+	b.observeFunctionBody(fd.Body, contexts, paramCancels, paramGroups, &scratch)
+	b.inParamPrepass = false
+	for _, c := range paramCancels {
+		next := c.binding.Called || c.binding.Escapes
+		if b.recordParamConsumption(c.cancelObj, next) {
+			reportChanged = true
+		}
+	}
+	for _, g := range paramGroups {
+		next := g.group.Joined || g.group.Escapes
+		if b.recordParamConsumption(g.obj, next) {
+			reportChanged = true
+		}
+	}
+	return reportChanged
+}
+
+// recordParamConsumption merges next into b.paramConsumption[obj] via OR
+// and reports whether the recorded state changed: either the value rose
+// from false to true, or this is the first time obj has been recorded at
+// all (a lookup miss and a recorded "false" are different things --
+// argumentConsumed's pending result depends on telling them apart -- so
+// recording "false" for the first time is still a real change dependents
+// need to see).
+func (b *builder) recordParamConsumption(obj types.Object, next bool) bool {
+	prev, existed := b.paramConsumption[obj]
+	merged := prev || next
+	b.paramConsumption[obj] = merged
+	return !existed || merged != prev
+}
+
+// argumentConsumed reports whether obj, passed directly as call's argument
+// at some position, is consumed by the callee's own body: a pure
+// model.Function lookup into b.paramConsumption, populated by
+// computeParameterConsumption's fixed-point loop. This never triggers a
+// fresh analysis (unlike, say, functionSummary's on-demand fallback),
+// which is what keeps it safe from recursion regardless of how functions
+// call each other: a lookup miss just means verified is false, not that
+// anything gets computed here.
+//
+// verified is false for two quite different reasons, which pending tells
+// apart:
+//
+//   - pending == false: the check can never be made with confidence for
+//     this call, no matter how many times it's retried -- the callee isn't
+//     a statically resolvable same-package function, the call uses `...`
+//     spread (whose positional argument-to-parameter mapping this does not
+//     attempt), or obj isn't found as a direct argument expression (only
+//     the direct case is handled, not a nested sub-expression). Callers
+//     should fall back to the prior unconditional "assume the obligation
+//     was transferred" behavior here, never assume a leak from an
+//     inability to check.
+//   - pending == true: the callee is a real, resolvable same-package
+//     function and its parameter was identified, but computeParameterConsumption
+//     hasn't recorded a result for that parameter yet -- either this
+//     iteration of Build's fixed-point loop hasn't reached it yet, or (if
+//     the fixed point has already finished, i.e. outside computeParameterConsumption's
+//     own call into observeFunctionBody) the pre-pass never reached the
+//     callee at all, e.g. max_functions truncation. Inside the fixed
+//     point, this should be treated as "no answer yet" and retried on a
+//     later sweep, not as "assume transferred", or the fixed point would
+//     just reproduce the old single-pass, declaration-order-dependent
+//     result. Once the fixed point has finished, a lingering pending case
+//     can only be the truncation scenario, and should fall back the same
+//     as the never-resolvable case.
+func (b *builder) argumentConsumed(call *ast.CallExpr, obj types.Object) (consumed, verified, pending bool) {
+	if call.Ellipsis.IsValid() {
+		return false, false, false
+	}
+	funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
+	if !ok {
+		return false, false, false
+	}
+	decl := b.funcs[funcObj]
+	if decl == nil {
+		return false, false, false
+	}
+	index := -1
+	for i, arg := range call.Args {
+		if identObject(arg, b.in.Info) == obj {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		return false, false, false
+	}
+	paramObj := paramObjectAtIndex(b.in.Info, decl, index)
+	if paramObj == nil {
+		return false, false, false
+	}
+	consumed, ok = b.paramConsumption[paramObj]
+	return consumed, ok, !ok
+}
+
+// paramObjectAtIndex returns the *types.Var for fd's parameter at the
+// given zero-based position, flattening multi-name parameter groups
+// (func f(a, b context.CancelFunc) has a at 0, b at 1). Returns nil for an
+// unnamed parameter (nothing to resolve) or an out-of-range index.
+func paramObjectAtIndex(info *types.Info, fd *ast.FuncDecl, index int) types.Object {
+	if fd.Type.Params == nil {
+		return nil
+	}
+	i := 0
+	for _, field := range fd.Type.Params.List {
+		if len(field.Names) == 0 {
+			if i == index {
+				return nil
+			}
+			i++
+			continue
+		}
+		for _, name := range field.Names {
+			if i == index {
+				return info.ObjectOf(name)
+			}
+			i++
+		}
+	}
+	return nil
+}
+
 func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups []*groupState) {
 	name := b.callName(call)
 	funObj := calledObject(call.Fun, b.in.Info)
@@ -472,11 +726,40 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 			c.binding.Called = true
 			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "cancel-call", Message: "cancellation function is called", Span: ptrSpan(b.span(call))})
 		}
-		// Passing a cancel function as an argument is a conservative ownership
-		// transfer. Whether the call's result is discarded is unrelated to the
-		// callee receiving that function, so no assignment-context guard applies.
+		// Passing a cancel function as an argument is treated as a
+		// conservative ownership transfer, UNLESS Phase 5's direct-
+		// parameter-passing check (docs/cfg-migration-plan.md) can verify
+		// what actually happens: when the callee is a resolvable
+		// same-package function and its own body demonstrably never
+		// consumes the corresponding parameter, that is a real, checked
+		// leak, not an unverified pass-through -- Escapes stays false and
+		// LL1001 fires. Whenever the check can't be made with confidence,
+		// argumentConsumed reports verified=false and this falls back to
+		// the prior unconditional behavior -- except mid-fixed-point,
+		// where a pending (not yet computed, but real and resolvable)
+		// dependency must be left alone rather than assumed transferred,
+		// or the interprocedural fixed point (computeParameterConsumption)
+		// would just freeze at whatever a single declaration-order pass
+		// happened to see, reintroducing the order dependence it exists to
+		// remove. Whether the call's result is discarded is unrelated to
+		// the callee receiving the function, so no assignment-context
+		// guard applies either way.
 		if c.cancelObj != nil && hasObject(argObjects, c.cancelObj) {
-			c.binding.Escapes = true
+			if consumed, verified, pending := b.argumentConsumed(call, c.cancelObj); verified {
+				if consumed {
+					c.binding.Escapes = true
+					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "passed as an argument; the callee's own body consumes it", Span: ptrSpan(b.span(call))})
+				} else {
+					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never calls or further transfers it", Span: ptrSpan(b.span(call))})
+				}
+			} else if pending && b.inParamPrepass {
+				// No answer yet this sweep; leave the binding as-is. If
+				// the callee really does consume it, that will surface as
+				// consumed==true here on a later sweep and this
+				// function's own recorded result will rise to match.
+			} else {
+				c.binding.Escapes = true
+			}
 		}
 	}
 	for _, g := range groups {
@@ -496,7 +779,21 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 			g.group.Joined = true
 		}
 		if receiver != g.obj && usesGroup && !b.hasWrapper(b.joinWrappers, name) {
-			g.group.Escapes = true
+			// Same Phase 5 verification as cancels above, applied to a
+			// group passed as an argument rather than joined directly,
+			// including the same mid-fixed-point "pending" carve-out.
+			if consumed, verified, pending := b.argumentConsumed(call, g.obj); verified {
+				if consumed {
+					g.group.Escapes = true
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "passed as an argument; the callee's own body joins or further transfers it", Span: ptrSpan(b.span(call))})
+				} else {
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never joins or further transfers it", Span: ptrSpan(b.span(call))})
+				}
+			} else if pending && b.inParamPrepass {
+				// No answer yet this sweep; see the cancel case above.
+			} else {
+				g.group.Escapes = true
+			}
 		}
 	}
 }
