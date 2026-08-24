@@ -45,8 +45,9 @@ type Rule struct {
 var Rules = []Rule{
 	{ID: "LL1001", Name: "lost-cancel", Description: "A context cancellation function is discarded or has no observed call/ownership transfer.", Level: "warning"},
 	{ID: "LL1002", Name: "goroutine-no-stop", Description: "An unconditional-loop goroutine has no recognized cancellation or termination path.", Level: "warning"},
-	{ID: "LL1003", Name: "waitgroup-no-wait", Description: "A local WaitGroup accounts for workers but is not joined or transferred.", Level: "warning"},
-	{ID: "LL1004", Name: "errgroup-no-wait", Description: "A local errgroup starts workers but is not waited or transferred.", Level: "warning"},
+	{ID: "LL1003", Name: "waitgroup-no-wait", Description: "A local WaitGroup accounts for workers but is not fully, verifiably joined before the owner returns.", Level: "warning"},
+	{ID: "LL1004", Name: "errgroup-no-wait", Description: "A local errgroup starts workers but is not fully, verifiably joined before the owner returns.", Level: "warning"},
+	{ID: "LL1005", Name: "wait-before-stop", Description: "A group is joined before its workers' own stop signal is guaranteed to have been sent.", Level: "warning"},
 	{ID: "LL9001", Name: "analysis-incomplete", Description: "A configured bound truncated analysis; remaining code is unknown.", Level: "note"},
 }
 
@@ -119,19 +120,58 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 			out = append(out, base(program, fn, "LL1002", Warning, msg, g.Span, "goroutine-stop", g.Evidence, suggestion, nil, meta))
 		}
 		for _, group := range fn.Groups {
-			if group.Starts == 0 || group.Joined || group.Escapes {
+			if group.Starts == 0 || group.Escapes {
 				continue
 			}
-			rule := "LL1003"
-			protocol := "waitgroup-join"
-			msg := fmt.Sprintf("%s %q accounts for %d worker start(s) but no Wait or ownership transfer is observed", group.Kind, group.Name, group.Starts)
-			suggestion := "wait for the group before the owner returns, or transfer ownership explicitly"
-			if group.Kind == "errgroup" {
-				rule = "LL1004"
-				protocol = "errgroup-join"
-				msg = fmt.Sprintf("errgroup %q starts %d worker(s) but no Wait or ownership transfer is observed", group.Name, group.Starts)
+			// Phase 3 completion (docs/cfg-migration-plan.md): what used to
+			// be a single flat "was Wait observed anywhere" check is now
+			// three independently-verified questions, each with its own
+			// message so the finding says which one actually failed --
+			// unjoined (unchanged from before this phase), joined but not
+			// on every path back to the owner's return (join-before-owner-
+			// return), and joined on every path but literal accounting
+			// still proves an outstanding worker (count intervals). Only
+			// the unjoined case existed before; the other two are real,
+			// checked findings the old flat Joined bool could not tell
+			// apart from "everything's fine". JoinedOnAllPaths == nil (not
+			// established at all -- no CFG, or Joined came from a
+			// join_wrapper call with no call site to check) is treated the
+			// same as "on all paths", matching Joined's own pre-Phase-3
+			// meaning: this only ever downgrades a verdict on positive
+			// evidence, never on an inability to check.
+			joinedOnAllPaths := group.JoinedOnAllPaths == nil || *group.JoinedOnAllPaths
+			if !(group.Joined && joinedOnAllPaths && !group.CountMismatch) {
+				rule, protocol, msg := "LL1003", "waitgroup-join", ""
+				switch {
+				case !group.Joined:
+					msg = fmt.Sprintf("%s %q accounts for %d worker start(s) but no Wait or ownership transfer is observed", group.Kind, group.Name, group.Starts)
+				case !joinedOnAllPaths:
+					msg = fmt.Sprintf("%s %q is joined on some but not every path back to the owner's return", group.Kind, group.Name)
+				default: // group.CountMismatch
+					msg = fmt.Sprintf("%s %q is joined on every path, but literal Add/Done accounting proves an outstanding worker; Wait may never return", group.Kind, group.Name)
+				}
+				suggestion := "wait for the group before the owner returns, or transfer ownership explicitly"
+				switch {
+				case !group.Joined:
+					// keep the default suggestion above
+				case !joinedOnAllPaths:
+					suggestion = "move the Wait call so every return path reaches it, e.g. with defer"
+				default: // group.CountMismatch
+					suggestion = "check every Add call is matched by exactly one Done, including on early-return paths"
+				}
+				if group.Kind == "errgroup" {
+					rule, protocol = "LL1004", "errgroup-join"
+					if !group.Joined {
+						msg = fmt.Sprintf("errgroup %q starts %d worker(s) but no Wait or ownership transfer is observed", group.Name, group.Starts)
+					}
+				}
+				out = append(out, base(program, fn, rule, Warning, msg, group.Span, protocol, group.Evidence, suggestion, nil, meta))
 			}
-			out = append(out, base(program, fn, rule, Warning, msg, group.Span, protocol, group.Evidence, suggestion, nil, meta))
+			if group.StopAfterWait {
+				msg := fmt.Sprintf("%s %q is joined before its workers' own stop signal is guaranteed to have been sent", group.Kind, group.Name)
+				suggestion := "send the stop signal before waiting, not after"
+				out = append(out, base(program, fn, "LL1005", Warning, msg, group.Span, "wait-before-stop", group.Evidence, suggestion, nil, meta))
+			}
 		}
 	}
 	if program.Truncated {

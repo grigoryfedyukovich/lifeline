@@ -2,14 +2,15 @@
 
 Lifeline is a **conservative static analyzer** for Go that helps you spot incomplete goroutine lifecycle protocols. It never claims to prove leaks or non-termination; it only reports local evidence that something important is missing.
 
-## What it looks for (the four rules)
+## What it looks for (the five rules)
 
 | ID     | Short name          | What is missing                                      |
 |--------|---------------------|------------------------------------------------------|
 | LL1001 | lost-cancel         | Cancellation function from `context.With*` is discarded or never called/transferred |
 | LL1002 | goroutine-no-stop   | Goroutine with an unconditional loop has no recognized way to stop |
-| LL1003 | waitgroup-no-wait   | `sync.WaitGroup` starts workers but never `Wait`s    |
-| LL1004 | errgroup-no-wait    | `errgroup.Group` starts workers but never `Wait`s    |
+| LL1003 | waitgroup-no-wait   | `sync.WaitGroup` starts workers but isn't fully, verifiably joined before the owner returns: never `Wait`s, `Wait`s on some but not every return path, or `Wait`s everywhere with a proven `Add`/`Done` count mismatch |
+| LL1004 | errgroup-no-wait    | The same three conditions as LL1003, for `errgroup.Group` (no count-mismatch condition: it manages its own bookkeeping) |
+| LL1005 | wait-before-stop    | `sync.WaitGroup`/`errgroup.Group` is joined before its workers' own stop signal is proven to have been sent |
 
 There is also `LL9001` when analysis hits a configured bound (max functions / timeout).
 

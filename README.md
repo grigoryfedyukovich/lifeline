@@ -39,8 +39,9 @@ examples/ignored_context/worker.go:10:2: [LL1002] goroutine has an unconditional
 |---|---|
 | `LL1001` | A `context.WithCancel`, `WithTimeout`, or `WithDeadline` cancellation function is discarded or has no observed call/ownership transfer. |
 | `LL1002` | A goroutine containing an unconditional loop has no recognized return, `break`, context delegation, context-select exit, channel-close exit, or configured stop operation. |
-| `LL1003` | A local `sync.WaitGroup` accounts for workers but has no observed `Wait` or ownership transfer. |
-| `LL1004` | A local `errgroup.Group` starts workers but has no observed `Wait` or ownership transfer. |
+| `LL1003` | A local `sync.WaitGroup` accounts for workers but isn't fully, verifiably joined before the owner returns (no `Wait` observed, `Wait` skipped by some return path, or a proven `Add`/`Done` count mismatch). |
+| `LL1004` | The same as `LL1003`, for a local `errgroup.Group` (no count-mismatch condition: `errgroup.Group` manages its own bookkeeping). |
+| `LL1005` | A `sync.WaitGroup`/`errgroup.Group` is joined before its workers' own stop signal is proven to have been sent yet. |
 | `LL9001` | Analysis is incomplete because a configured timeout or function bound was reached. Verdict: `UNKNOWN`. |
 
 Every diagnostic includes a stable rule ID, source span, protocol, evidence, assumptions, configured bounds, backend version, and an action only when the recognizer has grounded support for it.

@@ -48,8 +48,45 @@ import (
 // goroutine body). A `go`/`defer` statement whose argument is a FuncLit is
 // still recorded as a single instruction in the enclosing CFG; its body is
 // not inlined.
-func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.Info, isTrustedTerminator func(*ast.CallExpr) bool) *model.CFG {
-	b := &builder{fset: fset, info: info, labels: map[string]model.BlockID{}, isTrustedTerminator: isTrustedTerminator}
+//
+// The second return value maps every call expression Build encountered in
+// a statement's own direct effect position -- a bare call statement, a
+// deferred or go-launched call, or a call on the right-hand side of an
+// assignment (covering, among other things, `err := g.Wait()` and
+// `if err := g.Wait(); err != nil` alike, since an if/for's Init statement
+// is itself processed this same way) -- to the CallSite (block and
+// in-block instruction index) it landed in. A call nested deeper inside a
+// larger expression is not recorded (matching the narrow scope Phase 5's
+// own call-site tracking already uses elsewhere in this codebase). This
+// lets a caller that already has a specific *ast.CallExpr in hand (from
+// its own, separate traversal -- internal/cfg and internal/frontend
+// deliberately walk the same body independently rather than share one
+// traversal) ask "where is this exact call" for CFG-based ordering
+// questions (see model.CFG.ReachableAvoiding and CallSite's own doc
+// comment for why the index matters, not just the block), without
+// internal/cfg needing to know anything about what makes a call
+// interesting.
+// CallSite pinpoints one call expression's exact position in a CFG: which
+// block it landed in, and its index within that block's own Instructions
+// slice. The index is what lets two call sites be ordered relative to
+// each other even when both fall within the very same block: a "does A
+// happen before B" question resolved only at block granularity (see
+// model.CFG.ReachableAvoiding) can't tell two straight-line calls in the
+// same block apart, since neither is doing anything to structurally
+// escape the other. Execution within a single block is always strictly
+// sequential, though (nothing internal/cfg builds ever leaves a block
+// early and then resumes it -- a panic, trusted-stop, or return always
+// ends the block outright), so comparing Index directly resolves the
+// same-block case completely; a caller only needs ReachableAvoiding for
+// the cross-block case. See Build's own doc comment for exactly which
+// calls get a CallSite recorded at all.
+type CallSite struct {
+	Block model.BlockID
+	Index int
+}
+
+func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.Info, isTrustedTerminator func(*ast.CallExpr) bool) (*model.CFG, map[*ast.CallExpr]CallSite) {
+	b := &builder{fset: fset, info: info, labels: map[string]model.BlockID{}, isTrustedTerminator: isTrustedTerminator, callSites: map[*ast.CallExpr]CallSite{}}
 	entry := b.newBlock("entry")
 	exit := b.newBlock("exit")
 	b.exit = exit
@@ -61,7 +98,7 @@ func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.In
 	if b.current != invalidBlock {
 		b.addEdge(b.current, exit, model.EdgeNormal, "", b.spanOf(body))
 	}
-	return &model.CFG{Function: name, Entry: entry, Exit: exit, Blocks: b.blocks}
+	return &model.CFG{Function: name, Entry: entry, Exit: exit, Blocks: b.blocks}, b.callSites
 }
 
 const invalidBlock = model.BlockID(-1)
@@ -85,6 +122,26 @@ type builder struct {
 	labels              map[string]model.BlockID // label name -> pre-allocated block, for break/continue/goto targets
 	exit                model.BlockID
 	isTrustedTerminator func(*ast.CallExpr) bool
+	// callSites is Build's second return value as it's built up; see
+	// Build's own doc comment for exactly which calls get recorded.
+	callSites map[*ast.CallExpr]CallSite
+}
+
+// recordCall notes that call was found in a statement's own direct effect
+// position (see Build's doc comment) and is being processed while
+// b.current is the active block. Called before that statement's own
+// control-flow effects run and before the corresponding instruction is
+// emitted (a trusted-stop or panic call reassigns b.current to
+// invalidBlock right after, and either way exactly one instruction gets
+// emitted per processed statement), so the recorded block is always the
+// one execution was actually in when the call happened, and the recorded
+// index always matches the position that instruction will occupy.
+func (b *builder) recordCall(call *ast.CallExpr) {
+	if call == nil {
+		return
+	}
+	cur := b.ensureCurrent()
+	b.callSites[call] = CallSite{Block: cur, Index: len(b.blocks[cur].Instructions)}
 }
 
 func (b *builder) newBlock(kind string) model.BlockID {
@@ -234,8 +291,10 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 	case *ast.DeclStmt:
 		b.emit("decl", x, "", nil, nil)
 	case *ast.GoStmt:
+		b.recordCall(x.Call)
 		b.emit("go", x, calleeName(b.info, x.Call), nil, nil)
 	case *ast.DeferStmt:
+		b.recordCall(x.Call)
 		b.emit("defer", x, calleeName(b.info, x.Call), nil, nil)
 	case *ast.EmptyStmt:
 		// no-op
@@ -266,6 +325,7 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 }
 
 func (b *builder) simpleStmt(s ast.Stmt) {
+	b.recordDirectCalls(s)
 	if _, ok := b.findCall(s, b.isPanicCall); ok {
 		b.emit("panic", s, "panic", nil, nil)
 		b.addEdge(b.ensureCurrent(), b.exit, model.EdgePanic, "", b.spanOf(s))
@@ -292,6 +352,29 @@ func (b *builder) simpleStmt(s ast.Stmt) {
 		}
 	}
 	b.emit(op, s, callee, nil, nil)
+}
+
+// recordDirectCalls records, via recordCall, every call expression in s's
+// own direct effect position: a bare call statement's call, or each
+// right-hand side of an assignment that is itself a call (covering both
+// `wg.Add(1)` and `err := g.Wait()` alike). This runs unconditionally,
+// before the panic/trusted-stop check below: which of those a statement
+// turns out to be doesn't change which block it executed in, and a caller
+// asking Build's call-site map about a specific call doesn't care whether
+// internal/cfg separately decided to treat it as a trusted terminator.
+func (b *builder) recordDirectCalls(s ast.Stmt) {
+	switch x := s.(type) {
+	case *ast.ExprStmt:
+		if call, ok := x.X.(*ast.CallExpr); ok {
+			b.recordCall(call)
+		}
+	case *ast.AssignStmt:
+		for _, rhs := range x.Rhs {
+			if call, ok := rhs.(*ast.CallExpr); ok {
+				b.recordCall(call)
+			}
+		}
+	}
 }
 
 // findCall looks anywhere within statement s (not just at its top level --

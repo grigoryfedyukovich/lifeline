@@ -595,3 +595,191 @@ func countdown(c context.CancelFunc, n int) {
 		t.Fatalf("self-recursion that eventually consumes the cancel function should not fire, got diagnostics = %#v", diags)
 	}
 }
+
+// The following tests cover the WaitGroup/errgroup upgrade described in
+// docs/cfg-migration-plan.md's Phase 3 completion section: count
+// intervals, the common Add(1)-then-spawned-Done idiom, join-before-
+// owner-return, and stop-before-wait. Each is a narrow, structurally-
+// grounded check that only ever fires from positive evidence -- see that
+// section, and the doc comments on model.JoinGroup's new fields, for
+// exactly what is and isn't attempted.
+
+func TestWaitGroupCountMismatchFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func(){ defer wg.Done() }()
+	wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("literal Add(2)/Done(1) mismatch should fire LL1003 even though Wait is observed, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupMultipleLiteralAddDoneSitesBalance(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func(){ defer wg.Done() }()
+	go func(){ defer wg.Done() }()
+	go func(){ defer wg.Done() }()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("Add(3) matched by three separate spawned Done sites should balance, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupLoopPairedIdiomBalancesRegardlessOfIterationCount(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(items []int){
+	var wg sync.WaitGroup
+	for range items {
+		wg.Add(1)
+		go func(){ defer wg.Done() }()
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("the common loop-scoped Add(1)/spawned-Done idiom should never be flagged as a count mismatch, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupLoopUnmatchedCountsAreNotFullyKnownNotMismatched(t *testing.T) {
+	// Two Add(1) sites per iteration but only one spawned Done: a genuine
+	// shape this narrow idiom check can't resolve into a specific number
+	// without an iteration count, so it must stay silent (on the count
+	// question) rather than guess in either direction. Wait is on every
+	// path, so nothing else should fire either.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(items []int){
+	var wg sync.WaitGroup
+	for range items {
+		wg.Add(1)
+		wg.Add(1)
+		go func(){ defer wg.Done() }()
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("an unresolvable loop-scoped count should never be reported as a mismatch, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupJoinedOnSomeButNotAllPathsFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	if cond() {
+		return
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a Wait() bypassed by an early return should fire LL1003, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupJoinedOnAllPathsFromBothBranchesDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	if cond() {
+		wg.Wait()
+		return
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a Wait() call present on every branch's own return path should not fire, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupStopAfterWaitFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+	}()
+	wg.Wait()
+	cancel()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1005" {
+		t.Fatalf("a cancel-based stop signal only reachable after Wait() should fire LL1005, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupStopBeforeWaitDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+	}()
+	cancel()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a cancel-based stop signal guaranteed before Wait() should not fire, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupUnrelatedCancelNotCapturedByChildDoesNotFireStopAfterWait(t *testing.T) {
+	// cancel's own context is never captured by the started goroutine
+	// (UsedByChild stays false), so it isn't credited as this group's stop
+	// signal at all, regardless of where it falls relative to Wait().
+	diags := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+func Start(parent context.Context) {
+	_, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	wg.Wait()
+	cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("an unrelated cancel call should not be credited as this group's stop signal, got diagnostics = %#v", diags)
+	}
+}

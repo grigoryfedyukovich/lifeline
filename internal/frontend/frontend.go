@@ -3,8 +3,10 @@ package frontend
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
+	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -266,11 +268,24 @@ type cancelState struct {
 	binding   model.CancelBinding
 	ctxObj    types.Object
 	cancelObj types.Object
+	// callSites records every direct call to cancelObj itself (the "cancel-
+	// call" evidence case in observeCall), in AST-node identity form rather
+	// than just the span already on Evidence. computeGroupOrdering
+	// (docs/cfg-migration-plan.md, Phase 3 completion) uses this to find
+	// which CFG block a candidate "stop signal" call landed in, via
+	// Build's call-site map -- a lookup that needs the exact node, not a
+	// span, since a defer-wrapped call's own span differs from its
+	// underlying *ast.CallExpr's.
+	callSites []*ast.CallExpr
 }
 
 type groupState struct {
 	group model.JoinGroup
 	obj   types.Object
+	// waitCallSites is the same kind of AST-node record as
+	// cancelState.callSites above, for the same reason: finding each
+	// Wait() call's CFG block by identity, not by span.
+	waitCallSites []*ast.CallExpr
 }
 
 func (b *builder) buildFunction(source funcSource) model.Function {
@@ -285,8 +300,23 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	states, groups := b.collectBindings(fd, contexts)
 
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
-	fn.BodyLifecycle.CFG = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
+	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn)
+	computeGroupBalances(groups, fd.Body, b.in.Info)
+	// computeGroupOrdering needs real control-flow reachability, not
+	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
+	// receiving a tracked context is trusted to eventually terminate",
+	// calibrated for LL1002's loop-escape question, where treating such a
+	// call as if it reached the function's exit is a reasonable
+	// abstraction. It is not a reasonable one here -- context.WithCancel
+	// obviously returns normally, and the extremely common `ctx, cancel :=
+	// context.WithCancel(parent)` idiom would otherwise make everything
+	// after it look unreachable from entry, which is never actually true.
+	// So this builds its own, separate, purely structural CFG (nil trust
+	// predicate) rather than reusing fn.BodyLifecycle.CFG, at the cost of
+	// building the CFG twice per function.
+	orderingCFG, orderingCallBlocks := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
+	b.computeGroupOrdering(groups, states, fd.Body, orderingCFG, orderingCallBlocks)
 	if source.obj != nil {
 		b.summaries[source.obj] = cloneGoroutine(fn.BodyLifecycle)
 	}
@@ -724,6 +754,7 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 	for _, c := range cancels {
 		if c.cancelObj != nil && funObj == c.cancelObj {
 			c.binding.Called = true
+			c.callSites = append(c.callSites, call)
 			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "cancel-call", Message: "cancellation function is called", Span: ptrSpan(b.span(call))})
 		}
 		// Passing a cancel function as an argument is treated as a
@@ -771,6 +802,7 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 				g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "worker-start", Message: "worker accounting starts here", Span: ptrSpan(b.span(call))})
 			case "Wait":
 				g.group.Joined = true
+				g.waitCallSites = append(g.waitCallSites, call)
 				g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "join", Message: "group is joined here", Span: ptrSpan(b.span(call))})
 			}
 		}
@@ -875,6 +907,404 @@ func (b *builder) markChildUses(call *ast.CallExpr, cancels []*cancelState) {
 	}
 }
 
+// groupBalance is the literal, provable Add/Done tally walkGroupBalance
+// produces for one sync.WaitGroup: see computeGroupBalances.
+type groupBalance struct {
+	addTotal, doneTotal int
+	fullyKnown          bool
+}
+
+// loopScope accumulates same-idiom Add(1)/spawned-Done counts found
+// directly within one loop's own body (a nested loop gets its own separate
+// scope, closed and reconciled independently before its results, if any,
+// propagate up as ordinary otherActivity), so they can be compared once
+// that loop's body has been fully walked. See closeLoopScope.
+type loopScope struct {
+	addOnes      int
+	spawnedDones int
+	// otherActivity is set by anything found inside this loop that doesn't
+	// fit the narrow "some number of Add(1) calls matched by the same
+	// number of go-statements whose spawned body calls Done()" idiom: a
+	// non-literal or non-1 Add amount, a bare Done() call with no
+	// associated spawn, or (via closeLoopScope) a raw addOnes/spawnedDones
+	// count that doesn't match.
+	otherActivity bool
+}
+
+// computeGroupBalances fills in CountMismatch for every local WaitGroup in
+// groups (Phase 3 completion, "count intervals" and "common Add/Done
+// relationships", docs/cfg-migration-plan.md): a second, narrower pass
+// over the same function body specifically for WaitGroup accounting, kept
+// separate from observeCall's single-node-at-a-time traversal because it
+// needs same-block/same-loop sibling context that traversal doesn't carry.
+// errgroup.Group is skipped entirely: its Add/Done-equivalent accounting
+// is internal to the library, so there is nothing here for a caller to get
+// wrong the same way.
+//
+// See walkGroupBalance and closeLoopScope for exactly what is and isn't
+// recognized; CountMismatch is set only from a positive literal proof of
+// imbalance, never from an inability to fully account for every call site.
+func computeGroupBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info) {
+	for _, g := range groups {
+		if g.group.Kind != "waitgroup" || g.obj == nil {
+			continue
+		}
+		bal := walkGroupBalance(body, g.obj, info)
+		if bal.fullyKnown && bal.addTotal > bal.doneTotal {
+			g.group.CountMismatch = true
+			g.group.Evidence = append(g.group.Evidence, model.Evidence{
+				Kind:    "count-mismatch",
+				Message: fmt.Sprintf("literal accounting shows %d more Add than Done; Wait may never return", bal.addTotal-bal.doneTotal),
+			})
+		}
+	}
+}
+
+// walkGroupBalance recursively scans body's statement lists (not
+// descending into a nested FuncLit, matching the rest of this file's
+// scope) for obj's own Add()/Done() call sites, plus any `go` statement
+// whose spawned function literal itself calls Done() on obj. A site
+// outside any loop with a literal amount (always 1 for Done, or a
+// constant-folded non-negative int for Add) contributes exactly that much
+// to addTotal/doneTotal. A site inside a loop is instead attributed to
+// that loop's own loopScope (see closeLoopScope) rather than the running
+// total directly, since its true contribution depends on an iteration
+// count this analysis does not track. Anything that doesn't fit one of
+// these shapes -- a non-literal Add amount outside a loop, or (via
+// closeLoopScope) an unmatched loop-scoped site -- clears fullyKnown,
+// which is the signal computeGroupBalances uses to never report a
+// mismatch it can't actually prove.
+func walkGroupBalance(body *ast.BlockStmt, obj types.Object, info *types.Info) groupBalance {
+	bal := groupBalance{fullyKnown: true}
+
+	noteAdd := func(amount int, literal bool, scope *loopScope) {
+		switch {
+		case scope == nil && literal:
+			bal.addTotal += amount
+		case scope != nil && literal && amount == 1:
+			scope.addOnes++
+		case scope != nil:
+			scope.otherActivity = true
+		default:
+			bal.fullyKnown = false
+		}
+	}
+	noteDone := func(scope *loopScope) {
+		if scope == nil {
+			bal.doneTotal++
+			return
+		}
+		scope.otherActivity = true // a bare Done() inside a loop, on its own, isn't the recognized idiom
+	}
+	noteSpawnedDone := func(scope *loopScope) {
+		if scope == nil {
+			bal.doneTotal++
+			return
+		}
+		scope.spawnedDones++
+	}
+	closeLoopScope := func(scope *loopScope) {
+		if scope.otherActivity {
+			bal.fullyKnown = false
+			return
+		}
+		if scope.addOnes != scope.spawnedDones {
+			// Both zero means no activity for this group in this loop at
+			// all -- fine, nothing to reconcile. A nonzero mismatch (e.g.
+			// two Add(1) sites but only one spawned Done per iteration) is
+			// a real shape this narrow idiom check can't resolve into a
+			// specific number without knowing the iteration count, so it
+			// falls back to "not fully known" rather than guessing.
+			if scope.addOnes != 0 || scope.spawnedDones != 0 {
+				bal.fullyKnown = false
+			}
+			return
+		}
+		// addOnes == spawnedDones (including both zero): this loop
+		// balances itself every iteration regardless of how many
+		// iterations actually run. Nothing propagates to addTotal/
+		// doneTotal, and fullyKnown is unaffected.
+	}
+
+	var walkStmt func(s ast.Stmt, scope *loopScope)
+	walkList := func(list []ast.Stmt, scope *loopScope) {
+		for _, s := range list {
+			walkStmt(s, scope)
+		}
+	}
+	walkStmt = func(s ast.Stmt, scope *loopScope) {
+		if call, ok := groupMethodCall(s, obj, info); ok {
+			switch selectorMethod(call.Fun) {
+			case "Add":
+				amount, literal := literalNonNegativeInt(soleArg(call), info)
+				noteAdd(amount, literal, scope)
+			case "Done":
+				noteDone(scope)
+			}
+			return
+		}
+		if goStmt, ok := s.(*ast.GoStmt); ok {
+			if lit, ok := goStmt.Call.Fun.(*ast.FuncLit); ok && bodyCallsMethodOn(lit.Body, obj, "Done", info) {
+				noteSpawnedDone(scope)
+			}
+			return
+		}
+		switch x := s.(type) {
+		case *ast.BlockStmt:
+			walkList(x.List, scope)
+		case *ast.IfStmt:
+			walkStmt(x.Body, scope)
+			if x.Else != nil {
+				walkStmt(x.Else, scope)
+			}
+		case *ast.ForStmt:
+			inner := &loopScope{}
+			walkStmt(x.Body, inner)
+			closeLoopScope(inner)
+		case *ast.RangeStmt:
+			inner := &loopScope{}
+			walkStmt(x.Body, inner)
+			closeLoopScope(inner)
+		case *ast.SwitchStmt:
+			for _, c := range x.Body.List {
+				if cc, ok := c.(*ast.CaseClause); ok {
+					walkList(cc.Body, scope)
+				}
+			}
+		case *ast.TypeSwitchStmt:
+			for _, c := range x.Body.List {
+				if cc, ok := c.(*ast.CaseClause); ok {
+					walkList(cc.Body, scope)
+				}
+			}
+		case *ast.SelectStmt:
+			for _, c := range x.Body.List {
+				if cc, ok := c.(*ast.CommClause); ok {
+					walkList(cc.Body, scope)
+				}
+			}
+		case *ast.LabeledStmt:
+			walkStmt(x.Stmt, scope)
+		}
+	}
+	if body != nil {
+		walkList(body.List, nil)
+	}
+	return bal
+}
+
+// groupMethodCall reports whether s is (or directly defers) a call to
+// obj's Add or Done method, covering both `wg.Done()` and `defer
+// wg.Done()` the same way -- a bare Done() call site directly in the
+// owner's own body, with no associated spawn, is unusual but not
+// impossible, and undercounting it would risk a false CountMismatch, not
+// just a missed one.
+func groupMethodCall(s ast.Stmt, obj types.Object, info *types.Info) (*ast.CallExpr, bool) {
+	var call *ast.CallExpr
+	switch x := s.(type) {
+	case *ast.ExprStmt:
+		call, _ = x.X.(*ast.CallExpr)
+	case *ast.DeferStmt:
+		call = x.Call
+	}
+	if call == nil || selectorReceiverObject(call.Fun, info) != obj {
+		return nil, false
+	}
+	switch selectorMethod(call.Fun) {
+	case "Add", "Done":
+		return call, true
+	}
+	return nil, false
+}
+
+// soleArg returns call's only argument, or nil if it doesn't have exactly
+// one (sync.WaitGroup.Add always does in valid, type-checked code; nil
+// here just means literalNonNegativeInt will report "not a literal").
+func soleArg(call *ast.CallExpr) ast.Expr {
+	if len(call.Args) != 1 {
+		return nil
+	}
+	return call.Args[0]
+}
+
+// literalNonNegativeInt reports the constant-folded, non-negative integer
+// value of e, using the type-checker's own constant evaluation
+// (info.Types[e].Value) rather than hand-rolling *ast.BasicLit matching --
+// this is what lets a named constant (`const workers = 4; wg.Add(workers)`)
+// count exactly the same way a bare literal does.
+func literalNonNegativeInt(e ast.Expr, info *types.Info) (int, bool) {
+	if e == nil {
+		return 0, false
+	}
+	tv, ok := info.Types[e]
+	if !ok || tv.Value == nil {
+		return 0, false
+	}
+	n, ok := constant.Int64Val(tv.Value)
+	if !ok || n < 0 || n > math.MaxInt32 {
+		return 0, false
+	}
+	return int(n), true
+}
+
+// bodyCallsMethodOn reports whether body contains a call obj.method(...)
+// anywhere, including one reached via defer, except inside a further-
+// nested function literal (consistent with the rest of this file's
+// scoping): an existence check, not a reachability one -- it does not
+// establish the call happens on every path through body, only that it
+// appears somewhere in it. See walkGroupBalance's own doc comment for why
+// that narrower guarantee is what this idiom check needs.
+func bodyCallsMethodOn(body ast.Node, obj types.Object, method string, info *types.Info) bool {
+	if body == nil || obj == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if call, ok := n.(*ast.CallExpr); ok && selectorReceiverObject(call.Fun, info) == obj && selectorMethod(call.Fun) == method {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// collectStopWrapperCalls finds every call in body (not descending into a
+// nested FuncLit) that resolves to a configured stop_wrapper -- the same
+// recognition internal/cfg's trusted-stop edges use (b.trustedTerminator),
+// exposed here as plain call sites for computeGroupOrdering's ordering
+// check (Phase 3 completion, "stop-before-wait",
+// docs/cfg-migration-plan.md). A cancel-function call is a separate kind
+// of stop signal and is collected on cancelState.callSites directly by
+// observeCall instead, since a cancel binding already tracks its own calls
+// for LL1001's own purposes.
+func (b *builder) collectStopWrapperCalls(body *ast.BlockStmt) []*ast.CallExpr {
+	var calls []*ast.CallExpr
+	if body == nil {
+		return calls
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if call, ok := n.(*ast.CallExpr); ok && b.hasWrapper(b.stopWrappers, b.callName(call)) {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	return calls
+}
+
+// callSitesOf resolves each call in calls to the CallSite (from
+// internal/cfg.Build) it landed in, skipping any call Build never saw in a
+// direct effect position (see Build's own doc comment for exactly which
+// positions those are).
+func callSitesOf(calls []*ast.CallExpr, callSites map[*ast.CallExpr]flowgraph.CallSite) []flowgraph.CallSite {
+	var sites []flowgraph.CallSite
+	for _, call := range calls {
+		if site, ok := callSites[call]; ok {
+			sites = append(sites, site)
+		}
+	}
+	return sites
+}
+
+func blockSetOf(sites []flowgraph.CallSite) map[model.BlockID]bool {
+	set := map[model.BlockID]bool{}
+	for _, site := range sites {
+		set[site.Block] = true
+	}
+	return set
+}
+
+// stopProvenAfterWait reports whether stop is guaranteed to be reached, on
+// every path from g's entry, only after at least one of waitSites has
+// already run. When stop shares a block with a wait site, this is decided
+// directly by comparing in-block instruction index -- see
+// flowgraph.CallSite's own doc comment for why that is both necessary and
+// sufficient for that case, which model.CFG.ReachableAvoiding alone can't
+// resolve (a block is that function's own avoid-set target, and a block
+// can't avoid containing itself). Otherwise it falls back to
+// ReachableAvoiding at block granularity: stop is proven-after iff its
+// block cannot be reached from entry without passing through some wait
+// site's own block first.
+func stopProvenAfterWait(g *model.CFG, waitSites []flowgraph.CallSite, waitBlocks map[model.BlockID]bool, reachableAvoidingWaits map[model.BlockID]bool, stop flowgraph.CallSite) bool {
+	if waitBlocks[stop.Block] {
+		for _, w := range waitSites {
+			if w.Block == stop.Block && w.Index < stop.Index {
+				return true
+			}
+		}
+		return false
+	}
+	return !reachableAvoidingWaits[stop.Block]
+}
+
+// computeGroupOrdering fills in JoinedOnAllPaths and StopAfterWait for
+// every local group in groups, using the owner function's own CFG and the
+// call-site map internal/cfg.Build produced alongside it (Phase 3
+// completion, "join-before-owner-return" and "stop-before-wait",
+// docs/cfg-migration-plan.md). g may be nil (a function with no body to
+// build a CFG from); every group's fields are then left untouched at
+// their safe defaults (JoinedOnAllPaths nil, StopAfterWait at its zero
+// value of false).
+//
+// A candidate "stop signal" is any call to a configured stop_wrapper
+// (unconditionally trusted, the same way internal/cfg's own trusted-stop
+// edges already trust one), or a call to the cancel function of a tracked
+// context that is both actually called (binding.Called) and actually
+// observed to be captured by some goroutine started in this same function
+// (binding.UsedByChild) -- requiring UsedByChild specifically excludes an
+// unrelated cancel() call whose context no goroutine here even looks at,
+// which meaningfully narrows, though does not eliminate, the residual risk
+// of crediting a stop signal that happens to belong to a *different*
+// worker group than the one being checked when a function manages more
+// than one. That narrower per-group correlation is not attempted here;
+// see docs/limitations.md.
+func (b *builder) computeGroupOrdering(groups []*groupState, cancels []*cancelState, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite) {
+	if g == nil || len(groups) == 0 {
+		return
+	}
+	var stopSignals []*ast.CallExpr
+	for _, c := range cancels {
+		if c.binding.Called && c.binding.UsedByChild {
+			stopSignals = append(stopSignals, c.callSites...)
+		}
+	}
+	stopSignals = append(stopSignals, b.collectStopWrapperCalls(body)...)
+	stopSites := callSitesOf(stopSignals, callSites)
+
+	for _, gr := range groups {
+		if !gr.group.Joined {
+			continue // LL1003/LL1004 already fire on this; nothing further to establish
+		}
+		waitSites := callSitesOf(gr.waitCallSites, callSites)
+		if len(waitSites) == 0 {
+			continue // Joined came from a join_wrapper call, not a direct Wait(); no call site here to find a block for
+		}
+		waitBlocks := blockSetOf(waitSites)
+		reachableAvoidingWaits := g.ReachableAvoiding(g.Entry, waitBlocks)
+		onAllPaths := !reachableAvoidingWaits[g.Exit]
+		gr.group.JoinedOnAllPaths = &onAllPaths
+		if !onAllPaths {
+			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the function's entry to its return bypasses every Wait() call for this group"})
+		}
+		for _, stop := range stopSites {
+			if stopProvenAfterWait(g, waitSites, waitBlocks, reachableAvoidingWaits, stop) {
+				gr.group.StopAfterWait = true
+				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "the worker stop signal is only reachable after this Wait() call"})
+				break
+			}
+		}
+	}
+}
+
 func (b *builder) buildGoroutine(site ast.Node, call *ast.CallExpr, callerContexts map[types.Object]string, kind string) model.Goroutine {
 	siteSpan := b.span(site)
 	if lit, ok := call.Fun.(*ast.FuncLit); ok {
@@ -951,7 +1381,7 @@ func (b *builder) analyzeLifecycleBody(body *ast.BlockStmt, contexts map[types.O
 	if body == nil {
 		return g
 	}
-	g.CFG = flowgraph.Build(kind, b.in.Fset, body, b.in.Info, b.trustedTerminator(contexts))
+	g.CFG, _ = flowgraph.Build(kind, b.in.Fset, body, b.in.Info, b.trustedTerminator(contexts))
 	labels := labeledLoops(body)
 	ast.Inspect(body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {

@@ -118,7 +118,7 @@ func (c Config) Validate() error {
 
 func knownRule(id string) bool {
 	switch id {
-	case "LL1001", "LL1002", "LL1003", "LL1004", "LL9001":
+	case "LL1001", "LL1002", "LL1003", "LL1004", "LL1005", "LL9001":
 		return true
 	default:
 		return false

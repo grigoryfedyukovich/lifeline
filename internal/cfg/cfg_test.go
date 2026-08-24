@@ -13,6 +13,15 @@ import (
 
 func build(t *testing.T, source, funcName string) *model.CFG {
 	t.Helper()
+	g, _, _, _ := buildWithCallSites(t, source, funcName)
+	return g
+}
+
+// buildWithCallSites is like build but also returns Build's call-site map,
+// plus the type info and body used to build it, for tests that need to
+// check exactly which calls got recorded and where.
+func buildWithCallSites(t *testing.T, source, funcName string) (*model.CFG, map[*ast.CallExpr]CallSite, *types.Info, *ast.BlockStmt) {
+	t.Helper()
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
 	if err != nil {
@@ -34,7 +43,36 @@ func build(t *testing.T, source, funcName string) *model.CFG {
 	if body == nil {
 		t.Fatalf("function %s not found", funcName)
 	}
-	return Build(funcName, fset, body, info, nil)
+	g, sites := Build(funcName, fset, body, info, nil)
+	return g, sites, info, body
+}
+
+// callNamed finds the single call expression in body whose callee is a
+// bare identifier with the given name, for tests that need the exact
+// *ast.CallExpr to look up in a call-site map. Fails the test if there
+// isn't exactly one match.
+func callNamed(t *testing.T, body ast.Node, name string) *ast.CallExpr {
+	t.Helper()
+	var found *ast.CallExpr
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok || id.Name != name {
+			return true
+		}
+		if found != nil {
+			t.Fatalf("more than one call to %s found", name)
+		}
+		found = call
+		return true
+	})
+	if found == nil {
+		t.Fatalf("no call to %s found", name)
+	}
+	return found
 }
 
 func edgesOfKind(g *model.CFG, kind model.EdgeKind) []model.Edge {
@@ -574,5 +612,136 @@ func c() {}
 	}
 	if total != 3 {
 		t.Fatalf("total instructions = %d, want 3", total)
+	}
+}
+
+// The following tests cover Build's second return value, the call-site
+// map (see Build's own doc comment and CallSite's), added alongside the
+// WaitGroup/errgroup ordering upgrade described in
+// docs/cfg-migration-plan.md's Phase 3 completion section.
+
+func TestCallSites_BareCallStatementRecorded(t *testing.T) {
+	g, sites, _, body := buildWithCallSites(t, `package p
+func F() {
+	a()
+}
+func a() {}
+`, "F")
+	call := callNamed(t, body, "a")
+	site, ok := sites[call]
+	if !ok {
+		t.Fatalf("bare call statement a() should be recorded")
+	}
+	if site.Block != g.Entry {
+		t.Fatalf("a() should land in the entry block for straight-line code, got block %d", site.Block)
+	}
+}
+
+func TestCallSites_DeferAndGoRecorded(t *testing.T) {
+	_, sites, _, body := buildWithCallSites(t, `package p
+func F() {
+	defer a()
+	go b()
+}
+func a() {}
+func b() {}
+`, "F")
+	for _, name := range []string{"a", "b"} {
+		call := callNamed(t, body, name)
+		if _, ok := sites[call]; !ok {
+			t.Fatalf("%s(), reached via defer/go, should be recorded", name)
+		}
+	}
+}
+
+func TestCallSites_AssignmentRHSRecorded(t *testing.T) {
+	_, sites, _, body := buildWithCallSites(t, `package p
+func F() {
+	err := a()
+	_ = err
+}
+func a() error { return nil }
+`, "F")
+	call := callNamed(t, body, "a")
+	if _, ok := sites[call]; !ok {
+		t.Fatalf("a() on an assignment's right-hand side should be recorded")
+	}
+}
+
+func TestCallSites_IfInitAssignmentRecorded(t *testing.T) {
+	// if err := a(); err != nil { ... } -- the Init statement is itself an
+	// *ast.AssignStmt processed the same way a top-level one is, per
+	// Build's own doc comment.
+	_, sites, _, body := buildWithCallSites(t, `package p
+func F() {
+	if err := a(); err != nil {
+		b()
+	}
+}
+func a() error { return nil }
+func b() {}
+`, "F")
+	call := callNamed(t, body, "a")
+	if _, ok := sites[call]; !ok {
+		t.Fatalf("a() in an if statement's Init should be recorded")
+	}
+}
+
+func TestCallSites_NestedCallNotRecorded(t *testing.T) {
+	// b(a()) -- a() is nested inside b()'s argument list, not in a
+	// statement's own direct effect position, so only b() gets recorded.
+	_, sites, _, body := buildWithCallSites(t, `package p
+func F() {
+	b(a())
+}
+func a() int { return 0 }
+func b(int) {}
+`, "F")
+	if _, ok := sites[callNamed(t, body, "b")]; !ok {
+		t.Fatalf("the outer call b(a()) should be recorded")
+	}
+	if _, ok := sites[callNamed(t, body, "a")]; ok {
+		t.Fatalf("the nested call a() should not be recorded")
+	}
+}
+
+func TestCallSites_SameBlockGetsIncreasingIndex(t *testing.T) {
+	_, sites, _, body := buildWithCallSites(t, `package p
+func F() {
+	a()
+	b()
+	c()
+}
+func a() {}
+func b() {}
+func c() {}
+`, "F")
+	siteA := sites[callNamed(t, body, "a")]
+	siteB := sites[callNamed(t, body, "b")]
+	siteC := sites[callNamed(t, body, "c")]
+	if siteA.Block != siteB.Block || siteB.Block != siteC.Block {
+		t.Fatalf("straight-line calls with no branches should all land in the same block, got %v %v %v", siteA, siteB, siteC)
+	}
+	if !(siteA.Index < siteB.Index && siteB.Index < siteC.Index) {
+		t.Fatalf("call sites sharing a block should have strictly increasing indices in program order, got a=%d b=%d c=%d", siteA.Index, siteB.Index, siteC.Index)
+	}
+}
+
+func TestCallSites_DifferentBranchesGetDifferentBlocks(t *testing.T) {
+	_, sites, _, body := buildWithCallSites(t, `package p
+func F(cond bool) {
+	if cond {
+		a()
+	} else {
+		b()
+	}
+}
+func a() {}
+func b() {}
+`, "F")
+	siteA := sites[callNamed(t, body, "a")]
+	siteB := sites[callNamed(t, body, "b")]
+	if siteA.Block == siteB.Block {
+		t.Fatalf("calls in different if/else branches should land in different blocks, both got block %d", siteA.Block)
 	}
 }

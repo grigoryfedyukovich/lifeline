@@ -175,3 +175,71 @@ func TestPersistentSCCEscape(t *testing.T) {
 		})
 	}
 }
+
+// diamond: 0 -> {1, 2} -> 3 (two parallel branches merging before Exit) --
+// used to test ReachableAvoiding's ability to tell "every branch is
+// covered" apart from "one branch bypasses the covered block(s)", which a
+// linear or single-loop CFG can't exercise on its own.
+func diamondCFG() *CFG {
+	return &CFG{Entry: 0, Exit: 3, Blocks: []BasicBlock{
+		{ID: 0, Successors: []Edge{{From: 0, To: 1, Kind: EdgeTrue}, {From: 0, To: 2, Kind: EdgeFalse}}},
+		{ID: 1, Successors: []Edge{{From: 1, To: 3, Kind: EdgeNormal}}, Predecessors: []BlockID{0}},
+		{ID: 2, Successors: []Edge{{From: 2, To: 3, Kind: EdgeNormal}}, Predecessors: []BlockID{0}},
+		{ID: 3, Predecessors: []BlockID{1, 2}},
+	}}
+}
+
+func TestReachableAvoiding_LinearAvoidingMiddleBlocksExit(t *testing.T) {
+	g := linearCFG()
+	got := g.ReachableAvoiding(0, map[BlockID]bool{1: true})
+	if got[2] {
+		t.Fatalf("Exit should be unreachable avoiding block 1 on a purely linear 0->1->2 graph, got %v", got)
+	}
+	if !got[0] {
+		t.Fatalf("start block should always be included when it isn't itself avoided, got %v", got)
+	}
+}
+
+func TestReachableAvoiding_LinearAvoidingNothingReachesEverything(t *testing.T) {
+	g := linearCFG()
+	got := g.ReachableAvoiding(0, nil)
+	for _, want := range []BlockID{0, 1, 2} {
+		if !got[want] {
+			t.Fatalf("block %d should be reachable avoiding nothing, got %v", want, got)
+		}
+	}
+}
+
+func TestReachableAvoiding_StartInAvoidSetIsEmpty(t *testing.T) {
+	g := linearCFG()
+	got := g.ReachableAvoiding(0, map[BlockID]bool{0: true})
+	if len(got) != 0 {
+		t.Fatalf("nothing should be reachable \"without entering avoid\" when start is itself in avoid, got %v", got)
+	}
+}
+
+// TestReachableAvoiding_DiamondBypassViaOtherBranch is the CFG-level
+// primitive behind LL1003/LL1004's join-before-owner-return check
+// (internal/frontend.computeGroupOrdering, docs/cfg-migration-plan.md):
+// a Wait() call covering only one of two branches does not guarantee
+// Exit is unreachable without it, since the other branch bypasses it
+// entirely.
+func TestReachableAvoiding_DiamondBypassViaOtherBranch(t *testing.T) {
+	g := diamondCFG()
+	got := g.ReachableAvoiding(0, map[BlockID]bool{1: true})
+	if !got[3] {
+		t.Fatalf("Exit should still be reachable via block 2, avoiding only block 1, got %v", got)
+	}
+}
+
+// TestReachableAvoiding_DiamondBothBranchesCoveredBlocksExit is the same
+// CFG with both branches' own Wait-equivalent blocks avoided at once,
+// matching a group joined from every branch: Exit is genuinely
+// unreachable without passing through one of them.
+func TestReachableAvoiding_DiamondBothBranchesCoveredBlocksExit(t *testing.T) {
+	g := diamondCFG()
+	got := g.ReachableAvoiding(0, map[BlockID]bool{1: true, 2: true})
+	if got[3] {
+		t.Fatalf("Exit should be unreachable once every branch's own covering block is avoided, got %v", got)
+	}
+}

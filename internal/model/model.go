@@ -91,6 +91,47 @@ type JoinGroup struct {
 	Joined   bool       `json:"joined"`
 	Escapes  bool       `json:"escapes"`
 	Evidence []Evidence `json:"evidence,omitempty"`
+	// CountMismatch is true iff literal, unambiguous accounting proves this
+	// sync.WaitGroup's Add total exceeds its Done total (Phase 3
+	// completion, "count intervals", docs/cfg-migration-plan.md); see
+	// Evidence's "count-mismatch" entry for the specific numbers. Never
+	// true from an inability to verify -- a non-literal Add argument, a
+	// loop-scoped Add or Done not matched by the recognized
+	// Add(1)-then-spawned-Done idiom, or any other shape this narrow check
+	// doesn't attempt, all leave this false, not true. Always false for an
+	// errgroup.Group, whose own Add/Done-equivalent bookkeeping is
+	// internal to the library and not something a caller can get wrong the
+	// same way.
+	CountMismatch bool `json:"count_mismatch"`
+	// JoinedOnAllPaths, when non-nil, is the owner function's own CFG-
+	// verified answer (model.CFG.ReachableAvoiding) to whether every path
+	// from entry to exit passes through at least one of this group's own
+	// Wait() calls -- Phase 3 completion, "join-before-owner-return"
+	// (docs/cfg-migration-plan.md). This mirrors Goroutine.
+	// ImportedUnresolvedLoop's own nil-means-"not established" convention
+	// deliberately: nil covers every case this wasn't (or couldn't be)
+	// checked -- Joined is false to begin with, Joined came from a
+	// join_wrapper call rather than a direct Wait() with a call site to
+	// find a block for, or there was no CFG to check against at all -- and
+	// is treated exactly like Joined's own pre-Phase-3 meaning, not as a
+	// disproof. This is the same class of precision LL1002 already has for
+	// loops (see UnresolvedLoop's own doc comment): a Wait() call reachable
+	// on some path is not the same guarantee as a Wait() call reachable on
+	// every path, and a flat bool alone can't tell those apart from "never
+	// checked".
+	JoinedOnAllPaths *bool `json:"joined_on_all_paths,omitempty"`
+	// StopAfterWait is true iff the owner function also calls a recognized
+	// worker stop signal (a configured stop_wrapper call, or the cancel
+	// function of a tracked context) for its own body, and the CFG proves
+	// that call is reachable only by a path that already passed through
+	// one of this group's Wait() calls -- i.e. Wait is provably called
+	// before the signal that would let its workers stop, not after (Phase
+	// 3 completion, "stop-before-wait", docs/cfg-migration-plan.md). False
+	// whenever no such stop-signal call exists in the owner body, or when
+	// the relative order can't be established this way -- never true from
+	// a mere inability to prove the safe order, only from a positive CFG
+	// proof of the unsafe one.
+	StopAfterWait bool `json:"stop_after_wait"`
 }
 
 // BlockID identifies a basic block within a CFG. It is stable within a
@@ -193,6 +234,45 @@ func (g *CFG) CanReach(target BlockID) map[BlockID]bool {
 				seen[pred] = true
 				stack = append(stack, pred)
 			}
+		}
+	}
+	return seen
+}
+
+// ReachableAvoiding returns every block reachable from start by following
+// edges forward without ever entering a block in avoid, including start
+// itself (unless start is itself in avoid, in which case the result is
+// empty: nothing is reachable "without entering avoid" from a start point
+// that already is one). Unlike Reachable, this treats every block in avoid
+// as if it had been deleted from the graph entirely, not merely as an
+// ordinary block to stop at.
+//
+// This is the primitive a "does every path from A to B pass through C"
+// question reduces to, for any set of candidate C blocks: B is reachable
+// from A avoiding every block in C if and only if some path from A to B
+// exists that never touches C, i.e. C does not lie on every such path. The
+// call sites in internal/engine use this both ways -- "is the owner's own
+// Exit reachable without ever passing through a Wait() call" (join-before-
+// return) and "is a stop-signal call reachable without first passing
+// through a Wait() call" (stop-before-wait, checked in the opposite
+// direction: if the stop signal is NOT reachable avoiding Wait, Wait
+// necessarily precedes it on every path).
+func (g *CFG) ReachableAvoiding(start BlockID, avoid map[BlockID]bool) map[BlockID]bool {
+	seen := map[BlockID]bool{}
+	if avoid[start] {
+		return seen
+	}
+	seen[start] = true
+	stack := []BlockID{start}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, e := range g.Blocks[id].Successors {
+			if avoid[e.To] || seen[e.To] {
+				continue
+			}
+			seen[e.To] = true
+			stack = append(stack, e.To)
 		}
 	}
 	return seen

@@ -94,7 +94,7 @@ func exitReachable(t *testing.T, p parsed, funcName string) bool {
 		t.Fatalf("%s does not directly contain a goroutine closure (go func(){...}()); "+
 			"this helper does not resolve named-function goroutine targets", funcName)
 	}
-	g := flowgraph.Build(funcName, p.fset, litBody, p.info, nil)
+	g, _ := flowgraph.Build(funcName, p.fset, litBody, p.info, nil)
 	return reachable(g, g.Entry)[g.Exit]
 }
 

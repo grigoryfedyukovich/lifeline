@@ -72,8 +72,9 @@ Vet mode follows the normal `go vet` diagnostic exit convention.
 |---|---|---|
 | `LL1001` | `WARNING` | A supported context factory returns a cancel function that is discarded or has no observed call or ownership transfer. |
 | `LL1002` | `WARNING` | A modeled goroutine body contains `for {}` and no accepted return, break, context, channel, or configured stop evidence. |
-| `LL1003` | `WARNING` | A local `sync.WaitGroup` records worker starts but no `Wait` or ownership transfer. |
-| `LL1004` | `WARNING` | A local `errgroup.Group` starts workers but no `Wait` or ownership transfer. |
+| `LL1003` | `WARNING` | A local `sync.WaitGroup` records worker starts but isn't fully, verifiably joined before the owner returns: no `Wait`/ownership transfer observed at all, a `Wait` observed but not on every return path, or a `Wait` on every path with a literal `Add`/`Done` count that still doesn't balance. |
+| `LL1004` | `WARNING` | The same three conditions as `LL1003`, for a local `errgroup.Group` (the count-mismatch condition never applies: `errgroup.Group` manages its own `Add`/`Done`-equivalent bookkeeping internally). |
+| `LL1005` | `WARNING` | A `sync.WaitGroup`/`errgroup.Group` is joined before its workers' own recognized stop signal is guaranteed to have been sent, proven via CFG reachability rather than merely unproven the other way. |
 | `LL9001` | `UNKNOWN` | `max_functions` or the standalone timeout makes analysis incomplete. |
 
 An unsupported direct target is retained as `unsupported` model evidence and is never interpreted as a successful termination proof. Version 0.1.1 does not emit a separate user-visible unsupported diagnostic; this remaining specification gap is tracked in the roadmap.
@@ -114,7 +115,13 @@ Nested function literals have independent lifecycle summaries and independent CF
 - `errgroup.Group.Go` creates a local join obligation.
 - `Wait`, a configured join wrapper, or an observed ownership transfer discharges that obligation.
 
-Counts are qualitative in v0.1.1; Lifeline does not prove `Add`/`Done` balance.
+As of Phase 6 (`docs/cfg-migration-plan.md`), discharge is no longer a single flat "was `Wait` ever observed" boolean, and `Add`/`Done` counts are no longer purely qualitative — three independently-verified upgrades, each only ever firing from positive evidence:
+
+- **Count balance** (`sync.WaitGroup` only): a literal (or constant-folded named `const`) `Add(n)`/`Done()` call outside any loop is counted exactly; the common `Add(1)` paired with a `go func(){ defer wg.Done() }()` inside the same loop is recognized as self-balancing regardless of iteration count. A mismatch is reported only when every `Add`/`Done` site for a group fits one of those two shapes and the totals still don't balance; anything else (a non-literal amount, an unmatched loop-scoped call) leaves the count unproven rather than guessed. `errgroup.Group` is exempt: its bookkeeping is internal to the library.
+- **Join-before-owner-return**: a CFG reachability check (`model.CFG.ReachableAvoiding`) that every path from the owner's own entry to its exit passes through at least one `Wait` call for the group — the same class of precision `LL1002` already has for loops (reachable on *some* path is not reachable on *every* path). A `Wait` bypassed by an early return now fires, where the old flat boolean would have suppressed it.
+- **Stop-before-wait**: the same reachability check in reverse, against a recognized worker stop signal (a configured `stop_wrapper` call, or a tracked context's cancel function that is both called and observed to be captured by a goroutine started in the same function). Firing requires a positive CFG proof that the stop signal is reachable only *after* `Wait`, never merely an absence of proof that it comes before; this is reported as `LL1005`, separately from `LL1003`/`LL1004`.
+
+The stop-signal recognition above is function-scoped, not correlated to which specific group a given goroutine belongs to; see `docs/limitations.md` for the resulting residual risk when a function manages more than one WaitGroup/errgroup and more than one stop mechanism. Both CFG checks are same-function only.
 
 ## 8. Architecture and internal boundary
 
