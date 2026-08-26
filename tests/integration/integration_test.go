@@ -217,6 +217,52 @@ func TestVetCrossPackageFactCatchesMixedResolutionLoop(t *testing.T) {
 	}
 }
 
+// TestVetCrossPackageFactCatchesMixedResolutionLoopExample is the
+// examples/-hosted counterpart to TestVetCrossPackageFactCatchesMixedResolutionLoop
+// above: same pattern, but as a runnable example under examples/ (see
+// examples/README.md) rather than a tests/testdata/ fixture, so a plain
+// `lifeline ./examples/cross_package_mixed_loop_resolution` at least loads
+// without a package error even though it can't produce the real
+// diagnostic standalone (no fact information without go vet).
+func TestVetCrossPackageFactCatchesMixedResolutionLoopExample(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	cmd := exec.Command("go", "vet", "-vettool="+binary, "./examples/cross_package_mixed_loop_resolution/...")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("go vet unexpectedly succeeded: the outer loop never terminates and should be flagged\n%s", out)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("go vet: %v\n%s", err, out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "[LL1002]") || !strings.Contains(text, "versioned lifecycle fact") {
+		t.Fatalf("cross-package fact diagnostic missing for the mixed-resolution loop example\n%s", text)
+	}
+}
+
+// TestStandaloneCrossPackageExampleLoadsWithoutError is the standalone
+// (non-go-vet) counterpart: the whole point of phase6-fix-requirements.md
+// item 1 was that this directory previously had no Go files in it at all
+// ("no Go files in .../examples/cross_package_mixed_loop_resolution"),
+// which is a package-loading error, not an analyzer result. This only
+// guards against that regressing; it deliberately does not assert on
+// which diagnostic (if any) standalone mode produces, since that's a
+// different question already covered by the go-vet test above.
+func TestStandaloneCrossPackageExampleLoadsWithoutError(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	out, code := run(t, root, binary, "./examples/cross_package_mixed_loop_resolution")
+	if code != 0 {
+		t.Fatalf("exit code %d\n%s", code, out)
+	}
+	if strings.Contains(out, "no Go files in") {
+		t.Fatalf("package-loading error should never be reported as an analyzer result\n%s", out)
+	}
+}
+
 func TestDumpCFG(t *testing.T) {
 	root := repositoryRoot(t)
 	binary := buildBinary(t, root)

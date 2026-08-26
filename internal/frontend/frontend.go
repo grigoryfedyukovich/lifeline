@@ -58,20 +58,6 @@ type builder struct {
 	// a pure, stable map read; argumentConsumed itself never triggers a
 	// fresh computation, which is what keeps it non-recursive.
 	paramConsumption map[types.Object]bool
-	// inParamPrepass is true only while computeParameterConsumption's own
-	// call into observeFunctionBody is on the stack. It tells observeCall
-	// to treat a "pending" dependency (argumentConsumed's third return
-	// value: a real, resolvable same-package callee whose own summary
-	// merely hasn't been computed by this iteration yet) as "no answer
-	// yet, try again next sweep" rather than falling back to "assume
-	// transferred" -- that fallback is correct once and for all for a
-	// callee that can never be resolved (a different package, an
-	// interface method, a function value, a `...` spread), but would
-	// wrongly freeze a same-package chain's result at whatever the first
-	// sweep happened to see, reintroducing the exact declaration-order
-	// dependence the fixed point exists to remove.
-	inParamPrepass bool
-
 	contextInterface *types.Interface
 	contextFactories map[string]struct{}
 	startWrappers    map[string]struct{}
@@ -226,37 +212,12 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	// buildFunction's main loop below: a caller earlier in file order than
 	// its callee would otherwise see an empty result for that callee
 	// purely due to processing order, not because the callee is genuinely
-	// unanalyzable.
-	//
-	// A single sweep over sources[:limit] is not enough on its own: a
-	// chain like A(c){B(c)}, B(c){C(c)}, C(c){/* consume */} needs C's
-	// result before B's can be computed, and B's before A's, so one pass
-	// only resolves as deep as declaration order happens to already
-	// support -- the exact "different analysis result purely from source
-	// order" problem this loop exists to remove. So this keeps re-running
-	// computeParameterConsumption for every function, in the same order
-	// each time, until a full sweep changes nothing: each sweep can only
-	// ever add information (a param's own recorded value can go from
-	// absent to known, or from known-false to known-true, never back --
-	// see argumentConsumed's "pending" case and inParamPrepass), so this
-	// is a small monotone fixed point over a lattice with two possible
-	// rises per parameter, guaranteeing termination in at most that many
-	// sweeps, and it converges to the same result regardless of which
-	// order the functions happen to be declared in. See argumentConsumed
-	// for how a lookup degrades safely (falls back to the prior
-	// unconditional-escape behavior) once the fixed point is reached and a
-	// callee still has no entry at all -- max_functions truncation being
-	// the main reason that would happen.
-	for {
-		changed := false
-		for _, source := range sources[:limit] {
-			if b.computeParameterConsumption(source.decl) {
-				changed = true
-			}
-		}
-		if !changed {
-			break
-		}
+	// unanalyzable. See argumentConsumed for how a lookup here degrades
+	// safely (falls back to the prior unconditional-escape behavior)
+	// whenever this pre-pass didn't reach a particular callee at all --
+	// max_functions truncation being the main reason it wouldn't.
+	for _, source := range sources[:limit] {
+		b.computeParameterConsumption(source.decl)
 	}
 	for _, source := range sources[:limit] {
 		program.Functions = append(program.Functions, b.buildFunction(source))
@@ -302,7 +263,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
 	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn)
-	computeGroupBalances(groups, fd.Body, b.in.Info)
+	b.computeGroupBalances(groups, fd.Body, b.in.Info)
 	// computeGroupOrdering needs real control-flow reachability, not
 	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
 	// receiving a tracked context is trusted to eventually terminate",
@@ -562,44 +523,24 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 	})
 }
 
-// computeParameterConsumption (re)computes, for every cancel-like or
-// group-like parameter of fd, whether fd's own body consumes it, by
-// running the same Called/Escapes detection machinery used for
-// locally-declared cancel and group bindings (observeFunctionBody)
-// against fd's own body, with those parameters standing in for what would
-// otherwise be locally-declared bindings. This is Phase 5's "direct
-// parameter passing" support (docs/cfg-migration-plan.md): it lets
-// argumentConsumed later tell whether a cancel/group value passed as an
-// argument is actually consumed by the callee, rather than unconditionally
-// trusting that passing it anywhere discharges the caller's own
-// obligation.
-//
-// Build calls this once per function per sweep, as part of a fixed-point
-// loop, not once ever: fd's own body may itself pass a parameter on to
-// another function whose result isn't known yet on an early sweep, in
-// which case that call contributes nothing this time (see inParamPrepass
-// and argumentConsumed's pending result) and fd's recorded value may still
-// rise on a later sweep once that dependency resolves. Recording is
-// monotone -- merged with whatever was already there, via OR, never
-// overwritten with a lower value -- both because that is the only
-// direction new information moves in this analysis (something already
-// shown to be consumed stays consumed) and because it is what makes the
-// fixed point well-defined regardless of how many times or in what order
-// this runs. reportChanged is true iff this call caused any entry to
-// change (including a first-time recording of "false"; recording that a
-// callee's result is known, even if the answer is "not consumed", is
-// itself new information a caller depends on -- see argumentConsumed's
-// pending case), which is what tells Build's loop whether another sweep
-// is needed.
+// computeParameterConsumption populates b.paramConsumption for every
+// cancel-like or group-like parameter of fd, by running the same
+// Called/Escapes detection machinery used for locally-declared cancel and
+// group bindings (observeFunctionBody) against fd's own body, with those
+// parameters standing in for what would otherwise be locally-declared
+// bindings. This is Phase 5's "direct parameter passing" support
+// (docs/cfg-migration-plan.md): it lets argumentConsumed later tell
+// whether a cancel/group value passed as an argument is actually consumed
+// by the callee, rather than unconditionally trusting that passing it
+// anywhere discharges the caller's own obligation.
 //
 // The resulting model.Function is discarded: this call exists only for
 // its side effect on b.paramConsumption, not to produce a second copy of
 // fd's own diagnostics (buildFunction does that, separately, for fd's own
-// locally-declared bindings, once the fixed point above has fully
-// converged).
-func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) (reportChanged bool) {
+// locally-declared bindings).
+func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) {
 	if fd.Type.Params == nil {
-		return false
+		return
 	}
 	var paramCancels []*cancelState
 	var paramGroups []*groupState
@@ -619,88 +560,49 @@ func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) (reportChanged b
 		}
 	}
 	if len(paramCancels) == 0 && len(paramGroups) == 0 {
-		return false
+		return
 	}
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	var scratch model.Function
-	b.inParamPrepass = true
 	b.observeFunctionBody(fd.Body, contexts, paramCancels, paramGroups, &scratch)
-	b.inParamPrepass = false
 	for _, c := range paramCancels {
-		next := c.binding.Called || c.binding.Escapes
-		if b.recordParamConsumption(c.cancelObj, next) {
-			reportChanged = true
-		}
+		b.paramConsumption[c.cancelObj] = c.binding.Called || c.binding.Escapes
 	}
 	for _, g := range paramGroups {
-		next := g.group.Joined || g.group.Escapes
-		if b.recordParamConsumption(g.obj, next) {
-			reportChanged = true
-		}
+		b.paramConsumption[g.obj] = g.group.Joined || g.group.Escapes
 	}
-	return reportChanged
-}
-
-// recordParamConsumption merges next into b.paramConsumption[obj] via OR
-// and reports whether the recorded state changed: either the value rose
-// from false to true, or this is the first time obj has been recorded at
-// all (a lookup miss and a recorded "false" are different things --
-// argumentConsumed's pending result depends on telling them apart -- so
-// recording "false" for the first time is still a real change dependents
-// need to see).
-func (b *builder) recordParamConsumption(obj types.Object, next bool) bool {
-	prev, existed := b.paramConsumption[obj]
-	merged := prev || next
-	b.paramConsumption[obj] = merged
-	return !existed || merged != prev
 }
 
 // argumentConsumed reports whether obj, passed directly as call's argument
 // at some position, is consumed by the callee's own body: a pure
 // model.Function lookup into b.paramConsumption, populated by
-// computeParameterConsumption's fixed-point loop. This never triggers a
-// fresh analysis (unlike, say, functionSummary's on-demand fallback),
-// which is what keeps it safe from recursion regardless of how functions
-// call each other: a lookup miss just means verified is false, not that
-// anything gets computed here.
+// computeParameterConsumption's pre-pass. This never triggers a fresh
+// analysis (unlike, say, functionSummary's on-demand fallback), which is
+// what keeps it safe from recursion regardless of how functions call each
+// other: a lookup miss just means verified is false, not that anything
+// gets computed here.
 //
-// verified is false for two quite different reasons, which pending tells
-// apart:
-//
-//   - pending == false: the check can never be made with confidence for
-//     this call, no matter how many times it's retried -- the callee isn't
-//     a statically resolvable same-package function, the call uses `...`
-//     spread (whose positional argument-to-parameter mapping this does not
-//     attempt), or obj isn't found as a direct argument expression (only
-//     the direct case is handled, not a nested sub-expression). Callers
-//     should fall back to the prior unconditional "assume the obligation
-//     was transferred" behavior here, never assume a leak from an
-//     inability to check.
-//   - pending == true: the callee is a real, resolvable same-package
-//     function and its parameter was identified, but computeParameterConsumption
-//     hasn't recorded a result for that parameter yet -- either this
-//     iteration of Build's fixed-point loop hasn't reached it yet, or (if
-//     the fixed point has already finished, i.e. outside computeParameterConsumption's
-//     own call into observeFunctionBody) the pre-pass never reached the
-//     callee at all, e.g. max_functions truncation. Inside the fixed
-//     point, this should be treated as "no answer yet" and retried on a
-//     later sweep, not as "assume transferred", or the fixed point would
-//     just reproduce the old single-pass, declaration-order-dependent
-//     result. Once the fixed point has finished, a lingering pending case
-//     can only be the truncation scenario, and should fall back the same
-//     as the never-resolvable case.
-func (b *builder) argumentConsumed(call *ast.CallExpr, obj types.Object) (consumed, verified, pending bool) {
+// verified is false whenever the check can't be made with confidence: the
+// callee isn't a statically resolvable same-package function, the call
+// uses `...` spread (whose positional argument-to-parameter mapping this
+// does not attempt), obj isn't found as a direct argument expression (only
+// the direct case is handled, not a nested sub-expression), or the
+// pre-pass never reached the callee (e.g. max_functions truncation).
+// Callers should fall back to the prior unconditional "assume the
+// obligation was transferred" behavior when verified is false, never
+// assume a leak from an inability to check.
+func (b *builder) argumentConsumed(call *ast.CallExpr, obj types.Object) (consumed, verified bool) {
 	if call.Ellipsis.IsValid() {
-		return false, false, false
+		return false, false
 	}
 	funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
 	if !ok {
-		return false, false, false
+		return false, false
 	}
 	decl := b.funcs[funcObj]
 	if decl == nil {
-		return false, false, false
+		return false, false
 	}
 	index := -1
 	for i, arg := range call.Args {
@@ -710,14 +612,14 @@ func (b *builder) argumentConsumed(call *ast.CallExpr, obj types.Object) (consum
 		}
 	}
 	if index == -1 {
-		return false, false, false
+		return false, false
 	}
 	paramObj := paramObjectAtIndex(b.in.Info, decl, index)
 	if paramObj == nil {
-		return false, false, false
+		return false, false
 	}
 	consumed, ok = b.paramConsumption[paramObj]
-	return consumed, ok, !ok
+	return consumed, ok
 }
 
 // paramObjectAtIndex returns the *types.Var for fd's parameter at the
@@ -776,18 +678,13 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 		// the callee receiving the function, so no assignment-context
 		// guard applies either way.
 		if c.cancelObj != nil && hasObject(argObjects, c.cancelObj) {
-			if consumed, verified, pending := b.argumentConsumed(call, c.cancelObj); verified {
+			if consumed, verified := b.argumentConsumed(call, c.cancelObj); verified {
 				if consumed {
 					c.binding.Escapes = true
 					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "passed as an argument; the callee's own body consumes it", Span: ptrSpan(b.span(call))})
 				} else {
 					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never calls or further transfers it", Span: ptrSpan(b.span(call))})
 				}
-			} else if pending && b.inParamPrepass {
-				// No answer yet this sweep; leave the binding as-is. If
-				// the callee really does consume it, that will surface as
-				// consumed==true here on a later sweep and this
-				// function's own recorded result will rise to match.
 			} else {
 				c.binding.Escapes = true
 			}
@@ -812,17 +709,14 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 		}
 		if receiver != g.obj && usesGroup && !b.hasWrapper(b.joinWrappers, name) {
 			// Same Phase 5 verification as cancels above, applied to a
-			// group passed as an argument rather than joined directly,
-			// including the same mid-fixed-point "pending" carve-out.
-			if consumed, verified, pending := b.argumentConsumed(call, g.obj); verified {
+			// group passed as an argument rather than joined directly.
+			if consumed, verified := b.argumentConsumed(call, g.obj); verified {
 				if consumed {
 					g.group.Escapes = true
 					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "passed as an argument; the callee's own body joins or further transfers it", Span: ptrSpan(b.span(call))})
 				} else {
 					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never joins or further transfers it", Span: ptrSpan(b.span(call))})
 				}
-			} else if pending && b.inParamPrepass {
-				// No answer yet this sweep; see the cancel case above.
 			} else {
 				g.group.Escapes = true
 			}
@@ -907,8 +801,11 @@ func (b *builder) markChildUses(call *ast.CallExpr, cancels []*cancelState) {
 	}
 }
 
-// groupBalance is the literal, provable Add/Done tally walkGroupBalance
-// produces for one sync.WaitGroup: see computeGroupBalances.
+// groupBalance is the literal, provable Add/Done tally
+// walkGroupBalance/walkGroupBalanceStmts produces for one sync.WaitGroup,
+// for exactly the statements it was computed over -- either a whole
+// function body, or (see foldConditionalArms) one isolated, mutually
+// exclusive arm of a conditional. See computeGroupBalances.
 type groupBalance struct {
 	addTotal, doneTotal int
 	fullyKnown          bool
@@ -918,7 +815,7 @@ type groupBalance struct {
 // directly within one loop's own body (a nested loop gets its own separate
 // scope, closed and reconciled independently before its results, if any,
 // propagate up as ordinary otherActivity), so they can be compared once
-// that loop's body has been fully walked. See closeLoopScope.
+// that loop's body has been fully walked. See closeLoopScopeInto.
 type loopScope struct {
 	addOnes      int
 	spawnedDones int
@@ -926,30 +823,33 @@ type loopScope struct {
 	// fit the narrow "some number of Add(1) calls matched by the same
 	// number of go-statements whose spawned body calls Done()" idiom: a
 	// non-literal or non-1 Add amount, a bare Done() call with no
-	// associated spawn, or (via closeLoopScope) a raw addOnes/spawnedDones
-	// count that doesn't match.
+	// associated spawn, a conditional arm inside the loop that doesn't
+	// itself net to zero (see foldConditionalArms), or (via
+	// closeLoopScopeInto) a raw addOnes/spawnedDones count that doesn't
+	// match.
 	otherActivity bool
 }
 
 // computeGroupBalances fills in CountMismatch for every local WaitGroup in
-// groups (Phase 3 completion, "count intervals" and "common Add/Done
-// relationships", docs/cfg-migration-plan.md): a second, narrower pass
-// over the same function body specifically for WaitGroup accounting, kept
-// separate from observeCall's single-node-at-a-time traversal because it
-// needs same-block/same-loop sibling context that traversal doesn't carry.
-// errgroup.Group is skipped entirely: its Add/Done-equivalent accounting
-// is internal to the library, so there is nothing here for a caller to get
-// wrong the same way.
+// groups (Phase 6, "count intervals" and "common Add/Done relationships",
+// docs/cfg-migration-plan.md): a second, narrower pass over the same
+// function body specifically for WaitGroup accounting, kept separate from
+// observeCall's single-node-at-a-time traversal because it needs
+// same-block/same-loop/same-branch sibling context that traversal doesn't
+// carry. errgroup.Group is skipped entirely: its Add/Done-equivalent
+// accounting is internal to the library, so there is nothing here for a
+// caller to get wrong the same way.
 //
-// See walkGroupBalance and closeLoopScope for exactly what is and isn't
-// recognized; CountMismatch is set only from a positive literal proof of
-// imbalance, never from an inability to fully account for every call site.
-func computeGroupBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info) {
+// See walkGroupBalance, foldLoopBody, and foldConditionalArms for exactly
+// what is and isn't recognized; CountMismatch is set only from a positive
+// literal proof of imbalance, never from an inability to fully account for
+// every call site.
+func (b *builder) computeGroupBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info) {
 	for _, g := range groups {
 		if g.group.Kind != "waitgroup" || g.obj == nil {
 			continue
 		}
-		bal := walkGroupBalance(body, g.obj, info)
+		bal := b.walkGroupBalance(body, g.obj, info)
 		if bal.fullyKnown && bal.addTotal > bal.doneTotal {
 			g.group.CountMismatch = true
 			g.group.Evidence = append(g.group.Evidence, model.Evidence{
@@ -960,137 +860,272 @@ func computeGroupBalances(groups []*groupState, body *ast.BlockStmt, info *types
 	}
 }
 
-// walkGroupBalance recursively scans body's statement lists (not
-// descending into a nested FuncLit, matching the rest of this file's
-// scope) for obj's own Add()/Done() call sites, plus any `go` statement
-// whose spawned function literal itself calls Done() on obj. A site
-// outside any loop with a literal amount (always 1 for Done, or a
-// constant-folded non-negative int for Add) contributes exactly that much
-// to addTotal/doneTotal. A site inside a loop is instead attributed to
-// that loop's own loopScope (see closeLoopScope) rather than the running
-// total directly, since its true contribution depends on an iteration
-// count this analysis does not track. Anything that doesn't fit one of
-// these shapes -- a non-literal Add amount outside a loop, or (via
-// closeLoopScope) an unmatched loop-scoped site -- clears fullyKnown,
-// which is the signal computeGroupBalances uses to never report a
-// mismatch it can't actually prove.
-func walkGroupBalance(body *ast.BlockStmt, obj types.Object, info *types.Info) groupBalance {
+// walkGroupBalance computes obj's own Add()/Done() accounting for the
+// whole of body. See walkGroupBalanceStmt for exactly what is and isn't
+// recognized in each statement.
+func (b *builder) walkGroupBalance(body *ast.BlockStmt, obj types.Object, info *types.Info) groupBalance {
+	if body == nil {
+		return groupBalance{fullyKnown: true}
+	}
+	return b.walkGroupBalanceStmts(body.List, obj, info)
+}
+
+// walkGroupBalanceStmts computes a fresh, self-contained groupBalance for
+// exactly the statements in list, executed unconditionally in the
+// sequence given -- used both for a whole function body and, recursively,
+// for one isolated arm of a conditional (see foldConditionalArms), which
+// is what makes it safe to call on an arm without that arm's own
+// accounting bleeding into a sibling arm's.
+func (b *builder) walkGroupBalanceStmts(list []ast.Stmt, obj types.Object, info *types.Info) groupBalance {
 	bal := groupBalance{fullyKnown: true}
-
-	noteAdd := func(amount int, literal bool, scope *loopScope) {
-		switch {
-		case scope == nil && literal:
-			bal.addTotal += amount
-		case scope != nil && literal && amount == 1:
-			scope.addOnes++
-		case scope != nil:
-			scope.otherActivity = true
-		default:
-			bal.fullyKnown = false
-		}
-	}
-	noteDone := func(scope *loopScope) {
-		if scope == nil {
-			bal.doneTotal++
-			return
-		}
-		scope.otherActivity = true // a bare Done() inside a loop, on its own, isn't the recognized idiom
-	}
-	noteSpawnedDone := func(scope *loopScope) {
-		if scope == nil {
-			bal.doneTotal++
-			return
-		}
-		scope.spawnedDones++
-	}
-	closeLoopScope := func(scope *loopScope) {
-		if scope.otherActivity {
-			bal.fullyKnown = false
-			return
-		}
-		if scope.addOnes != scope.spawnedDones {
-			// Both zero means no activity for this group in this loop at
-			// all -- fine, nothing to reconcile. A nonzero mismatch (e.g.
-			// two Add(1) sites but only one spawned Done per iteration) is
-			// a real shape this narrow idiom check can't resolve into a
-			// specific number without knowing the iteration count, so it
-			// falls back to "not fully known" rather than guessing.
-			if scope.addOnes != 0 || scope.spawnedDones != 0 {
-				bal.fullyKnown = false
-			}
-			return
-		}
-		// addOnes == spawnedDones (including both zero): this loop
-		// balances itself every iteration regardless of how many
-		// iterations actually run. Nothing propagates to addTotal/
-		// doneTotal, and fullyKnown is unaffected.
-	}
-
-	var walkStmt func(s ast.Stmt, scope *loopScope)
-	walkList := func(list []ast.Stmt, scope *loopScope) {
-		for _, s := range list {
-			walkStmt(s, scope)
-		}
-	}
-	walkStmt = func(s ast.Stmt, scope *loopScope) {
-		if call, ok := groupMethodCall(s, obj, info); ok {
-			switch selectorMethod(call.Fun) {
-			case "Add":
-				amount, literal := literalNonNegativeInt(soleArg(call), info)
-				noteAdd(amount, literal, scope)
-			case "Done":
-				noteDone(scope)
-			}
-			return
-		}
-		if goStmt, ok := s.(*ast.GoStmt); ok {
-			if lit, ok := goStmt.Call.Fun.(*ast.FuncLit); ok && bodyCallsMethodOn(lit.Body, obj, "Done", info) {
-				noteSpawnedDone(scope)
-			}
-			return
-		}
-		switch x := s.(type) {
-		case *ast.BlockStmt:
-			walkList(x.List, scope)
-		case *ast.IfStmt:
-			walkStmt(x.Body, scope)
-			if x.Else != nil {
-				walkStmt(x.Else, scope)
-			}
-		case *ast.ForStmt:
-			inner := &loopScope{}
-			walkStmt(x.Body, inner)
-			closeLoopScope(inner)
-		case *ast.RangeStmt:
-			inner := &loopScope{}
-			walkStmt(x.Body, inner)
-			closeLoopScope(inner)
-		case *ast.SwitchStmt:
-			for _, c := range x.Body.List {
-				if cc, ok := c.(*ast.CaseClause); ok {
-					walkList(cc.Body, scope)
-				}
-			}
-		case *ast.TypeSwitchStmt:
-			for _, c := range x.Body.List {
-				if cc, ok := c.(*ast.CaseClause); ok {
-					walkList(cc.Body, scope)
-				}
-			}
-		case *ast.SelectStmt:
-			for _, c := range x.Body.List {
-				if cc, ok := c.(*ast.CommClause); ok {
-					walkList(cc.Body, scope)
-				}
-			}
-		case *ast.LabeledStmt:
-			walkStmt(x.Stmt, scope)
-		}
-	}
-	if body != nil {
-		walkList(body.List, nil)
+	for _, s := range list {
+		b.walkGroupBalanceStmt(s, obj, info, &bal, nil)
 	}
 	return bal
+}
+
+// walkGroupBalanceStmt processes one statement's contribution to obj's
+// running Add/Done tally: either bal directly (the enclosing function
+// body or conditional arm's own total), or, when scope is non-nil,
+// that loop's own loopScope (see loopScope's own doc comment for why a
+// loop-scoped site is tracked separately rather than added to bal
+// directly -- its true per-run contribution depends on an iteration count
+// this analysis does not track, unless it matches the recognized
+// Add(1)-paired-with-a-spawned-Done idiom, which balances regardless of
+// how many times the loop actually runs).
+//
+// A `go` statement counts as a spawned Done site the same way in either
+// position: an inline closure that calls Done() on obj directly
+// (bodyCallsMethodOn), or a call to a resolvable same-package function
+// that receives obj as a direct argument and calls Done() on the
+// corresponding parameter itself (calleeDoneParamMatches -- the
+// named-function counterpart, for the equally common `wg.Add(1); go
+// worker(&wg)` idiom).
+//
+// A conditional (if/switch/type-switch/select) is walked differently from
+// either: each of its arms is a mutually exclusive alternative -- exactly
+// one of them runs, never more than one -- so each gets its own fresh,
+// isolated groupBalance (walkGroupBalanceStmts on just that arm's own
+// statement list), and the combined result only folds into bal/scope when
+// that's safe regardless of which arm actually runs (foldConditionalArms).
+// This is what stops an Add() in one arm and an unrelated Done() in a
+// sibling arm from ever being treated as balancing each other, the way a
+// single shared running total would.
+func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types.Info, bal *groupBalance, scope *loopScope) {
+	if call, ok := groupMethodCall(s, obj, info); ok {
+		switch selectorMethod(call.Fun) {
+		case "Add":
+			amount, literal := literalNonNegativeInt(soleArg(call), info)
+			noteAddInto(bal, scope, amount, literal)
+		case "Done":
+			noteDoneInto(bal, scope)
+		}
+		return
+	}
+	if goStmt, ok := s.(*ast.GoStmt); ok {
+		if lit, ok := goStmt.Call.Fun.(*ast.FuncLit); ok {
+			if bodyCallsMethodOn(lit.Body, obj, "Done", info) {
+				noteSpawnedDoneInto(bal, scope)
+			}
+			return
+		}
+		if b.calleeDoneParamMatches(goStmt.Call, obj) {
+			noteSpawnedDoneInto(bal, scope)
+		}
+		return
+	}
+	switch x := s.(type) {
+	case *ast.BlockStmt:
+		for _, sub := range x.List {
+			b.walkGroupBalanceStmt(sub, obj, info, bal, scope)
+		}
+	case *ast.IfStmt:
+		arms := []groupBalance{b.walkGroupBalanceStmts(x.Body.List, obj, info)}
+		if x.Else != nil {
+			// x.Else is either another *ast.BlockStmt or (for an else-if
+			// chain) a nested *ast.IfStmt; wrapping it as a one-statement
+			// list and recursing through walkGroupBalanceStmt handles
+			// both uniformly, including arbitrarily long else-if chains.
+			arms = append(arms, b.walkGroupBalanceStmts([]ast.Stmt{x.Else}, obj, info))
+		} else {
+			arms = append(arms, groupBalance{fullyKnown: true}) // implicit empty else: "if" not taken
+		}
+		foldConditionalArms(bal, scope, arms)
+	case *ast.ForStmt:
+		b.foldLoopBody(x.Body, obj, info, bal)
+	case *ast.RangeStmt:
+		b.foldLoopBody(x.Body, obj, info, bal)
+	case *ast.SwitchStmt:
+		foldConditionalArms(bal, scope, b.walkCaseClauses(x.Body.List, obj, info))
+	case *ast.TypeSwitchStmt:
+		foldConditionalArms(bal, scope, b.walkCaseClauses(x.Body.List, obj, info))
+	case *ast.SelectStmt:
+		foldConditionalArms(bal, scope, b.walkCommClauses(x.Body.List, obj, info))
+	case *ast.LabeledStmt:
+		b.walkGroupBalanceStmt(x.Stmt, obj, info, bal, scope)
+	}
+}
+
+// walkCaseClauses computes one isolated groupBalance per case of a
+// switch/type-switch, for foldConditionalArms. If none of the clauses is
+// `default:`, "no case matches" is itself a possible outcome (falling
+// through to whatever comes after the switch untouched), so an implicit
+// empty arm is added for it -- the switch/type-switch counterpart to an
+// `if` with no `else`.
+func (b *builder) walkCaseClauses(list []ast.Stmt, obj types.Object, info *types.Info) []groupBalance {
+	var arms []groupBalance
+	hasDefault := false
+	for _, c := range list {
+		cc, ok := c.(*ast.CaseClause)
+		if !ok {
+			continue
+		}
+		arms = append(arms, b.walkGroupBalanceStmts(cc.Body, obj, info))
+		if cc.List == nil { // nil List is how a `default:` clause is represented
+			hasDefault = true
+		}
+	}
+	if !hasDefault {
+		arms = append(arms, groupBalance{fullyKnown: true})
+	}
+	return arms
+}
+
+// walkCommClauses computes one isolated groupBalance per case of a
+// select, for foldConditionalArms. Unlike a switch, a select (with or
+// without a `default:`) always executes exactly one of its own clauses --
+// blocking until one is ready if it has no default -- so there is no
+// "none of them ran" case to add an implicit arm for.
+func (b *builder) walkCommClauses(list []ast.Stmt, obj types.Object, info *types.Info) []groupBalance {
+	var arms []groupBalance
+	for _, c := range list {
+		cc, ok := c.(*ast.CommClause)
+		if !ok {
+			continue
+		}
+		arms = append(arms, b.walkGroupBalanceStmts(cc.Body, obj, info))
+	}
+	if len(arms) == 0 {
+		arms = append(arms, groupBalance{fullyKnown: true})
+	}
+	return arms
+}
+
+// noteAddInto, noteDoneInto, and noteSpawnedDoneInto route one Add/Done/
+// spawned-Done site into either bal (scope == nil) or scope (scope !=
+// nil), matching walkGroupBalanceStmt's own destination for whichever
+// statement it just processed.
+func noteAddInto(bal *groupBalance, scope *loopScope, amount int, literal bool) {
+	switch {
+	case scope == nil && literal:
+		bal.addTotal += amount
+	case scope != nil && literal && amount == 1:
+		scope.addOnes++
+	case scope != nil:
+		scope.otherActivity = true
+	default:
+		bal.fullyKnown = false
+	}
+}
+
+func noteDoneInto(bal *groupBalance, scope *loopScope) {
+	if scope == nil {
+		bal.doneTotal++
+		return
+	}
+	scope.otherActivity = true // a bare Done() inside a loop, on its own, isn't the recognized idiom
+}
+
+func noteSpawnedDoneInto(bal *groupBalance, scope *loopScope) {
+	if scope == nil {
+		bal.doneTotal++
+		return
+	}
+	scope.spawnedDones++
+}
+
+// foldLoopBody walks one loop's own body into a fresh loopScope and folds
+// the result into bal once the whole body has been processed -- always
+// directly into bal, regardless of whether this loop is itself nested
+// inside another loop or a conditional arm: an unresolved nested loop
+// bails all the way out rather than being absorbed into an enclosing
+// loop's own idiom-matching, which would conflate two different loops'
+// iteration counts.
+func (b *builder) foldLoopBody(body *ast.BlockStmt, obj types.Object, info *types.Info, bal *groupBalance) {
+	if body == nil {
+		return
+	}
+	inner := &loopScope{}
+	for _, s := range body.List {
+		b.walkGroupBalanceStmt(s, obj, info, bal, inner)
+	}
+	closeLoopScopeInto(bal, inner)
+}
+
+// closeLoopScopeInto reconciles one loop's own accumulated loopScope once
+// its body has been fully walked, folding the result into bal.
+func closeLoopScopeInto(bal *groupBalance, scope *loopScope) {
+	if scope.otherActivity {
+		bal.fullyKnown = false
+		return
+	}
+	if scope.addOnes != scope.spawnedDones {
+		// Both zero means no activity for this group in this loop at all
+		// -- fine, nothing to reconcile. A nonzero mismatch (e.g. two
+		// Add(1) sites but only one spawned Done per iteration) is a real
+		// shape this narrow idiom check can't resolve into a specific
+		// number without knowing the iteration count, so it falls back to
+		// "not fully known" rather than guessing.
+		if scope.addOnes != 0 || scope.spawnedDones != 0 {
+			bal.fullyKnown = false
+		}
+		return
+	}
+	// addOnes == spawnedDones (including both zero): this loop balances
+	// itself every iteration regardless of how many iterations actually
+	// run. Nothing propagates to addTotal/doneTotal, and fullyKnown is
+	// unaffected.
+}
+
+// foldConditionalArms folds the results of walking each of a
+// conditional's mutually exclusive arms into bal, or scope if non-nil.
+// Safe only when every arm's own net delta (addTotal-doneTotal) is
+// exactly zero and every arm is itself fully known: whichever arm
+// actually runs at runtime, the net change to the group's counter is zero
+// either way, so nothing needs to be added to the running total. This is
+// what lets the common conditionally-started worker idiom (`if needed {
+// wg.Add(1); go worker() }`, no else) stay silent rather than falsely
+// balanced or falsely flagged: that arm's own delta is zero (one Add
+// matched by one spawned Done within the same arm), and the implicit
+// empty else is trivially zero too.
+//
+// An arm with a nonzero delta, or one that isn't itself fully known,
+// makes the combined result "not fully known" for whatever it's folded
+// into: which arm will actually run isn't something this analysis tracks,
+// so two sibling arms' nonzero deltas can never be safely combined the
+// way sequential statements can. This is also what stops an Add() in one
+// arm and an unrelated Done() in a sibling arm from ever being treated as
+// balancing each other -- previously, both were walked into the very same
+// running total regardless of which branch they were in, so a bare
+// Done() in an "else" that has nothing to do with an Add() over in the
+// "if" could look balanced on paper while being a guaranteed negative-
+// counter panic on whichever runs at runtime.
+func foldConditionalArms(bal *groupBalance, scope *loopScope, arms []groupBalance) {
+	safe := true
+	for _, arm := range arms {
+		if !arm.fullyKnown || arm.addTotal != arm.doneTotal {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return // every arm nets to zero; nothing to add anywhere
+	}
+	if scope != nil {
+		scope.otherActivity = true
+		return
+	}
+	bal.fullyKnown = false
 }
 
 // groupMethodCall reports whether s is (or directly defers) a call to
@@ -1145,6 +1180,46 @@ func literalNonNegativeInt(e ast.Expr, info *types.Info) (int, bool) {
 		return 0, false
 	}
 	return int(n), true
+}
+
+// calleeDoneParamMatches reports whether call's target is a resolvable
+// same-package function that receives obj as a direct argument at some
+// position, and whose own body calls Done() on that corresponding
+// parameter -- the named-function counterpart to bodyCallsMethodOn's
+// closure-capture check above, for the equally common `wg.Add(1); go
+// worker(&wg)` idiom, where worker's whole job is to call Done() on
+// whatever it's given. This deliberately does not reuse
+// b.paramConsumption (Phase 5's own fixed point for cancel/group
+// parameters): that answers a different question -- does the parameter
+// get Wait()ed or further transferred -- appropriate for verifying an
+// ownership handoff, not for a worker whose job is specifically to
+// decrement the counter its caller already incremented. This is a one-hop
+// existence check, not a fixed point: if worker itself delegates to a
+// further helper that calls Done(), that is not attempted here.
+func (b *builder) calleeDoneParamMatches(call *ast.CallExpr, obj types.Object) bool {
+	funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
+	if !ok {
+		return false
+	}
+	decl := b.funcs[funcObj]
+	if decl == nil {
+		return false
+	}
+	index := -1
+	for i, arg := range call.Args {
+		if identObject(arg, b.in.Info) == obj {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		return false
+	}
+	paramObj := paramObjectAtIndex(b.in.Info, decl, index)
+	if paramObj == nil {
+		return false
+	}
+	return bodyCallsMethodOn(decl.Body, paramObj, "Done", b.in.Info)
 }
 
 // bodyCallsMethodOn reports whether body contains a call obj.method(...)

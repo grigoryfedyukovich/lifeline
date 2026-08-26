@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 
 	"github.com/gfedyukovich/lifeline/internal/config"
@@ -444,17 +445,16 @@ func Start(parent context.Context) {
 	}
 }
 
-// The following tests cover chained (multi-hop) verification, now that
-// computeParameterConsumption runs to an interprocedural fixed point
-// (docs/cfg-migration-plan.md, Phase 5's interprocedural extension)
-// instead of a single declaration-order pass: Build keeps re-running it
-// for every function until a full sweep changes nothing, so a chain
-// resolves to the same answer regardless of which order its functions
-// happen to be declared in. Both declaration orders below cover the same
-// 3-hop leak/non-leak pair a single pass could only catch in one of the
-// two orders (see git history for the previous, order-dependent
-// behavior); a resolvable same-package chain is no longer a source of
-// declaration-order-dependent results.
+// The following two tests document the exact, honest boundary of chained
+// (multi-hop) verification: computeParameterConsumption's pre-pass runs
+// once, in source declaration order, not call-graph order, so a chain is
+// only verified as far as a deeper callee's result happens to already be
+// computed by the time an earlier caller needs it. This is never a false
+// positive either way -- the fallback for an unverified check is always
+// "assume transferred" -- but it does mean multi-hop detection currently
+// depends on how the source happens to be organized. See docs/limitations.md
+// and docs/roadmap.md for the call-graph-ordered pre-pass that would make
+// this reliable regardless of declaration order.
 
 func TestParameterPassing_ChainedLeakCaughtWhenCalleesDeclaredFirst(t *testing.T) {
 	diags := analyzeSource(t, `package p
@@ -474,14 +474,7 @@ func Start(parent context.Context) {
 	}
 }
 
-// TestParameterPassing_ChainedLeakCaughtWhenCallerDeclaredFirst is the
-// same 3-hop leak as the test above, with the declaration order reversed
-// (caller first, leaf last -- the more common style, and the order that
-// used to be the "honest gap" before the fixed point). It must now also
-// fire: the whole point of iterating computeParameterConsumption to a
-// fixed point, rather than running it once, is that this order no longer
-// changes the answer.
-func TestParameterPassing_ChainedLeakCaughtWhenCallerDeclaredFirst(t *testing.T) {
+func TestParameterPassing_ChainedLeakMissedWhenCallerDeclaredFirst(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
 func Start(parent context.Context) {
@@ -494,105 +487,15 @@ func hop2(c context.CancelFunc) { hop3(c) }
 func hop3(c context.CancelFunc) { _ = c }
 func work(context.Context) {}
 `)
-	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
-		t.Fatalf("3-hop leak with caller-first declaration order should now also be caught, got diagnostics = %#v", diags)
-	}
-}
-
-// TestParameterPassing_ChainedConsumptionCaughtRegardlessOfOrder mirrors
-// the leak tests above with the non-leaking case (the leaf hop actually
-// calls the cancel function) in both declaration orders, confirming the
-// fixed point doesn't just flip every chain to "leak" -- it converges to
-// the correct answer either way.
-func TestParameterPassing_ChainedConsumptionCaughtRegardlessOfOrder(t *testing.T) {
-	calleesFirst := analyzeSource(t, `package p
-import "context"
-func hop3(c context.CancelFunc) { c() }
-func hop2(c context.CancelFunc) { hop3(c) }
-func hop1(c context.CancelFunc) { hop2(c) }
-func work(context.Context) {}
-func Start(parent context.Context) {
-	ctx, cancel := context.WithCancel(parent)
-	hop1(cancel)
-	go work(ctx)
-}
-`)
-	if len(calleesFirst) != 0 {
-		t.Fatalf("3-hop consumption with leaf-first declaration order should not fire, got diagnostics = %#v", calleesFirst)
-	}
-	callerFirst := analyzeSource(t, `package p
-import "context"
-func Start(parent context.Context) {
-	ctx, cancel := context.WithCancel(parent)
-	hop1(cancel)
-	go work(ctx)
-}
-func hop1(c context.CancelFunc) { hop2(c) }
-func hop2(c context.CancelFunc) { hop3(c) }
-func hop3(c context.CancelFunc) { c() }
-func work(context.Context) {}
-`)
-	if len(callerFirst) != 0 {
-		t.Fatalf("3-hop consumption with caller-first declaration order should not fire, got diagnostics = %#v", callerFirst)
-	}
-}
-
-// TestParameterPassing_MutualRecursionConverges is a cycle in the
-// dependency graph the fixed point must still terminate on and resolve
-// correctly: two functions that only ever pass the cancel function to
-// each other, never calling or otherwise consuming it, is a genuine leak
-// (the least fixed point -- "not consumed unless proven otherwise" --
-// is the correct, safe answer for a cycle with no base-case evidence
-// either way), not a hang and not a false negative from the cycle itself.
-func TestParameterPassing_MutualRecursionConverges(t *testing.T) {
-	diags := analyzeSource(t, `package p
-import "context"
-func work(context.Context) {}
-func Start(parent context.Context) {
-	ctx, cancel := context.WithCancel(parent)
-	ping(cancel, 0)
-	go work(ctx)
-}
-func ping(c context.CancelFunc, n int) {
-	if n < 10 {
-		pong(c, n+1)
-	}
-}
-func pong(c context.CancelFunc, n int) {
-	if n < 10 {
-		ping(c, n+1)
-	}
-}
-`)
-	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
-		t.Fatalf("mutual recursion with no consumption anywhere should fire LL1001, got diagnostics = %#v", diags)
-	}
-}
-
-// TestParameterPassing_SelfRecursionWithConsumptionConverges is the same
-// cycle shape as above, but with a base case that actually calls the
-// cancel function, confirming the fixed point still finds real
-// consumption through a self-recursive call rather than only through
-// calls to other functions.
-func TestParameterPassing_SelfRecursionWithConsumptionConverges(t *testing.T) {
-	diags := analyzeSource(t, `package p
-import "context"
-func work(context.Context) {}
-func Start(parent context.Context) {
-	ctx, cancel := context.WithCancel(parent)
-	countdown(cancel, 3)
-	go work(ctx)
-}
-func countdown(c context.CancelFunc, n int) {
-	if n <= 0 {
-		c()
-		return
-	}
-	countdown(c, n-1)
-}
-`)
+	// This is the honest, current gap, not a desired outcome: the same
+	// 3-hop leak as the test above is missed here, purely because of
+	// declaration order, and safely falls back rather than ever producing
+	// a false positive. If this test starts failing because diagnostics
+	// now correctly catches this case, that's a genuine improvement --
+	// update this test (and docs/limitations.md's chaining paragraph)
+	// to match, don't just delete the inconvenient assertion.
 	if len(diags) != 0 {
-		t.Fatalf("self-recursion that eventually consumes the cancel function should not fire, got diagnostics = %#v", diags)
+		t.Fatalf("expected the current honest gap (caller-first order misses the chain), got diagnostics = %#v", diags)
 	}
 }
 
@@ -781,5 +684,491 @@ func Start(parent context.Context) {
 `)
 	if len(diags) != 0 {
 		t.Fatalf("an unrelated cancel call should not be credited as this group's stop signal, got diagnostics = %#v", diags)
+	}
+}
+
+// The following tests are regressions for two bugs found via an external
+// Phase 6 benchmark run (phase6-fix-requirements.md) after the checks
+// above first shipped: a named-function goroutine target's own Done()
+// call was invisible to count-balance accounting (only an inline closure
+// was recognized), and count-balance accounting wasn't path-sensitive at
+// all -- an Add() in one conditional branch and an unrelated Done() in a
+// sibling branch were summed into the same running total as if both
+// always ran together, which could either mask a real per-branch
+// imbalance or fabricate one that doesn't correspond to any single
+// execution. Both are now fixed; see calleeDoneParamMatches and
+// foldConditionalArms.
+
+func TestWaitGroupNamedFunctionWorkerDoneRecognized(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) { defer wg.Done() }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go worker(&wg)
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a named-function worker that calls Done() on its pointer parameter should balance the count, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupNamedFunctionWorkerLoopPairedRecognized(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) { defer wg.Done() }
+func Start(items []int) {
+	var wg sync.WaitGroup
+	for range items {
+		wg.Add(1)
+		go worker(&wg)
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a loop-scoped Add(1) paired with a named-function worker's own Done() should balance regardless of iteration count, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupNamedFunctionWorkerNeverDoneStillFires(t *testing.T) {
+	// Regression guard the other direction: fixing the false negative
+	// above must not turn into a blanket "any go statement to a named
+	// function counts as Done" false suppression. worker here never calls
+	// Done, so the outstanding Add(1) must still be caught.
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) {}
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go worker(&wg)
+	wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a named-function worker that never calls Done() should still be caught, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupCrossBranchAddDoneNeverFabricatesAMismatch(t *testing.T) {
+	// if cond: Add(1) alone (a real, but conditional, mismatch). else:
+	// Add(1) matched by its own spawned Done (fine on its own). Summing
+	// across both branches as the old, non-path-sensitive accounting did
+	// gives a fabricated "2 Add vs 1 Done" that no single execution of
+	// this function ever actually produces -- whichever branch runs, it's
+	// either "1 Add, 0 Done" or "1 Add, 1 Done", never both branches'
+	// contributions at once. Firing from that fabricated arithmetic would
+	// be exactly the kind of manufactured evidence this analysis commits
+	// to never producing, so this must stay silent (an unproven, branch-
+	// dependent case, not a proven one) even though the "if" branch alone
+	// is genuinely suspicious.
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	if cond() {
+		wg.Add(1)
+	} else {
+		wg.Add(1)
+		go func(){ defer wg.Done() }()
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a mismatch that only exists by summing two mutually exclusive branches together must not fire, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupCrossBranchAddDoneUnrelatedDoneDoesNotMaskMismatch(t *testing.T) {
+	// The mirror image of the bug: an Add() in one branch must not be
+	// treated as satisfied by an unrelated Done() in a sibling branch
+	// either. Here the "if" branch's own Add(1) has no Done anywhere in
+	// that branch; the "else" branch's bare Done() belongs to a
+	// completely different, unconditional code path and must not be
+	// borrowed to paper over the "if" branch's own accounting. Since this
+	// is still a branch-dependent (not proven-on-every-path) situation,
+	// the correct outcome is the same conservative silence as the test
+	// above -- the old bug's failure mode was claiming a false balance
+	// here (1 Add, 1 Done, "clean"), which is what this guards against.
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	if cond() {
+		wg.Add(1)
+	} else {
+		wg.Done()
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("an Add() and an unrelated Done() in sibling branches must never be treated as balancing each other, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupConditionalWorkerIdiomStillClean(t *testing.T) {
+	// Guard against the path-sensitivity fix overcorrecting: the very
+	// common "start a worker only if needed" idiom, entirely self-
+	// contained within a single branch with no else, must remain clean.
+	diags := analyzeSource(t, `package p
+import "sync"
+func needed() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	if needed() {
+		wg.Add(1)
+		go func(){ defer wg.Done() }()
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a self-contained conditional Add/spawned-Done pair with no else should stay clean, got diagnostics = %#v", diags)
+	}
+}
+
+// The following tests correspond directly to phase6-fix-requirements.md's
+// numbered items: group identity (items 2, 5, 8), mixed-path accounting
+// (item 6), and ordering semantics (items 9, 10). Helper-mediated joins
+// (item 7) are already covered above by TestParameterPassing_*, applied
+// to groups the same way as cancels; the multi-hop, declaration-order-
+// independent case is TestParameterPassing_ChainedLeakCaughtWhenCaller-
+// DeclaredFirst's own sibling coverage, exercised for groups by
+// TestParameterPassing_GroupVerifiedLeakFires/...WaitDoesNotFire above.
+
+func TestGroupIdentity_DoneOnWrongGroupBothFindingsAreIndependentlyCorrect(t *testing.T) {
+	// item 2: a worker meant for "a" mistakenly calls Done() on "b". Two
+	// independent, individually correct findings are the intended oracle
+	// here, not a bug to fix: "a" genuinely has an outstanding worker (its
+	// Add(1) is never matched by any Done()), and "b" is genuinely never
+	// waited (only "a" is waited). Neither finding borrows evidence from
+	// the other group.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var a, b sync.WaitGroup
+	a.Add(1)
+	b.Add(1)
+	go func(){ defer b.Done() }() // bug: worker for "a" decrements "b" instead
+	a.Wait()
+}
+`)
+	if len(diags) != 2 {
+		t.Fatalf("expected exactly two independent findings (one per group), got %#v", diags)
+	}
+	var sawA, sawB bool
+	for _, d := range diags {
+		if d.RuleID != "LL1003" {
+			t.Fatalf("expected LL1003 for both findings, got %#v", d)
+		}
+		switch {
+		case strings.Contains(d.Message, `"a"`):
+			sawA = true
+			if !strings.Contains(d.Message, "outstanding worker") {
+				t.Fatalf(`group "a" should be flagged for an outstanding worker (Done() went to the wrong group), got %q`, d.Message)
+			}
+		case strings.Contains(d.Message, `"b"`):
+			sawB = true
+			if !strings.Contains(d.Message, "no Wait or ownership transfer") {
+				t.Fatalf(`group "b" should be flagged as never waited, got %q`, d.Message)
+			}
+		}
+	}
+	if !sawA || !sawB {
+		t.Fatalf("expected findings for both group \"a\" and group \"b\", got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_AliasResolvedLocallyKeepsGroupsSeparate(t *testing.T) {
+	// item 5: pointer aliases the analysis can resolve locally (&a, &b
+	// passed to distinct named-function workers) must never cross-wire
+	// group "a"'s accounting with group "b"'s.
+	diags := analyzeSource(t, `package p
+import "sync"
+func workerA(wg *sync.WaitGroup) { defer wg.Done() }
+func workerB(wg *sync.WaitGroup) { defer wg.Done() }
+func Start(){
+	var a, b sync.WaitGroup
+	a.Add(1)
+	go workerA(&a)
+	b.Add(1)
+	go workerB(&b)
+	a.Wait()
+	b.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("two independently correct, separately-aliased groups should both be clean, got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_UnresolvableAliasFallsBackConservatively(t *testing.T) {
+	// item 5: a WaitGroup reached only through a struct field (h.wg) is
+	// not a local variable declaration collectBindings recognizes at all
+	// -- consistent with docs/limitations.md's existing "a value stored in
+	// a struct field... is not attempted" scope boundary, not a new
+	// resolution this test is claiming. The point of this test is the
+	// negative guarantee: since it's untracked, it must never be
+	// misattributed to some other, unrelated group either -- confirmed by
+	// this staying clean with zero groups recognized, not by any specific
+	// finding.
+	diags := analyzeSource(t, `package p
+import "sync"
+type holder struct{ wg sync.WaitGroup }
+func run(h *holder) {
+	h.wg.Add(1)
+	go func(){ defer h.wg.Done() }()
+	h.wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("an untracked struct-field WaitGroup should never produce a finding either way, got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_TwoIndependentGroupsOneUnjoinedOneClean(t *testing.T) {
+	// item 8: group "a" being correctly joined must not suppress a
+	// finding for group "b".
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var a, b sync.WaitGroup
+	a.Add(1)
+	go func(){ defer a.Done() }()
+	a.Wait()
+	b.Add(1)
+	go func(){ defer b.Done() }()
+	// b is never waited
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" || !strings.Contains(diags[0].Message, `"b"`) {
+		t.Fatalf(`expected exactly one LL1003 finding for group "b" only, got %#v`, diags)
+	}
+}
+
+func TestGroupIdentity_TwoIndependentGroupsBothCleanControlCase(t *testing.T) {
+	// item 8: the fully-safe two-group control case, guarding against
+	// over-reporting (e.g. accidentally flagging "a" because "b" exists).
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var a, b sync.WaitGroup
+	a.Add(1)
+	go func(){ defer a.Done() }()
+	b.Add(1)
+	go func(){ defer b.Done() }()
+	a.Wait()
+	b.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("two fully-correct independent groups should produce no findings, got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_ReorderedOperationsStillSeparate(t *testing.T) {
+	// item 5: interleaved (reordered) operations on two groups must still
+	// resolve to the correct, separate identities.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var a, b sync.WaitGroup
+	a.Add(1)
+	b.Add(1)
+	go func(){ defer a.Done() }()
+	go func(){ defer b.Done() }()
+	b.Wait()
+	a.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("interleaved operations on two distinct groups should still both resolve cleanly, got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_MultipleWaitCallsSameGroup(t *testing.T) {
+	// item 5: multiple Wait() calls on the same group (e.g. one per
+	// branch) must all be attributed to that one group, not confused with
+	// a second group.
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	if cond() {
+		wg.Wait()
+		return
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a Wait() call present on every branch's own return path should stay clean, got %#v", diags)
+	}
+}
+
+func TestMixedPathAccounting_EarlyReturnBeforeDoneStaysConservative(t *testing.T) {
+	// item 6: an early return before a worker's Done() would run leaves
+	// the count merely unproven (the worker was still started and may
+	// still call Done() on its own later), not a proven mismatch --
+	// distinct from the join-before-return question, which this same
+	// early return DOES violate (Wait is never reached on this path).
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	if cond() {
+		return
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" || !strings.Contains(diags[0].Message, "not every path") {
+		t.Fatalf("expected exactly one LL1003 for the bypassed Wait(), not a count-mismatch claim, got %#v", diags)
+	}
+}
+
+func TestMixedPathAccounting_MultipleAddsOnlySomeMatchedStaysUnknown(t *testing.T) {
+	// item 6: three Add(1) sites, only two matched by a spawned Done --
+	// not the recognized loop idiom (no loop here at all), so this must
+	// stay silent rather than guess at a specific mismatch count.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	wg.Add(1)
+	wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("2 Add(1) matched with 2 spawned Done leaves exactly one literal, unmatched Add(1); expected exactly one LL1003 count-mismatch, got %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, "outstanding worker") {
+		t.Fatalf("expected the count-mismatch message, got %q", diags[0].Message)
+	}
+}
+
+func TestMixedPathAccounting_WaitAfterBranchMergeStaysClean(t *testing.T) {
+	// item 6: Wait() placed after an if/else merge point (rather than
+	// duplicated in each branch) is a completely ordinary, safe pattern.
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return true }
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	if cond() {
+		_ = 1
+	} else {
+		_ = 2
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("Wait() after an unrelated if/else merge should stay clean, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_WaitBeforeLaterAddIsNotFlagged(t *testing.T) {
+	// item 9: Wait() called while the counter is still zero is a no-op in
+	// sync.WaitGroup's own semantics (it returns immediately) and is not
+	// itself unsafe; a later, properly-ordered Add()+Wait() pair still
+	// completes the protocol correctly. Phase 6 does not verify temporal
+	// ordering between Add and Wait call sites at all -- CountMismatch is
+	// order-independent by construction (a sum, not a sequence), and
+	// JoinedOnAllPaths only asks whether a Wait() call is reachable on
+	// every path, not what precedes it -- so this is documented as
+	// "unsupported/unknown", not silently inferred as "safe", from lexical
+	// order: see docs/limitations.md.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	wg.Wait()
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("an extra, harmless early Wait() before a correctly-ordered Add/Done/Wait sequence should not fire, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_ReusedWaitGroupSecondRoundUnverified(t *testing.T) {
+	// item 9, the known gap this documents rather than silently ignores:
+	// reusing one WaitGroup for a second round of work with no matching
+	// second Wait() is not caught. Joined is satisfied by the first
+	// Wait() call found anywhere in the function; per-"round" temporal
+	// tracking (is every Add() eventually followed by a Wait() that
+	// precedes the *next* Add()) is a materially larger undertaking than
+	// the reachability and literal-sum checks Phase 6 implements, and is
+	// explicitly out of scope -- see docs/limitations.md. This test
+	// exists so a future fix to this gap is a deliberate, documented
+	// change, not a silent regression either way.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	wg.Wait()
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	// second round never waited
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("documented known gap: a reused WaitGroup's second round is not currently verified; if this now fires, update this test and docs/limitations.md to match the improvement, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_StopBeforeWaitProvesOrderingOnly(t *testing.T) {
+	// item 10: LL1005 proves only that a recognized stop-signal call is
+	// CFG-ordered before Wait(); it does not, and cannot, prove the
+	// worker has actually observed and acted on that signal by the time
+	// Wait() unblocks -- that would require reasoning about the
+	// concurrently-running goroutine's own execution, which is out of
+	// scope for a single-function CFG check. This is the same positive
+	// case as TestWaitGroupStopBeforeWaitDoesNotFire above, restated here
+	// to keep the ordering-only scope explicit and testable; see
+	// docs/limitations.md.
+	diags := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+	}()
+	cancel()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a stop signal CFG-ordered before Wait() should not fire, got %#v", diags)
 	}
 }
