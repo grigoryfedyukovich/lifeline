@@ -499,6 +499,422 @@ func work(context.Context) {}
 	}
 }
 
+// The following tests cover field/constructor ownership tracking
+// (docs/roadmap.md item 3): a cancel/group binding stored into a named
+// struct field, either by a local variable ("stored struct") or by a
+// constructor function's own return value, is verified against that one
+// specific field's later use instead of being unconditionally treated as
+// transferred the moment it is stored. See internal/frontend/frontend.go's
+// collectFieldCaptures, resolveFieldCaptures, computeFieldOwnership, and
+// computeConstructorCallerConsumption for the implementation this section
+// exercises.
+
+func TestFieldCapture_CancelStoredStructUnconsumedFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Label  string
+	Cancel context.CancelFunc
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Label: "worker", Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	_ = h.Label
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	found := false
+	for _, e := range diags[0].Evidence {
+		if e.Kind == "field-not-consumed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a field-not-consumed evidence entry, got %#v", diags[0].Evidence)
+	}
+}
+
+func TestFieldCapture_CancelStoredStructConsumedDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Label  string
+	Cancel context.CancelFunc
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Label: "worker", Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	h.Cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldCapture_BlankDiscardTreatedAsUnconsumedFires documents that
+// `_ = h`, the common idiom for explicitly discarding a value, does not
+// count as a "further use this narrow check can't follow" the way passing
+// h to another function does (see
+// TestFieldCapture_PassedToUnresolvedFunctionFallsBack below) -- h is
+// confidently local and never consumed, so this is the same "stored
+// struct" leak as TestFieldCapture_CancelStoredStructUnconsumedFires,
+// just spelled differently.
+func TestFieldCapture_BlankDiscardTreatedAsUnconsumedFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	_ = h
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldCapture_PassedToUnresolvedFunctionFallsBack is the safety
+// check for the "stored struct" mechanism, mirroring
+// TestParameterPassing_VerifiedFurtherEscapeDoesNotFire for direct
+// arguments: once h is passed on to another function, this narrow,
+// single-variable check does not attempt to follow it, and must fall back
+// to the same conservative assume-transferred default used everywhere
+// else in this file rather than guess -- getting this wrong would turn
+// every struct handle passed onward into a new false positive.
+func TestFieldCapture_PassedToUnresolvedFunctionFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	register(h)
+}
+func register(h *Handle) { _ = h }
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldCapture_PositionalStructLiteralFallsBack documents the exact
+// boundary of "selected struct fields": only a keyed struct literal
+// (`&Handle{Cancel: cancel}`) is tracked field-by-field. A positional
+// literal (`&Handle{cancel}`) has no field identity collectFieldCaptures
+// can attach to a specific value, so it falls back to the prior generic
+// "stored in a composite value => escaped" handling untouched, the same
+// as before this capability existed.
+func TestFieldCapture_PositionalStructLiteralFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{cancel}
+	go func() { <-ctx.Done() }()
+	_ = h
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldCapture_MultiNameAssignmentFallsBack documents the other half
+// of the same boundary: only a single named local variable receiving the
+// whole literal (`h := &Handle{...}`) is tracked. A multi-name assignment
+// is left to the existing generic fallback, exactly as before.
+func TestFieldCapture_MultiNameAssignmentFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func other() int { return 0 }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h, n := &Handle{Cancel: cancel}, other()
+	_ = n
+	go func() { <-ctx.Done() }()
+	_ = h
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_GroupStoredStructUnconsumedFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Handle struct {
+	Label string
+	WG    *sync.WaitGroup
+}
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	h := &Handle{Label: "worker", WG: &wg}
+	go func() { defer wg.Done() }()
+	_ = h.Label
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_GroupStoredStructWaitedDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Handle struct{ WG *sync.WaitGroup }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	h := &Handle{WG: &wg}
+	go func() { defer wg.Done() }()
+	h.WG.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldCapture_GroupAddAndWaitBothThroughFieldBalance exercises
+// markGroupFieldConsumed's Add branch end to end -- including
+// computeGroupOrdering's own CFG-based join-before-return check, which
+// depends on the Wait call site recorded through the field being findable
+// in the flowgraph the same way a direct Wait() call's site is -- by
+// routing both Add and Wait through the same field, with no direct
+// wg.Add/wg.Wait call anywhere for either to fall back on.
+func TestFieldCapture_GroupAddAndWaitBothThroughFieldBalance(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Handle struct{ WG *sync.WaitGroup }
+func Start() {
+	var wg sync.WaitGroup
+	h := &Handle{WG: &wg}
+	h.WG.Add(1)
+	go func() { defer wg.Done() }()
+	h.WG.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldOwnership_ConstructorCancelDroppedByCallerFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Label  string
+	Cancel context.CancelFunc
+}
+func NewHandle(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Label: "worker", Cancel: cancel}, ctx
+}
+func Start(parent context.Context) {
+	h, ctx := NewHandle(parent)
+	go func() { <-ctx.Done() }()
+	_ = h.Label
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	found := false
+	for _, e := range diags[0].Evidence {
+		if e.Kind == "field-not-consumed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a field-not-consumed evidence entry, got %#v", diags[0].Evidence)
+	}
+}
+
+func TestFieldOwnership_ConstructorCancelConsumedByCallerDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func NewHandle(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+func Start(parent context.Context) {
+	h, ctx := NewHandle(parent)
+	go func() { <-ctx.Done() }()
+	h.Cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldOwnership_ConstructorGroupDroppedByCallerFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Handle struct {
+	Label string
+	WG    *sync.WaitGroup
+}
+func NewHandle() *Handle {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done() }()
+	return &Handle{Label: "worker", WG: &wg}
+}
+func Start() {
+	h := NewHandle()
+	_ = h.Label
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldOwnership_ConstructorGroupWaitedByCallerDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Handle struct{ WG *sync.WaitGroup }
+func NewHandle() *Handle {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done() }()
+	return &Handle{WG: &wg}
+}
+func Start() {
+	h := NewHandle()
+	h.WG.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldOwnership_ConstructorCallerDeclaredFirstStillVerifies is the
+// constructor-tracking counterpart to
+// TestParameterPassing_CalleeDeclaredFirstStillVerifies: here Start (the
+// caller) is declared before NewHandle (the constructor), the opposite of
+// every other test in this section. Unlike Phase 5's own single
+// declaration-order-dependent pre-pass (see the chained-leak pair of
+// tests above), field/constructor ownership tracking always runs
+// computeFieldOwnership to completion for every function before
+// computeConstructorCallerConsumption examines any caller, so this must
+// verify identically regardless of which one is declared first.
+func TestFieldOwnership_ConstructorCallerDeclaredFirstStillVerifies(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Label  string
+	Cancel context.CancelFunc
+}
+func Start(parent context.Context) {
+	h, ctx := NewHandle(parent)
+	go func() { <-ctx.Done() }()
+	_ = h.Label
+}
+func NewHandle(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Label: "worker", Cancel: cancel}, ctx
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("caller-declared-first case should still be verified and fire LL1001, got diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldOwnership_ConstructorNeverCalledFallsBack documents that an
+// unused (or, in real code, exported-for-another-package) constructor
+// never produces a finding purely from the absence of a caller to check:
+// b.returnFieldConsumption has no entry for its binding, which
+// recordReturnedField treats exactly like a verified-consumed caller --
+// the same conservative assume-transferred default used everywhere else
+// whenever a value's fate can't be verified.
+func TestFieldOwnership_ConstructorNeverCalledFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func NewHandle(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+func Start() {}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldOwnership_ConstructorCallerPassesHandleOnwardFallsBack
+// documents the single-hop boundary computeConstructorCallerConsumption
+// deliberately keeps (mirroring Phase 5's own one-hop guarantee for
+// direct parameter passing, see the chained-leak pair of tests above): a
+// caller that itself just forwards the handle to a further function is
+// not chased into, even though that further function does in fact
+// consume it -- an honest gap, safely falling back rather than ever
+// producing a false positive.
+func TestFieldOwnership_ConstructorCallerPassesHandleOnwardFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func NewHandle(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+func Start(parent context.Context) {
+	h, ctx := NewHandle(parent)
+	go func() { <-ctx.Done() }()
+	forward(h)
+}
+func forward(h *Handle) { h.Cancel() }
+`)
+	if len(diags) != 0 {
+		t.Fatalf("expected the current honest gap (single-hop caller check does not chase a further forward), got diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldOwnership_ConstructorLocalVariableThenReturnAlsoTracked
+// confirms the second shape resolveFieldCaptures recognizes for a
+// constructor -- a struct literal assigned to a local variable and then
+// returned, rather than built directly inline in the return statement --
+// is tracked identically to
+// TestFieldOwnership_ConstructorCancelDroppedByCallerFires above.
+func TestFieldOwnership_ConstructorLocalVariableThenReturnAlsoTracked(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Label  string
+	Cancel context.CancelFunc
+}
+func NewHandle(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	h := &Handle{Label: "worker", Cancel: cancel}
+	return h, ctx
+}
+func Start(parent context.Context) {
+	h, ctx := NewHandle(parent)
+	go func() { <-ctx.Done() }()
+	_ = h.Label
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
 // The following tests cover the WaitGroup/errgroup upgrade described in
 // docs/cfg-migration-plan.md's Phase 3 completion section: count
 // intervals, the common Add(1)-then-spawned-Done idiom, join-before-

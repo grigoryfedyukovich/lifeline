@@ -155,6 +155,19 @@ func TestTutorialExamples(t *testing.T) {
 		{name: "custom_wrapper_with_config", args: []string{"-config", "./examples/custom_context_wrapper/lifeline.yaml", "./examples/custom_context_wrapper"}, needle: "[LL1001]"},
 		{name: "custom_start_without_config", args: []string{"./examples/custom_start_wrapper"}, needle: "no lifecycle diagnostics"},
 		{name: "custom_start_with_config", args: []string{"-config", "./examples/custom_start_wrapper/lifeline.yaml", "./examples/custom_start_wrapper"}, needle: "[LL1002]"},
+		// Field/constructor ownership tracking (docs/roadmap.md item 3):
+		// a lifecycle capability stored into a named struct field, either
+		// by a local variable ("stored struct") or by a constructor
+		// function's own return value, is tracked through that one field
+		// instead of being unconditionally treated as transferred the
+		// moment it is stored -- see internal/frontend/frontend.go's
+		// resolveFieldCaptures and computeConstructorCallerConsumption.
+		{name: "cancel_stored_struct", args: []string{"./examples/cancel_stored_struct"}, needle: "[LL1001]"},
+		{name: "cancel_stored_struct_consumed", args: []string{"./examples/cancel_stored_struct_consumed"}, needle: "no lifecycle diagnostics"},
+		{name: "waitgroup_stored_struct", args: []string{"./examples/waitgroup_stored_struct"}, needle: "[LL1003]"},
+		{name: "waitgroup_stored_struct_waited", args: []string{"./examples/waitgroup_stored_struct_waited"}, needle: "no lifecycle diagnostics"},
+		{name: "constructor_cancel_handle_dropped", args: []string{"./examples/constructor_cancel_handle_dropped"}, needle: "[LL1001]"},
+		{name: "constructor_waitgroup_handle_dropped", args: []string{"./examples/constructor_waitgroup_handle_dropped"}, needle: "[LL1003]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, code := run(t, root, binary, tc.args...)

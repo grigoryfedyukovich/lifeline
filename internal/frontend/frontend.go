@@ -58,11 +58,76 @@ type builder struct {
 	// a pure, stable map read; argumentConsumed itself never triggers a
 	// fresh computation, which is what keeps it non-recursive.
 	paramConsumption map[types.Object]bool
-	contextInterface *types.Interface
-	contextFactories map[string]struct{}
-	startWrappers    map[string]struct{}
-	joinWrappers     map[string]struct{}
-	stopWrappers     map[string]struct{}
+	// returnFieldInfo records, for a cancel/group binding's own local
+	// identifier object (a cancelState.cancelObj or groupState.obj), the
+	// single narrow shape this file tracks for "constructor-returned
+	// objects" (docs/roadmap.md item 3): that binding is stored into a
+	// named struct field which is itself returned by the function that
+	// declared the binding, either directly inline in the return
+	// statement or via a local variable assigned the struct literal and
+	// then returned unconsumed. Populated by computeFieldOwnership's
+	// pre-pass (run for every function before any caller-side check),
+	// consumed by computeConstructorCallerConsumption to know which
+	// functions are "constructors" worth checking callers of, and by
+	// recordReturnedField's own lookup into returnFieldConsumption below
+	// once every function's callers have been checked.
+	returnFieldInfo map[types.Object]returnFieldSite
+	// returnFieldConsumption records, for the same binding-object keys as
+	// returnFieldInfo, whether a resolvable direct (same-package,
+	// statically-called) caller of the owning constructor was found to
+	// read the returned struct's field back and consume it --
+	// true: at least one such caller does; false: at least one such
+	// caller was checked and confidently does not, and none does;
+	// absent: no caller could be checked with confidence either way, or
+	// the constructor is never called within this package's analyzed
+	// bound. Absent is treated exactly like true (the conservative
+	// assume-transferred default used throughout this file whenever a
+	// value's fate can't be verified) -- only an explicit false, from
+	// positive evidence at every checked call site, ever produces a
+	// finding. Populated by computeConstructorCallerConsumption.
+	returnFieldConsumption map[types.Object]bool
+	contextInterface       *types.Interface
+	contextFactories       map[string]struct{}
+	startWrappers          map[string]struct{}
+	joinWrappers           map[string]struct{}
+	stopWrappers           map[string]struct{}
+}
+
+// returnFieldSite is the shape computeFieldOwnership records into
+// b.returnFieldInfo: which field of which function's own return value
+// carries a specific cancel/group binding out of the function that
+// created it, for computeConstructorCallerConsumption to verify against
+// that function's own direct callers.
+type returnFieldSite struct {
+	fieldName   string
+	resultIndex int
+	fn          *types.Func
+}
+
+// fieldCapture records a lifecycle binding (a cancel function or a join
+// group) stored into a specific named field of a struct value, either
+// held by a single local variable (varObj set, returnIndex -1) or
+// constructed directly inline in a return statement (varObj nil,
+// returnIndex the result position) -- the two shapes collectFieldCaptures
+// recognizes for "selected struct fields" (docs/roadmap.md item 3). This
+// is a narrow, identity-tracked alternative to the unconditional "stored
+// in a composite value => escaped" fallback (observeContainerEscape):
+// instead of assuming the obligation was discharged the instant it is
+// stored, resolveFieldCaptures verifies whether the same variable's field
+// is later read back and consumed (a call through the field for a cancel
+// function, or a Wait/Add/Go call through the field for a group) before
+// falling back to the prior conservative assume-transferred behavior for
+// anything more indirect than that. It deliberately does not follow an
+// arbitrary alias graph: only this one specific shape (a single named
+// local variable, or a direct return) is tracked, exactly as
+// docs/limitations.md's "aliasing is shallow" boundary describes for
+// every other escape form in this file.
+type fieldCapture struct {
+	varObj      types.Object
+	fieldName   string
+	cancel      *cancelState
+	group       *groupState
+	returnIndex int
 }
 
 // generatedFilePattern matches the standard Go convention for marking a
@@ -167,17 +232,19 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		return model.Program{}, fmt.Errorf("frontend requires file set, package, and type information")
 	}
 	b := &builder{
-		in:               in,
-		cfg:              cfg,
-		funcs:            map[*types.Func]*ast.FuncDecl{},
-		analyzed:         map[*types.Func]bool{},
-		summaries:        map[*types.Func]model.Goroutine{},
-		paramConsumption: map[types.Object]bool{},
-		contextInterface: findContextInterface(in.Pkg),
-		contextFactories: stringSet(cfg.ContextWrappers),
-		startWrappers:    stringSet(cfg.StartWrappers),
-		joinWrappers:     stringSet(cfg.JoinWrappers),
-		stopWrappers:     stringSet(cfg.StopWrappers),
+		in:                     in,
+		cfg:                    cfg,
+		funcs:                  map[*types.Func]*ast.FuncDecl{},
+		analyzed:               map[*types.Func]bool{},
+		summaries:              map[*types.Func]model.Goroutine{},
+		paramConsumption:       map[types.Object]bool{},
+		returnFieldInfo:        map[types.Object]returnFieldSite{},
+		returnFieldConsumption: map[types.Object]bool{},
+		contextInterface:       findContextInterface(in.Pkg),
+		contextFactories:       stringSet(cfg.ContextWrappers),
+		startWrappers:          stringSet(cfg.StartWrappers),
+		joinWrappers:           stringSet(cfg.JoinWrappers),
+		stopWrappers:           stringSet(cfg.StopWrappers),
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
@@ -218,6 +285,23 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	// max_functions truncation being the main reason it wouldn't.
 	for _, source := range sources[:limit] {
 		b.computeParameterConsumption(source.decl)
+	}
+	// Two further pre-passes, run in this order and each over every
+	// function before the next begins, behind the "constructor-returned
+	// objects" half of field/constructor ownership tracking
+	// (docs/roadmap.md item 3) -- the same "isolated pre-pass, not folded
+	// into buildFunction's main loop" reasoning computeParameterConsumption
+	// above already documents, extended one step further: a constructor's
+	// own returned-field shape (computeFieldOwnership) must be known
+	// before any of its callers can be checked (computeConstructorCallerConsumption),
+	// regardless of which one is declared first in source order, and every
+	// caller must in turn be checked before buildFunction's real pass
+	// below looks up the answer.
+	for _, source := range sources[:limit] {
+		b.computeFieldOwnership(source)
+	}
+	for _, source := range sources[:limit] {
+		b.computeConstructorCallerConsumption(source)
 	}
 	for _, source := range sources[:limit] {
 		program.Functions = append(program.Functions, b.buildFunction(source))
@@ -262,7 +346,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
 	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
-	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn)
+	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn, source.obj)
 	b.computeGroupBalances(groups, fd.Body, b.in.Info)
 	// computeGroupOrdering needs real control-flow reachability, not
 	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
@@ -470,7 +554,16 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 	return states, groups
 }
 
-func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Object]string, cancels []*cancelState, groups []*groupState, fn *model.Function) {
+func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Object]string, cancels []*cancelState, groups []*groupState, fn *model.Function, fnObj *types.Func) {
+	// Field/constructor ownership tracking (docs/roadmap.md item 3): find
+	// every "stored struct" or "constructor" field-capture shape in body
+	// up front, before the main traversal below runs, so the generic
+	// unconditional composite-literal/return escape fallbacks
+	// (observeContainerEscape, observeReturn) know via claimed which
+	// specific bindings not to mark Escapes=true for -- their fate is
+	// instead settled by resolveFieldCaptures at the end of this
+	// function, once the whole body has been seen.
+	captures, claimed := b.collectFieldCaptures(body, cancels, groups)
 	// The same traversal observes lifecycle uses and goroutine start sites. A
 	// small depth stack keeps the enclosing function's own termination summary
 	// from inheriting loops or exits from nested function literals.
@@ -507,13 +600,13 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 				}
 			}
 		case *ast.ReturnStmt:
-			b.observeReturn(x, cancels, groups)
+			b.observeReturn(x, cancels, groups, claimed)
 		case *ast.AssignStmt:
 			b.observeEscapeAssignment(x, cancels, groups)
 		case *ast.CompositeLit:
-			b.observeContainerEscape(x, cancels, groups)
+			b.observeContainerEscape(x, cancels, groups, claimed)
 		case *ast.ValueSpec:
-			b.observeContainerEscape(x, cancels, groups)
+			b.observeContainerEscape(x, cancels, groups, claimed)
 		case *ast.GoStmt:
 			g := b.buildGoroutine(x, x.Call, contexts, "go")
 			fn.Goroutines = append(fn.Goroutines, g)
@@ -521,6 +614,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		}
 		return true
 	})
+	b.resolveFieldCaptures(fnObj, body, captures)
 }
 
 // computeParameterConsumption populates b.paramConsumption for every
@@ -565,7 +659,14 @@ func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) {
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	var scratch model.Function
-	b.observeFunctionBody(fd.Body, contexts, paramCancels, paramGroups, &scratch)
+	// fnObj is nil here: this scratch run exists only for its side effect
+	// on b.paramConsumption (see the doc comment above), and constructor-
+	// field tracking is keyed off a binding's *declaring* function, which
+	// for a parameter-standing-in-for-a-binding like this is meaningless
+	// -- there is no separate function that "returns" this parameter's
+	// own value out of itself. recordReturnedField treats a nil fnObj as
+	// a no-op for exactly this reason.
+	b.observeFunctionBody(fd.Body, contexts, paramCancels, paramGroups, &scratch, nil)
 	for _, c := range paramCancels {
 		b.paramConsumption[c.cancelObj] = c.binding.Called || c.binding.Escapes
 	}
@@ -724,15 +825,15 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 	}
 }
 
-func (b *builder) observeReturn(ret *ast.ReturnStmt, cancels []*cancelState, groups []*groupState) {
+func (b *builder) observeReturn(ret *ast.ReturnStmt, cancels []*cancelState, groups []*groupState, claimed map[types.Object]bool) {
 	used := objectsUsedInExpressions(ret.Results, b.in.Info, true)
 	for _, c := range cancels {
-		if c.cancelObj != nil && hasObject(used, c.cancelObj) {
+		if c.cancelObj != nil && hasObject(used, c.cancelObj) && !claimed[c.cancelObj] {
 			c.binding.Escapes = true
 		}
 	}
 	for _, g := range groups {
-		if g.obj != nil && hasObject(used, g.obj) {
+		if g.obj != nil && hasObject(used, g.obj) && !claimed[g.obj] {
 			g.group.Escapes = true
 		}
 	}
@@ -765,7 +866,7 @@ func pairedLHSIsBlank(as *ast.AssignStmt, rhsIndex int) bool {
 	return ok && id.Name == "_"
 }
 
-func (b *builder) observeContainerEscape(n ast.Node, cancels []*cancelState, groups []*groupState) {
+func (b *builder) observeContainerEscape(n ast.Node, cancels []*cancelState, groups []*groupState, claimed map[types.Object]bool) {
 	// A ValueSpec contains both newly defined identifiers and initializers. Only
 	// initializer expressions can store an already-existing lifecycle value.
 	nodes := []ast.Node{n}
@@ -778,16 +879,667 @@ func (b *builder) observeContainerEscape(n ast.Node, cancels []*cancelState, gro
 	for _, node := range nodes {
 		used := objectsUsed(node, b.in.Info, true)
 		for _, c := range cancels {
-			if c.cancelObj != nil && hasObject(used, c.cancelObj) {
+			// claimed holds every binding already accounted for by the
+			// narrower, identity-tracked field-capture mechanism
+			// (collectFieldCaptures/resolveFieldCaptures) -- skipping it
+			// here defers to that mechanism's own, more precise verdict
+			// instead of this generic fallback's unconditional "stored
+			// anywhere => transferred".
+			if c.cancelObj != nil && hasObject(used, c.cancelObj) && !claimed[c.cancelObj] {
 				c.binding.Escapes = true
 				c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "ownership-transfer", Message: "cancellation function is stored in another value", Span: ptrSpan(b.span(node))})
 			}
 		}
 		for _, g := range groups {
-			if g.obj != nil && hasObject(used, g.obj) {
+			if g.obj != nil && hasObject(used, g.obj) && !claimed[g.obj] {
 				g.group.Escapes = true
 			}
 		}
+	}
+}
+
+// collectFieldCaptures scans body for the two "selected struct fields"
+// shapes field/constructor ownership tracking recognizes (docs/roadmap.md
+// item 3): a cancel/group binding already recognized in cancels/groups
+// used as the value of a named field in a struct composite literal,
+// either (a) that literal assigned whole to a single local variable via
+// `:=`/`=`/a `var` declaration with an initializer, or (b) that literal
+// constructed directly inline as one of a return statement's own result
+// expressions. Only a keyed struct literal is recognized -- a positional
+// literal, or a literal for a slice/array/map type, is left to the
+// existing generic escape fallback untouched, the same as multi-name or
+// blank-discarded assignments and any other shape not matching this exact
+// narrow pattern. claimed is populated with every binding object captured
+// this way, so the caller's generic composite-literal/return escape
+// handling knows to defer to resolveFieldCaptures's own verdict instead
+// of unconditionally marking it transferred on sight. Nested function
+// literals have independent locals and are not descended into, matching
+// the rest of this file's scoping.
+func (b *builder) collectFieldCaptures(body *ast.BlockStmt, cancels []*cancelState, groups []*groupState) (captures []*fieldCapture, claimed map[types.Object]bool) {
+	claimed = map[types.Object]bool{}
+	if body == nil || (len(cancels) == 0 && len(groups) == 0) {
+		return nil, claimed
+	}
+	funcDepth := 0
+	var nodeIsFuncLit []bool
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			last := len(nodeIsFuncLit) - 1
+			if last >= 0 {
+				if nodeIsFuncLit[last] {
+					funcDepth--
+				}
+				nodeIsFuncLit = nodeIsFuncLit[:last]
+			}
+			return true
+		}
+		_, isFuncLit := n.(*ast.FuncLit)
+		nodeIsFuncLit = append(nodeIsFuncLit, isFuncLit)
+		if isFuncLit {
+			funcDepth++
+		}
+		if funcDepth > 0 {
+			return true
+		}
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			if x.Tok != token.DEFINE && x.Tok != token.ASSIGN {
+				return true
+			}
+			if len(x.Lhs) != 1 || len(x.Rhs) != 1 {
+				return true
+			}
+			lhs, ok := x.Lhs[0].(*ast.Ident)
+			if !ok || lhs.Name == "_" {
+				return true
+			}
+			varObj := b.in.Info.ObjectOf(lhs)
+			if varObj == nil {
+				return true
+			}
+			if lit := compositeLitOf(x.Rhs[0]); lit != nil {
+				captures = append(captures, b.captureFieldsFromLiteral(lit, varObj, -1, cancels, groups, claimed)...)
+			}
+		case *ast.ValueSpec:
+			if len(x.Names) != 1 || len(x.Values) != 1 || x.Names[0].Name == "_" {
+				return true
+			}
+			varObj := b.in.Info.ObjectOf(x.Names[0])
+			if varObj == nil {
+				return true
+			}
+			if lit := compositeLitOf(x.Values[0]); lit != nil {
+				captures = append(captures, b.captureFieldsFromLiteral(lit, varObj, -1, cancels, groups, claimed)...)
+			}
+		case *ast.ReturnStmt:
+			for i, res := range x.Results {
+				if lit := compositeLitOf(res); lit != nil {
+					captures = append(captures, b.captureFieldsFromLiteral(lit, nil, i, cancels, groups, claimed)...)
+				}
+			}
+		}
+		return true
+	})
+	return captures, claimed
+}
+
+// captureFieldsFromLiteral inspects one struct composite literal's own
+// keyed elements for a value that is exactly one of cancels'/groups'
+// tracked binding objects (not a nested sub-expression using it, matching
+// identObject's own narrow unwrapping of `&x`/parens only), returning one
+// fieldCapture per match found. Not a struct literal at all (a slice,
+// array, or map composite literal, or a struct literal using positional
+// rather than keyed elements) yields no captures, leaving those bindings
+// for the existing generic escape fallback to handle exactly as before.
+func (b *builder) captureFieldsFromLiteral(lit *ast.CompositeLit, varObj types.Object, returnIndex int, cancels []*cancelState, groups []*groupState, claimed map[types.Object]bool) []*fieldCapture {
+	if !isStructCompositeLit(lit, b.in.Info) {
+		return nil
+	}
+	var out []*fieldCapture
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		valueObj := identObject(kv.Value, b.in.Info)
+		if valueObj == nil {
+			continue
+		}
+		for _, c := range cancels {
+			if c.cancelObj != nil && valueObj == c.cancelObj {
+				claimed[valueObj] = true
+				out = append(out, &fieldCapture{varObj: varObj, fieldName: key.Name, cancel: c, returnIndex: returnIndex})
+			}
+		}
+		for _, g := range groups {
+			if g.obj != nil && valueObj == g.obj {
+				claimed[valueObj] = true
+				out = append(out, &fieldCapture{varObj: varObj, fieldName: key.Name, group: g, returnIndex: returnIndex})
+			}
+		}
+	}
+	return out
+}
+
+// compositeLitOf unwraps expr down to the struct/slice/map composite
+// literal it constructs, if any: `&T{...}` (the overwhelmingly common
+// shape for a constructor returning a pointer, or for a locally-held
+// handle) and a parenthesized literal are both recognized; anything else
+// (an existing variable, a function call, a type conversion of something
+// other than a literal) returns nil, since those are not a fresh literal
+// this function's own body can attribute a field of to a specific value.
+func compositeLitOf(expr ast.Expr) *ast.CompositeLit {
+	switch x := expr.(type) {
+	case *ast.CompositeLit:
+		return x
+	case *ast.UnaryExpr:
+		if x.Op == token.AND {
+			return compositeLitOf(x.X)
+		}
+	case *ast.ParenExpr:
+		return compositeLitOf(x.X)
+	}
+	return nil
+}
+
+// isStructCompositeLit reports whether lit's own static type (as recorded
+// by the type checker, which is always the pointed-to struct type itself
+// even when the literal is immediately addressed with `&`, never the
+// pointer type) is a struct. A slice, array, or map composite literal --
+// the other kinds sharing the same *ast.CompositeLit node type -- reports
+// false, which is what keeps this field-capture mechanism from ever
+// attempting to track a binding placed in a container it has no field
+// identity for.
+func isStructCompositeLit(lit *ast.CompositeLit, info *types.Info) bool {
+	t := info.TypeOf(lit)
+	if t == nil {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Struct)
+	return ok
+}
+
+// ancestor returns the node n levels up the stack from its top (n=1 is
+// the immediate parent, n=2 the grandparent, and so on), or nil if the
+// stack is not that deep. See walkFieldCaptureUses for how stack is built
+// and maintained during traversal.
+func ancestor(stack []ast.Node, n int) ast.Node {
+	if len(stack) < n {
+		return nil
+	}
+	return stack[len(stack)-n]
+}
+
+// resolveFieldCaptures is field/constructor ownership tracking's own
+// verdict step, run once per function body after collectFieldCaptures has
+// found every candidate in it (see observeFunctionBody and
+// computeFieldOwnership, its two callers). A capture built directly
+// inline in a return statement (returnIndex >= 0) has no further local
+// evidence to look for -- a fresh literal born inside the return
+// statement can't be referenced again -- so it goes straight to
+// recordReturnedField. A capture held by a named local variable is
+// resolved against the rest of the body via walkFieldCaptureUses: verified
+// consumption needs nothing further (Called/Joined is already set);
+// verified as returned (and not otherwise used in a way this narrow check
+// can't follow) is handed to recordReturnedField the same way; any other,
+// less certain use of the variable falls back to the conservative
+// assume-transferred default the rest of this file uses whenever a
+// value's fate can't be verified; and a variable neither consumed,
+// returned, nor used any other way at all is left exactly as constructed
+// (Called/Joined/Escapes all false) so the ordinary LL1001/LL1003 checks
+// fire on this positive evidence of an unconsumed capability -- the
+// "stored struct" leak this mechanism exists to catch.
+func (b *builder) resolveFieldCaptures(fnObj *types.Func, body *ast.BlockStmt, captures []*fieldCapture) {
+	if len(captures) == 0 {
+		return
+	}
+	byVar := map[types.Object][]*fieldCapture{}
+	for _, c := range captures {
+		if c.returnIndex >= 0 {
+			b.recordReturnedField(fnObj, c, c.returnIndex)
+			continue
+		}
+		if c.varObj != nil {
+			byVar[c.varObj] = append(byVar[c.varObj], c)
+		}
+	}
+	if len(byVar) == 0 {
+		return
+	}
+	consumed := map[*fieldCapture]bool{}
+	returnedAt := map[types.Object]int{}
+	otherUse := map[types.Object]bool{}
+	b.walkFieldCaptureUses(body, byVar, consumed, returnedAt, otherUse)
+
+	for varObj, fcs := range byVar {
+		idx, wasReturned := returnedAt[varObj]
+		hasOther := otherUse[varObj]
+		for _, fc := range fcs {
+			if consumed[fc] {
+				continue
+			}
+			switch {
+			case hasOther:
+				markFieldCaptureFallback(fc)
+			case wasReturned:
+				b.recordReturnedField(fnObj, fc, idx)
+			default:
+				markFieldCaptureUnconsumed(fc)
+			}
+		}
+	}
+}
+
+// walkFieldCaptureUses is the single whole-body scan every field capture
+// in byVar (keyed by the local variable holding it) is resolved against,
+// run once per body rather than interleaved with collectFieldCaptures'
+// own traversal so that a consuming call or return statement is found
+// regardless of its lexical position relative to the capture's own
+// definition. It maintains an explicit ancestor stack (the same push-
+// before-descend/pop-on-nil-visit idiom observeFunctionBody's own
+// funcDepth tracking already uses) so classifyFieldCaptureUse can look at
+// an identifier's immediate call/selector context without go/ast's own
+// Inspect providing parent links directly.
+func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*fieldCapture, consumed map[*fieldCapture]bool, returnedAt map[types.Object]int, otherUse map[types.Object]bool) {
+	if body == nil || len(byVar) == 0 {
+		return
+	}
+	var stack []ast.Node
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if id, ok := n.(*ast.Ident); ok && id.Name != "_" {
+			if obj := b.in.Info.Uses[id]; obj != nil {
+				if fcs, tracked := byVar[obj]; tracked {
+					b.classifyFieldCaptureUse(stack, id, obj, fcs, consumed, returnedAt, otherUse)
+				}
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+}
+
+// classifyFieldCaptureUse decides what one identifier occurrence of a
+// captured variable (id, resolving to obj, tracked by fcs) means for
+// resolveFieldCaptures' final verdict:
+//
+//   - h.otherField or h.otherMethod(...), where otherField/otherMethod
+//     doesn't match any of fcs' own field names: an incidental, harmless
+//     use of the same variable for something unrelated (e.g. reading a
+//     sibling field for a log message) -- neither consumption nor
+//     disqualifying, so it is silently ignored.
+//   - h.field(...), where field matches a tracked cancel binding's field
+//     name and the selector is itself being called: verified consumption
+//     -- marks Called and records evidence, the same shape a direct
+//     `cancel()` call already gets.
+//   - h.field.Add(...)/.Go(...)/.Wait(...), where field matches a tracked
+//     group binding's field name: verified worker-accounting/consumption
+//     through the field, mirroring observeCall's direct-receiver handling
+//     for the same three methods.
+//   - h appearing directly as one of a return statement's own result
+//     expressions: recorded by position for resolveFieldCaptures to hand
+//     to recordReturnedField (the "constructor" shape).
+//   - anything else -- the field is referenced but not called, an
+//     unrelated method is called on it, h is passed as an argument,
+//     reassigned, or used any other way this narrow check does not
+//     attempt to follow: marked otherUse, resolveFieldCaptures' signal to
+//     fall back to the conservative assume-transferred default rather
+//     than guess.
+func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj types.Object, fcs []*fieldCapture, consumed map[*fieldCapture]bool, returnedAt map[types.Object]int, otherUse map[types.Object]bool) {
+	parent := ancestor(stack, 1)
+	if sel, ok := parent.(*ast.SelectorExpr); ok && sel.X == ast.Expr(id) {
+		fieldName := sel.Sel.Name
+		matches := false
+		for _, fc := range fcs {
+			if fc.fieldName == fieldName {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			return // an unrelated field/method access through the same variable; harmless
+		}
+		grand := ancestor(stack, 2)
+		if call, ok := grand.(*ast.CallExpr); ok && call.Fun == ast.Expr(sel) {
+			for _, fc := range fcs {
+				if fc.cancel != nil && fc.fieldName == fieldName {
+					b.markCancelFieldConsumed(fc, consumed, call)
+					return
+				}
+			}
+		}
+		if outer, ok := grand.(*ast.SelectorExpr); ok && outer.X == ast.Expr(sel) {
+			method := outer.Sel.Name
+			if method == "Add" || method == "Go" || method == "Wait" {
+				if call, ok := ancestor(stack, 3).(*ast.CallExpr); ok && call.Fun == ast.Expr(outer) {
+					for _, fc := range fcs {
+						if fc.group != nil && fc.fieldName == fieldName {
+							b.markGroupFieldConsumed(fc, method, consumed, call)
+							return
+						}
+					}
+				}
+			}
+		}
+		otherUse[obj] = true
+		return
+	}
+	if ret, ok := parent.(*ast.ReturnStmt); ok {
+		for i, r := range ret.Results {
+			if r == ast.Expr(id) {
+				returnedAt[obj] = i
+				return
+			}
+		}
+	}
+	if as, ok := parent.(*ast.AssignStmt); ok {
+		for i, rhs := range as.Rhs {
+			if rhs == ast.Expr(id) && pairedLHSIsBlank(as, i) {
+				// `_ = h`: the common idiom for explicitly discarding a
+				// value (often just to satisfy Go's "declared and not
+				// used" rule) -- harmless and not a real use, the same
+				// way accessing an unrelated field is.
+				return
+			}
+		}
+	}
+	otherUse[obj] = true
+}
+
+// markCancelFieldConsumed records verified consumption of a cancel
+// binding through a struct field: the same Called flag and call-site
+// bookkeeping a direct `cancel()` call gets from observeCall, so every
+// downstream consumer (LL1001's own check, computeGroupOrdering's stop-
+// signal detection) treats the two identically.
+func (b *builder) markCancelFieldConsumed(fc *fieldCapture, consumed map[*fieldCapture]bool, call *ast.CallExpr) {
+	consumed[fc] = true
+	fc.cancel.binding.Called = true
+	fc.cancel.callSites = append(fc.cancel.callSites, call)
+	fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{
+		Kind: "field-consumed", Message: fmt.Sprintf("cancellation function is called through field %q", fc.fieldName), Span: ptrSpan(b.span(call)),
+	})
+}
+
+// markGroupFieldConsumed records verified worker-accounting or join
+// consumption of a group binding through a struct field, mirroring
+// observeCall's direct-receiver handling for the same three methods:
+// Add/Go increment Starts, Wait sets Joined and records a call site
+// (for computeGroupOrdering's own CFG-based ordering checks) the same
+// way a direct `wg.Wait()` does. Only Wait marks the capture itself
+// resolved (consumed): an Add/Go-only capture still needs a
+// consumption/return/other-use verdict for its own sake, since seeing a
+// worker started through the field says nothing about whether it is
+// ever joined through the field too.
+func (b *builder) markGroupFieldConsumed(fc *fieldCapture, method string, consumed map[*fieldCapture]bool, call *ast.CallExpr) {
+	switch method {
+	case "Add", "Go":
+		fc.group.group.Starts++
+		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "worker-start", Message: fmt.Sprintf("worker accounting starts here (through field %q)", fc.fieldName), Span: ptrSpan(b.span(call))})
+	case "Wait":
+		fc.group.group.Joined = true
+		fc.group.waitCallSites = append(fc.group.waitCallSites, call)
+		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "join", Message: fmt.Sprintf("group is joined here, through field %q", fc.fieldName), Span: ptrSpan(b.span(call))})
+		consumed[fc] = true
+	}
+}
+
+// markFieldCaptureFallback applies this file's ordinary conservative
+// assume-transferred default (the same one observeContainerEscape's own
+// generic fallback uses) to a capture whose fate resolveFieldCaptures
+// could not verify with confidence.
+func markFieldCaptureFallback(fc *fieldCapture) {
+	if fc.cancel != nil {
+		fc.cancel.binding.Escapes = true
+		fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "ownership-transfer", Message: fmt.Sprintf("cancellation function is stored in field %q; further use is not verified", fc.fieldName)})
+	}
+	if fc.group != nil {
+		fc.group.group.Escapes = true
+	}
+}
+
+// markFieldCaptureUnconsumed records evidence for a capture confidently
+// verified as local and never consumed (resolveFieldCaptures' positive
+// "stored struct" leak case), without itself setting Escapes -- leaving
+// it false is what lets LL1001/LL1003's own ordinary checks fire.
+func markFieldCaptureUnconsumed(fc *fieldCapture) {
+	if fc.cancel != nil {
+		fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("stored in field %q, but that field is never called", fc.fieldName)})
+	}
+	if fc.group != nil {
+		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("stored in field %q, but that field is never joined", fc.fieldName)})
+	}
+}
+
+// recordReturnedField is the shared landing point for both a capture
+// known outright to be returned (an inline literal in a return
+// statement) and one resolveFieldCaptures determined is returned via a
+// local variable: it registers the constructor shape into
+// b.returnFieldInfo (for computeConstructorCallerConsumption to find, on
+// the pre-pass call from computeFieldOwnership) and, using whatever
+// b.returnFieldConsumption already holds for this binding (populated by
+// computeConstructorCallerConsumption before buildFunction's real pass
+// runs -- empty on the pre-pass's own call, which is fine, since that
+// call's only purpose is populating returnFieldInfo in the first place),
+// settles the binding's own Escapes/evidence: verified-consumed-by-a-
+// caller and not-yet-verified both apply the same conservative
+// assume-transferred fallback (recordReturnedField cannot itself tell
+// them apart from any evidence beyond the flag, so both get the same
+// safe treatment other than which evidence message is recorded);
+// verified as NOT consumed by every checked caller leaves Escapes false,
+// so the ordinary LL1001/LL1003 checks fire.
+func (b *builder) recordReturnedField(fnObj *types.Func, fc *fieldCapture, resultIndex int) {
+	var bindingObj types.Object
+	switch {
+	case fc.cancel != nil:
+		bindingObj = fc.cancel.cancelObj
+	case fc.group != nil:
+		bindingObj = fc.group.obj
+	}
+	if bindingObj == nil {
+		return
+	}
+	if fnObj != nil {
+		b.returnFieldInfo[bindingObj] = returnFieldSite{fieldName: fc.fieldName, resultIndex: resultIndex, fn: fnObj}
+	}
+	consumedByCaller, verified := b.returnFieldConsumption[bindingObj]
+	if !verified || consumedByCaller {
+		markFieldCaptureFallback(fc)
+		if verified && consumedByCaller {
+			if fc.cancel != nil {
+				fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller consumes it", fc.fieldName)})
+			}
+			if fc.group != nil {
+				fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller consumes it", fc.fieldName)})
+			}
+		}
+		return
+	}
+	// verified, and no checked caller consumes it: a genuine, confirmed
+	// leak -- leave Escapes/Called/Joined exactly as constructed (false)
+	// and record why.
+	if fc.cancel != nil {
+		fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("returned via field %q; no direct caller is verified to consume it", fc.fieldName)})
+	}
+	if fc.group != nil {
+		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("returned via field %q; no direct caller is verified to consume it", fc.fieldName)})
+	}
+}
+
+// computeFieldOwnership is the first of two dedicated pre-passes (see
+// also computeConstructorCallerConsumption) behind the "constructor-
+// returned objects" half of field/constructor ownership tracking
+// (docs/roadmap.md item 3): before any function's real diagnostics are
+// built, every function is scanned once for the narrow shape this
+// capability recognizes -- a cancel/group binding declared in this
+// function, stored into a named field of a struct composite literal, and
+// returned (either inline in the same return statement, or via a local
+// variable that is itself later returned unconsumed) -- populating
+// b.returnFieldInfo so computeConstructorCallerConsumption knows which
+// functions are "constructors" to check callers of, and buildFunction's
+// own later call to the same body-walking machinery
+// (observeFunctionBody -> resolveFieldCaptures) can look the answer up
+// instead of guessing. This mirrors computeParameterConsumption's own
+// reasons for running as an isolated pre-pass rather than being folded
+// into buildFunction's main loop: a caller earlier in file order than its
+// callee must still see the callee's own returned-field shape. The
+// resulting scratch cancels/groups states are discarded, same as
+// computeParameterConsumption's own scratch model.Function: this call
+// exists only for its side effect on b.returnFieldInfo.
+func (b *builder) computeFieldOwnership(source funcSource) {
+	fd := source.decl
+	if fd.Body == nil {
+		return
+	}
+	contexts := map[types.Object]string{}
+	cancels, groups := b.collectBindings(fd, contexts)
+	if len(cancels) == 0 && len(groups) == 0 {
+		return
+	}
+	captures, _ := b.collectFieldCaptures(fd.Body, cancels, groups)
+	b.resolveFieldCaptures(source.obj, fd.Body, captures)
+}
+
+// computeConstructorCallerConsumption is the second of the two
+// constructor-return pre-passes: for every function (as a potential
+// direct caller), find call sites to a function already known (from
+// computeFieldOwnership's b.returnFieldInfo) to return a cancel/group
+// binding via a struct field, whose result at the matching position is
+// captured by a single named local variable in the caller -- then reuse
+// the exact same field-capture consumption search resolveFieldCaptures
+// already runs for the "stored struct" pattern (walkFieldCaptureUses),
+// this time against the caller's own body, to determine whether that
+// specific field is read back and consumed there. Like Phase 5's
+// argumentConsumed, this is a single verified hop (the constructor's
+// direct, resolvable, same-package, statically-called caller): an
+// unresolved or further-indirect caller (the result passed on again, an
+// interface method, a different package) leaves b.returnFieldConsumption
+// without an entry for that binding, which recordReturnedField's own
+// lookup treats as "not verified" and falls back to the conservative
+// assume-transferred default, never a leak.
+func (b *builder) computeConstructorCallerConsumption(source funcSource) {
+	if len(b.returnFieldInfo) == 0 {
+		return
+	}
+	fd := source.decl
+	if fd.Body == nil {
+		return
+	}
+	funcDepth := 0
+	var nodeIsFuncLit []bool
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if n == nil {
+			last := len(nodeIsFuncLit) - 1
+			if last >= 0 {
+				if nodeIsFuncLit[last] {
+					funcDepth--
+				}
+				nodeIsFuncLit = nodeIsFuncLit[:last]
+			}
+			return true
+		}
+		_, isFuncLit := n.(*ast.FuncLit)
+		nodeIsFuncLit = append(nodeIsFuncLit, isFuncLit)
+		if isFuncLit {
+			funcDepth++
+		}
+		if funcDepth > 0 {
+			return true
+		}
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return true
+		}
+		call, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		calleeObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
+		if !ok {
+			return true
+		}
+		for bindingObj, site := range b.returnFieldInfo {
+			if site.fn != calleeObj || site.resultIndex >= len(as.Lhs) {
+				continue
+			}
+			lhs, ok := as.Lhs[site.resultIndex].(*ast.Ident)
+			if !ok || lhs.Name == "_" {
+				continue
+			}
+			varObj := b.in.Info.ObjectOf(lhs)
+			if varObj == nil {
+				continue
+			}
+			b.verifyConstructorCallerField(fd.Body, bindingObj, varObj, site)
+		}
+		return true
+	})
+}
+
+// verifyConstructorCallerField checks one specific call site's captured
+// result variable (varObj, expected to hold site.fieldName's binding)
+// against the calling function's own body, via the same
+// walkFieldCaptureUses machinery a locally-declared "stored struct"
+// capture is resolved with. bindingObj's own static type (rather than a
+// stored kind flag) tells cancel and group bindings apart, since this
+// runs from the caller's side where no cancelState/groupState has ever
+// existed for this particular binding -- only computeFieldOwnership's
+// recorded field name and origin function.
+func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, varObj types.Object, site returnFieldSite) {
+	fc := &fieldCapture{varObj: varObj, fieldName: site.fieldName, returnIndex: -1}
+	switch {
+	case isCancelFuncType(bindingObj.Type()):
+		fc.cancel = &cancelState{cancelObj: bindingObj}
+	case groupKind(bindingObj.Type()) != "":
+		fc.group = &groupState{obj: bindingObj}
+	default:
+		return
+	}
+	consumed := map[*fieldCapture]bool{}
+	returnedAt := map[types.Object]int{}
+	otherUse := map[types.Object]bool{}
+	byVar := map[types.Object][]*fieldCapture{varObj: {fc}}
+	b.walkFieldCaptureUses(callerBody, byVar, consumed, returnedAt, otherUse)
+	_, passedOnward := returnedAt[varObj]
+	switch {
+	case consumed[fc]:
+		b.setReturnFieldConsumption(bindingObj, true)
+	case otherUse[varObj]:
+		// Can't verify at this call site either way (e.g. the caller
+		// passes the handle on somewhere this check does not follow) --
+		// leave it unresolved unless a different call site already
+		// resolved it.
+	case passedOnward:
+		// The caller itself just returns the handle onward -- a second
+		// hop, out of scope for this single verified hop (matching Phase
+		// 5's own one-hop guarantee for direct parameter passing); leave
+		// it unresolved.
+	default:
+		b.setReturnFieldConsumption(bindingObj, false)
+	}
+}
+
+// setReturnFieldConsumption merges one call site's verdict into
+// b.returnFieldConsumption for bindingObj: a verified consumption is
+// permanent and wins over any other call site's verdict (recorded
+// unconditionally, even overwriting an earlier false), while a verified
+// non-consumption only takes effect if no entry exists yet, so that one
+// consuming caller is always enough to clear a binding even if another,
+// earlier-checked caller drops it -- consistent with this file's general
+// preference for avoiding a false positive over catching every leak.
+func (b *builder) setReturnFieldConsumption(obj types.Object, consumed bool) {
+	if consumed {
+		b.returnFieldConsumption[obj] = true
+		return
+	}
+	if _, already := b.returnFieldConsumption[obj]; !already {
+		b.returnFieldConsumption[obj] = false
 	}
 }
 

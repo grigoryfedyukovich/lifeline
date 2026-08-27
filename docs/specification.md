@@ -87,9 +87,9 @@ Standard context factories and configured equivalents are modeled. The cancel ob
 
 - called directly or through `defer`;
 - returned;
-- passed as an argument;
+- passed as an argument to a resolvable same-package function whose own body is verified to consume it in turn (a direct call, `defer`, or any of the other discharge forms on this list — one hop reliably regardless of declaration order, a chain of hops as far as a pre-pass computed a deeper callee's result in time; see `docs/limitations.md`), or, when the callee cannot be resolved with confidence, unconditionally as before;
 - assigned to a named value;
-- stored in a composite value.
+- stored into a named field of a *keyed* struct literal assigned to a single local variable, or built directly in a `return` statement, and verified against that specific field's later use — a call through the field (same-function "stored struct" shape) or a direct, resolvable, same-package caller's own use of the field (the "constructor" shape) — one verified hop either way; any other, more indirect storage (an unkeyed literal, a multi-name assignment, a slice/map/array, or a value passed on to a further function) remains unconditionally discharged, as before this capability existed.
 
 A cancel value assigned to `_` is lost immediately. A suggested edit is emitted only for the unambiguous short-declaration form where retaining and immediately deferring the cancel function is syntax-preserving.
 
@@ -114,6 +114,7 @@ Nested function literals have independent lifecycle summaries and independent CF
 - `sync.WaitGroup.Add` and `sync.WaitGroup.Go` create a local join obligation.
 - `errgroup.Group.Go` creates a local join obligation.
 - `Wait`, a configured join wrapper, or an observed ownership transfer discharges that obligation.
+- The same field/constructor ownership tracking described above for cancellation applies to a group: stored into a named field of a keyed struct literal (a single local variable, or built directly in a `return`), the obligation is verified against that field's own later `Add`/`Go`/`Wait` use — same-function or, for a constructor, one verified hop into a direct caller — rather than unconditionally discharged; any more indirect storage remains unconditionally discharged, as before.
 
 As of Phase 6 (`docs/cfg-migration-plan.md`), discharge is no longer a single flat "was `Wait` ever observed" boolean, and `Add`/`Done` counts are no longer purely qualitative — three independently-verified upgrades, each only ever firing from positive evidence:
 
