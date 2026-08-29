@@ -322,6 +322,13 @@ type cancelState struct {
 	// span, since a defer-wrapped call's own span differs from its
 	// underlying *ast.CallExpr's.
 	callSites []*ast.CallExpr
+	// pendingAliasEscapes records every other cancel binding this one's
+	// cancel function was assigned into (`other := cancel` or `other =
+	// cancel`), where that other identifier is itself a separately
+	// tracked cancel binding rather than some arbitrary, untracked
+	// variable. See resolveAliasEscapes for why this is deferred rather
+	// than decided immediately in observeEscapeAssignment.
+	pendingAliasEscapes []*cancelState
 }
 
 type groupState struct {
@@ -331,6 +338,10 @@ type groupState struct {
 	// cancelState.callSites above, for the same reason: finding each
 	// Wait() call's CFG block by identity, not by span.
 	waitCallSites []*ast.CallExpr
+	// pendingAliasEscapes is groupState's analogue of
+	// cancelState.pendingAliasEscapes above, for `other := &wg` / `other
+	// = &wg` where other is itself a separately tracked group binding.
+	pendingAliasEscapes []*groupState
 }
 
 func (b *builder) buildFunction(source funcSource) model.Function {
@@ -347,6 +358,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
 	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn, source.obj)
+	resolveAliasEscapes(states, groups)
 	b.computeGroupBalances(groups, fd.Body, b.in.Info)
 	// computeGroupOrdering needs real control-flow reachability, not
 	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
@@ -872,14 +884,148 @@ func (b *builder) observeEscapeAssignment(as *ast.AssignStmt, cancels []*cancelS
 		if obj == nil || pairedLHSIsBlank(as, i) {
 			continue
 		}
+		lhsObj := aliasTargetObject(as, i, b.in.Info)
 		for _, c := range cancels {
-			if obj == c.cancelObj {
-				c.binding.Escapes = true
+			if obj != c.cancelObj {
+				continue
+			}
+			if alias := cancelBindingFor(cancels, lhsObj); alias != nil {
+				if alias != c {
+					c.pendingAliasEscapes = append(c.pendingAliasEscapes, alias)
+				}
+				continue
+			}
+			c.binding.Escapes = true
+		}
+		for _, g := range groups {
+			if obj != g.obj {
+				continue
+			}
+			if alias := groupBindingFor(groups, lhsObj); alias != nil {
+				if alias != g {
+					g.pendingAliasEscapes = append(g.pendingAliasEscapes, alias)
+				}
+				continue
+			}
+			g.group.Escapes = true
+		}
+	}
+}
+
+// aliasTargetObject returns the types.Object that the i-th name on as's
+// left-hand side defines (`:=`) or assigns to (`=`), if that name is a
+// plain identifier other than the blank identifier -- nil for any lvalue
+// this function doesn't resolve to a specific object (a selector like
+// `h.wg`, an index expression, or an out-of-range index, none of which
+// pairedLHSIsBlank's blank-identifier check already screens out).
+func aliasTargetObject(as *ast.AssignStmt, i int, info *types.Info) types.Object {
+	if i >= len(as.Lhs) {
+		return nil
+	}
+	id, ok := as.Lhs[i].(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return nil
+	}
+	if as.Tok == token.DEFINE {
+		if obj := info.Defs[id]; obj != nil {
+			return obj
+		}
+	}
+	return info.ObjectOf(id)
+}
+
+func cancelBindingFor(cancels []*cancelState, obj types.Object) *cancelState {
+	if obj == nil {
+		return nil
+	}
+	for _, c := range cancels {
+		if c.cancelObj == obj {
+			return c
+		}
+	}
+	return nil
+}
+
+func groupBindingFor(groups []*groupState, obj types.Object) *groupState {
+	if obj == nil {
+		return nil
+	}
+	for _, g := range groups {
+		if g.obj == obj {
+			return g
+		}
+	}
+	return nil
+}
+
+// resolveAliasEscapes finalizes every pending alias-escape relationship
+// observeEscapeAssignment recorded while walking a function body: taking
+// a tracked cancel/group's value (its address, for a group; the function
+// value itself, for a cancel) and assigning it into ANOTHER local
+// variable that is itself a separately tracked cancel/group binding is
+// not, by itself, evidence that the original value was transferred
+// anywhere -- only evidence that a local alias for it now exists. Whether
+// that alias was ever put to any use is exactly what the alias's own
+// binding, independently, has already recorded by the time the whole
+// body has been walked (observeFunctionBody runs the identical generic
+// call/escape observation against the alias's own object, the same as it
+// does for any other locally-declared binding): if the alias itself
+// shows no activity at all -- never called or started via it, never
+// itself joined, never itself further escaped -- then aliasing the
+// original into it is exactly as inert as never mentioning the original
+// value's address/function value at all, and should not discharge the
+// original's own "was this ever called/joined" obligation. Confirmed
+// concretely: `var a, b sync.WaitGroup; p := &a; p = &b; b.Add(1)` with
+// no Wait() anywhere and p never otherwise used previously suppressed
+// LL1003 for "b" entirely (b.group.Escapes was set the moment `p = &b`
+// assigned its address into ANY tracked local, regardless of whether
+// that local was ever subsequently used for anything) -- exactly the
+// same as the far simpler, single-assignment `wg.Add(1); go
+// worker(&wg)-shaped goroutine; p := &wg` with no reassignment and no
+// further use of p at all.
+//
+// If the alias DOES show activity, this still cannot verify that the
+// activity reflects what happened to *this specific* original value: a
+// later reassignment (`p := &a; p = &b`) can make an alias's own
+// eventual activity belong to a different original value than the one
+// under consideration, and this function does not attempt to disentangle
+// that (a materially larger undertaking -- see docs/limitations.md's
+// "aliasing is shallow" boundary). So, conservatively, matching this
+// project's "unverified defaults to safe" policy throughout, the original
+// is marked Escapes in that case, exactly as it always was before this
+// resolution step existed.
+//
+// This runs to a fixed point rather than a single pass so that a chain
+// of aliases (an alias whose own only activity is itself being an inert
+// or active alias of something further) resolves correctly regardless of
+// the order bindings happen to appear in cancels/groups; each pass can
+// only ever set Escapes (never clear it), so it is guaranteed to
+// terminate within at most len(cancels)+len(groups) passes.
+func resolveAliasEscapes(cancels []*cancelState, groups []*groupState) {
+	for changed := true; changed; {
+		changed = false
+		for _, c := range cancels {
+			if c.binding.Escapes {
+				continue
+			}
+			for _, alias := range c.pendingAliasEscapes {
+				if alias.binding.Called || alias.binding.Escapes {
+					c.binding.Escapes = true
+					changed = true
+					break
+				}
 			}
 		}
 		for _, g := range groups {
-			if obj == g.obj {
-				g.group.Escapes = true
+			if g.group.Escapes {
+				continue
+			}
+			for _, alias := range g.pendingAliasEscapes {
+				if alias.group.Starts > 0 || alias.group.Joined || alias.group.Escapes {
+					g.group.Escapes = true
+					changed = true
+					break
+				}
 			}
 		}
 	}

@@ -1482,6 +1482,114 @@ func run(h *holder) {
 	}
 }
 
+func TestGroupIdentity_UnusedLocalAliasDoesNotSuppressUnjoined(t *testing.T) {
+	// Taking a group's address into a local pointer variable that is
+	// itself independently tracked (any *sync.WaitGroup-typed local
+	// qualifies per groupKind, not just ones passed to a function) is not
+	// evidence that the group was transferred anywhere -- only that an
+	// alias now exists. Before resolveAliasEscapes existed,
+	// observeEscapeAssignment set wg.Escapes the moment `p := &wg` was
+	// observed, regardless of whether p was ever used for anything
+	// afterward -- silently discarding a real, otherwise-detected
+	// unjoined-group finding. p here is declared and immediately
+	// discarded; it must not launder wg past LL1003.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	p := &wg
+	_ = p
+	// wg is never waited
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("an unused local alias of a group must not suppress its own unjoined finding, got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_ReassignedAliasDoesNotSuppressEitherGroup(t *testing.T) {
+	// The exact reported shape: `p := &a; p = &b`, with only "b" ever
+	// started and never waited, and p never itself used for anything.
+	// Both assignments independently set p as a pending alias for their
+	// own RHS group ("a" for the first, "b" for the second); since p's
+	// own final state shows no activity at all, neither assignment
+	// discharges its group's obligation. "a" stays silent because it was
+	// genuinely never used for anything (Starts == 0, not because of any
+	// alias reasoning) -- only "b" should fire.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var a, b sync.WaitGroup
+	p := &a
+	p = &b
+	b.Add(1)
+	go func(){}()
+	_ = p
+	// b is never waited
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" || !strings.Contains(diags[0].Message, `"b"`) {
+		t.Fatalf("a group reassigned into an otherwise-unused alias must still fire its own unjoined finding, got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_AliasLaterVerifiedJoinedStaysConservative(t *testing.T) {
+	// The flip side of the two tests above, guarding against
+	// overcorrection: when the alias p *is* later put to genuine use
+	// (here, verified-consumed by a one-hop helper that calls p.Wait()),
+	// resolveAliasEscapes must still mark the original wg as Escapes, not
+	// Joined -- the same conservative "unverified defaults to safe"
+	// answer as before this fix existed. Directly crediting wg with
+	// p's own Joined status would require trusting that p still points to
+	// wg by the time p.Wait() runs, which -- as
+	// TestGroupIdentity_ReassignedAliasDoesNotSuppressEitherGroup's own
+	// reassignment shape demonstrates -- is not something this analysis
+	// verifies. Silence here is the correct, conservative answer, not an
+	// unrelated gap.
+	diags := analyzeSource(t, `package p
+import "sync"
+func foo(g *sync.WaitGroup) { g.Wait() }
+func Start(){
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+	p := &wg
+	foo(p)
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("an alias later verified-joined through a helper should still resolve conservatively (Escapes, not a false positive), got %#v", diags)
+	}
+}
+
+func TestCancelIdentity_ReassignedAliasDoesNotSuppressEitherCancel(t *testing.T) {
+	// The cancel-side analogue: two independently constructed cancel
+	// functions, with the first variable reassigned to hold the second's
+	// value. Before resolveAliasEscapes existed, this reassignment alone
+	// marked cancel2 as Escapes (its value was "assigned into a tracked
+	// binding"), even though cancel1 -- the only place cancel2's value
+	// was assigned to -- is never itself called. Both must now fire.
+	diags := analyzeSource(t, `package p
+import "context"
+func Start(parent context.Context){
+	ctx1, cancel1 := context.WithCancel(parent)
+	_, cancel2 := context.WithCancel(ctx1)
+	cancel1 = cancel2
+	_ = cancel1
+}
+`)
+	if len(diags) != 2 {
+		t.Fatalf("reassigning one cancel binding to hold another's value must not suppress either's lost-cancel finding, got %#v", diags)
+	}
+	for _, d := range diags {
+		if d.RuleID != "LL1001" {
+			t.Fatalf("expected both diagnostics to be LL1001, got %#v", diags)
+		}
+	}
+}
+
 func TestGroupIdentity_TwoIndependentGroupsOneUnjoinedOneClean(t *testing.T) {
 	// item 8: group "a" being correctly joined must not suppress a
 	// finding for group "b".
