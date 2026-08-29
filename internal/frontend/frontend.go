@@ -2002,6 +2002,54 @@ func bodyCallsMethodOn(body ast.Node, obj types.Object, method string, info *typ
 	return found
 }
 
+// deferredCallSet returns the set of call expressions in body (not
+// descending into a nested FuncLit, consistent with
+// collectStopWrapperCalls) that are the direct target of a defer
+// statement. computeGroupOrdering uses this to recognize a cancel
+// binding whose stop signal is only ever sent via defer: internal/cfg
+// records a defer at the defer statement's own lexical position, not at
+// the function's actual return time (see cfg.go's handling of
+// *ast.DeferStmt), which is misleading for an ordering question like
+// stop-before-wait -- a deferred call always actually runs when the
+// enclosing function is about to return, which is unconditionally after
+// any statement, including a Wait() call, that already ran earlier in
+// the same invocation. See allCallsDeferred and computeGroupOrdering's
+// own doc comment for how this is used.
+func deferredCallSet(body *ast.BlockStmt) map[*ast.CallExpr]bool {
+	set := map[*ast.CallExpr]bool{}
+	if body == nil {
+		return set
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if d, ok := n.(*ast.DeferStmt); ok {
+			set[d.Call] = true
+		}
+		return true
+	})
+	return set
+}
+
+// allCallsDeferred reports whether every call in calls is present in
+// deferred -- i.e. every registration of this stop signal is via defer,
+// so the signal never actually fires until the enclosing function is
+// already on its way out. A binding with no call sites at all is not
+// "all deferred" (there is nothing to have proven anything about); see
+// computeGroupOrdering.
+func allCallsDeferred(calls []*ast.CallExpr, deferred map[*ast.CallExpr]bool) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	for _, call := range calls {
+		if !deferred[call] {
+			return false
+		}
+	}
+	return true
+}
+
 // collectStopWrapperCalls finds every call in body (not descending into a
 // nested FuncLit) that resolves to a configured stop_wrapper -- the same
 // recognition internal/cfg's trusted-stop edges use (b.trustedTerminator),
@@ -2094,14 +2142,38 @@ func stopProvenAfterWait(g *model.CFG, waitSites []flowgraph.CallSite, waitBlock
 // worker group than the one being checked when a function manages more
 // than one. That narrower per-group correlation is not attempted here;
 // see docs/limitations.md.
+//
+// A cancel binding whose *every* call site is a deferred one
+// (allCallsDeferred) is handled separately from stopProvenAfterWait's
+// ordinary block/index comparison: since such a signal never actually
+// fires until the enclosing function is already returning, it is
+// unconditionally sent after any Wait() call that already ran earlier in
+// the same invocation, regardless of where internal/cfg happened to
+// record the defer statement's own call site. This is deliberately an
+// all-or-nothing test on the *binding*, not a per-call one: a binding
+// that has at least one non-deferred call site (e.g. `defer cancel()` as
+// a panic/early-return safety net alongside an explicit `cancel()` right
+// before Wait(), as in examples/stop_before_wait) already has a real
+// escape hatch that may independently prove the signal is sent before
+// Wait(), so it is left to the ordinary per-call-site loop below rather
+// than short-circuited here -- folding a defer-only binding into that
+// same loop would make its (misleadingly early) recorded position count
+// as "not proven after," silently defeating the very check this exists
+// to fix. As with the stop-signal candidacy check above, this is decided
+// per binding, not per group; see docs/limitations.md.
 func (b *builder) computeGroupOrdering(groups []*groupState, cancels []*cancelState, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite) {
 	if g == nil || len(groups) == 0 {
 		return
 	}
+	deferredCalls := deferredCallSet(body)
 	var stopSignals []*ast.CallExpr
+	deferOnlyStopSeen := false
 	for _, c := range cancels {
 		if c.binding.Called && c.binding.UsedByChild {
 			stopSignals = append(stopSignals, c.callSites...)
+			if allCallsDeferred(c.callSites, deferredCalls) {
+				deferOnlyStopSeen = true
+			}
 		}
 	}
 	stopSignals = append(stopSignals, b.collectStopWrapperCalls(body)...)
@@ -2121,6 +2193,11 @@ func (b *builder) computeGroupOrdering(groups []*groupState, cancels []*cancelSt
 		gr.group.JoinedOnAllPaths = &onAllPaths
 		if !onAllPaths {
 			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the function's entry to its return bypasses every Wait() call for this group"})
+		}
+		if deferOnlyStopSeen {
+			gr.group.StopAfterWait = true
+			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "the worker stop signal is only ever sent via a deferred call, which does not run until the function is already returning -- after this Wait() call"})
+			continue
 		}
 		for _, stop := range stopSites {
 			if stopProvenAfterWait(g, waitSites, waitBlocks, reachableAvoidingWaits, stop) {

@@ -1080,6 +1080,76 @@ func Start(parent context.Context) {
 	}
 }
 
+func TestWaitGroupDeferOnlyCancelStillFiresStopAfterWait(t *testing.T) {
+	// `defer cancel()` immediately after WithCancel, with no other call to
+	// cancel anywhere, genuinely deadlocks: the deferred call does not run
+	// until Start is already returning, which cannot happen until Wait()
+	// has returned, which cannot happen until the goroutine sees
+	// ctx.Done(), which cannot happen until cancel() runs. internal/cfg
+	// records the defer at its own lexical position (right after
+	// WithCancel, before Add/go/Wait), which is *before* Wait() in both
+	// block and in-block-index terms -- so without special handling for
+	// an all-deferred cancel binding, stopProvenAfterWait's ordinary
+	// same-block index comparison would (wrongly) conclude the stop
+	// signal is proven to arrive before Wait() and never fire LL1005 at
+	// all, missing a deterministic deadlock. See allCallsDeferred and
+	// computeGroupOrdering's own doc comment.
+	diags := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+	}()
+	wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1005" {
+		t.Fatalf("a stop signal only ever sent via a deferred call should fire LL1005, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupDeferCancelAlongsideExplicitStopBeforeWaitDoesNotFire(t *testing.T) {
+	// The idiomatic combination -- `defer cancel()` right after
+	// WithCancel as a panic/early-return safety net, *plus* an explicit
+	// cancel() at the point the caller actually wants to signal shutdown,
+	// guaranteed to run before Wait() -- must not be flagged. This is
+	// examples/stop_before_wait's own shape: the explicit call already
+	// proves the signal is sent before Wait() regardless of the
+	// deferred call's own (misleadingly early) recorded position, so the
+	// all-deferred short-circuit in computeGroupOrdering must not apply
+	// merely because *a* call site for this binding happens to be a
+	// defer -- only when *every* call site is.
+	diags := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+	}()
+	cancel()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a defer-as-safety-net alongside an explicit stop-before-wait call should not fire, got diagnostics = %#v", diags)
+	}
+}
+
 func TestWaitGroupUnrelatedCancelNotCapturedByChildDoesNotFireStopAfterWait(t *testing.T) {
 	// cancel's own context is never captured by the started goroutine
 	// (UsedByChild stays false), so it isn't credited as this group's stop
