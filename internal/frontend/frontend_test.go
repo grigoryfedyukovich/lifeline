@@ -1529,6 +1529,41 @@ func Start(){
 	}
 }
 
+func TestOrderingSemantics_DeferredWaitAtTopIsNotFlagged(t *testing.T) {
+	// A `defer wg.Wait()` placed immediately after the WaitGroup is
+	// declared -- the canonical way to guarantee a join on every return
+	// path, mirroring `defer cancel()` for a cancel function -- must not
+	// be flagged, even though internal/cfg records a defer at the defer
+	// statement's own lexical position rather than at the function's
+	// actual exit (see internal/cfg/cfg.go's handling of *ast.DeferStmt).
+	// That positioning puts this Wait call site in the entry block,
+	// lexically before the later Add()/go; computeGroupOrdering's
+	// ReachableAvoiding(entry, {entry-block}) then returns the empty set
+	// (ReachableAvoiding treats a start block that is itself in the
+	// avoid set as unable to reach anything, per
+	// TestReachableAvoiding_StartInAvoidSetIsEmpty in
+	// internal/model/cfg_algorithms_test.go), so JoinedOnAllPaths comes
+	// out true -- the correct "not flagged" verdict for this snippet, but
+	// for a block-granularity reason that has nothing to do with actually
+	// understanding defer's run-at-return semantics. This test exists so
+	// that a future change to defer's CFG placement, or to
+	// computeGroupOrdering's block-granularity reachability check, can't
+	// silently start flagging this extremely common, correct idiom as a
+	// join-ordering violation. See docs/limitations.md.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	wg.Add(1)
+	go func(){ defer wg.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a deferred wg.Wait() declared immediately after the WaitGroup, with Add/go following it lexically, should not be flagged as join-not-on-all-paths, got %#v", diags)
+	}
+}
+
 func TestOrderingSemantics_ReusedWaitGroupSecondRoundUnverified(t *testing.T) {
 	// item 9, the known gap this documents rather than silently ignores:
 	// reusing one WaitGroup for a second round of work with no matching
