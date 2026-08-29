@@ -810,10 +810,37 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 		}
 		if receiver != g.obj && usesGroup && !b.hasWrapper(b.joinWrappers, name) {
 			// Same Phase 5 verification as cancels above, applied to a
-			// group passed as an argument rather than joined directly.
+			// group passed as an argument rather than joined directly --
+			// but with one deliberate divergence from the cancel case: a
+			// cancel binding has only one further-life question worth
+			// asking ("does something eventually call it"), so Escapes is
+			// the right signal there regardless of *how* consumption was
+			// verified. A group has several more questions Escapes was
+			// silently answering wrong for: count-interval accounting
+			// (CountMismatch, computeGroupBalances) and the ordering
+			// checks (computeGroupOrdering) are each independently
+			// verified from the group's own recorded Add/Done/Wait call
+			// sites and do not depend on *who* calls Wait -- but engine.go
+			// skips a group's diagnostics entirely whenever Escapes is
+			// set, before any of those other checks are even consulted.
+			// Recording a verified helper-mediated join as Escapes (as if
+			// it were an unverified pass-elsewhere, the same as the
+			// cancel case) silently discarded a real, already-computed
+			// CountMismatch finding along with it -- a group passed to a
+			// helper that calls Wait() on it, but started with an Add(n)
+			// no spawned Done() actually matches, was reported clean.
+			// Recording it as Joined instead keeps that finding live: an
+			// outstanding literal imbalance is exactly as real regardless
+			// of whether Wait() is called directly or through a helper.
+			// (JoinedOnAllPaths and StopAfterWait stay unestablished for a
+			// helper-mediated join either way, the same as for a
+			// join_wrapper call: neither has a direct Wait() call site in
+			// *this* function's own CFG to anchor to. That is an existing,
+			// separately documented limitation, not something this
+			// change affects.)
 			if consumed, verified := b.argumentConsumed(call, g.obj); verified {
 				if consumed {
-					g.group.Escapes = true
+					g.group.Joined = true
 					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "passed as an argument; the callee's own body joins or further transfers it", Span: ptrSpan(b.span(call))})
 				} else {
 					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never joins or further transfers it", Span: ptrSpan(b.span(call))})

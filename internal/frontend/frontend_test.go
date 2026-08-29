@@ -419,6 +419,69 @@ func work() {}
 	}
 }
 
+func TestParameterPassing_GroupVerifiedWaitStillCatchesCountMismatch(t *testing.T) {
+	// A verified helper-mediated join (run's own body genuinely calls
+	// Wait() on the parameter) must record Joined, not Escapes: Escapes
+	// makes engine.go skip the group's diagnostics entirely (Starts == 0
+	// || Escapes), which would silently discard a real, independently-
+	// computed CountMismatch finding along with it. Add(2) matched by
+	// only one spawned Done() is a genuine bug -- Wait() may never
+	// return -- regardless of whether Wait() is called directly or
+	// through a resolvable one-hop helper; this must fire exactly the
+	// same as it would if Start called wg.Wait() itself. See
+	// docs/limitations.md's Phase 5 paragraph.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+	}()
+	run(&wg)
+}
+func run(g *sync.WaitGroup) {
+	g.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a count mismatch behind a verified helper-mediated Wait() should still fire LL1003, got diagnostics = %#v", diags)
+	}
+}
+
+func TestParameterPassing_GroupHelperConditionalWaitUnverifiedGap(t *testing.T) {
+	// Known, accepted limitation (docs/limitations.md): computeParameterConsumption's
+	// scratch pass over the callee's body does not run computeGroupOrdering
+	// or computeGroupBalances against it, so it has no way to tell a
+	// Wait() call that is actually reached from one buried inside a
+	// condition that happens to never be true for this particular call
+	// site's own argument. run's own Wait() is gated behind `ok`, and
+	// Start passes a literal false -- Wait() genuinely never executes,
+	// so this group is never joined at all, but is currently reported
+	// clean anyway. If this starts firing, that is a real improvement:
+	// update this test (and docs/limitations.md's Phase 5 paragraph) to
+	// match, do not treat a newly-passing test here as a regression.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+	}()
+	run(&wg, false)
+}
+func run(g *sync.WaitGroup, ok bool) {
+	if ok {
+		g.Wait()
+	}
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("documented known gap: a helper's conditionally-unreached Wait() is not currently verified; if this now fires, update this test and docs/limitations.md to match the improvement, got %#v", diags)
+	}
+}
+
 // TestParameterPassing_CalleeDeclaredFirstStillVerifies is a concrete
 // regression guard for why computeParameterConsumption runs as its own
 // complete pre-pass in Build, rather than being computed lazily on first
