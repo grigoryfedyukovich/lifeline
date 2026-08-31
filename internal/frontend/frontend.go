@@ -1001,6 +1001,65 @@ func groupBindingFor(groups []*groupState, obj types.Object) *groupState {
 // the order bindings happen to appear in cancels/groups; each pass can
 // only ever set Escapes (never clear it), so it is guaranteed to
 // terminate within at most len(cancels)+len(groups) passes.
+//
+// A second, unconditional rule runs alongside the one above, but for
+// *groups only*, never cancels -- an asymmetry that reflects a real
+// difference in what a tracked binding means for each. collectBindings
+// tracks every *sync.WaitGroup/*errgroup.Group-typed local exactly like
+// a directly-declared value -- necessarily so, since that is also the
+// shape of an ordinary function *parameter* receiving a group by
+// pointer, the common case this recognition exists for -- but a local
+// variable of that pointer type that is also, at some point, assigned
+// the address of an *already independently tracked* group in the same
+// function is something else: a plain alias for the exact same
+// underlying value, not a second, independent group. A cancel binding
+// has no equivalent phantom-identity risk: collectBindings only ever
+// creates one by recognizing the specific `x, cancel := factory(...)`
+// constructor-call shape, so every cancelState in cancels represents a
+// genuinely separate construction event, never a bare alias for a
+// pointer type the way a group can be. Consequently, `cancel1 = cancel2`
+// does not "alias cancel1 into cancel2's already-tracked identity" the
+// way `p = &wg` aliases p into wg's -- it overwrites cancel1's own
+// variable, permanently losing whatever cancel function it held before
+// (there is no address-of/pointer involved, so nothing else can reach
+// that original value once this assignment runs), which is exactly the
+// scenario LL1001 exists to catch: cancel1's own "was the function it
+// once held ever called" question stays fully legitimate and answerable
+// as "no, and it now never can be" regardless of what cancel1's name
+// goes on to hold afterward. Applying this second rule to cancels too
+// would have wrongly suppressed exactly that finding -- confirmed by a
+// regression while developing this fix: marking cancel1 Escapes merely
+// because cancel2's value was assigned into it silently dropped
+// cancel1's own genuine lost-cancel finding for a value that no longer
+// has any surviving reference at all. See
+// TestCancelIdentity_ReassignedAliasDoesNotSuppressEitherCancel.
+//
+// Confirmed concretely for the group case this rule does apply to:
+// `var wg sync.WaitGroup; var p *sync.WaitGroup; p = &wg; p.Add(1); go
+// func(){ wg.Done() }(); wg.Wait()` is entirely correct, safe code (wg's
+// counter genuinely goes 0->1->0 and Wait() genuinely unblocks), but
+// before this rule existed it produced a confirmed false positive:
+// LL1003 fired on "p" specifically, because p.Add(1) is attributed to
+// p's own independent binding (Starts=1) while wg.Done() and wg.Wait()
+// are attributed to wg's own, entirely separate binding (which stays
+// silent regardless, since wg.Starts==0 excludes it) -- leaving p
+// accounting for a start with no join ever observed through its own
+// name specifically. Since this project treats a false positive as
+// categorically worse than a false negative throughout, this rule is
+// unconditional rather than activity-gated the way the first rule above
+// is: even a real, active use of the alias is not safe to diagnose on
+// its own once it is known that some *other*, already-tracked group was
+// assigned into it at some point, since the alias's own accounting may
+// reflect calls meant for a different underlying value than whichever
+// one is actually live at any given point (this analysis does not track
+// that, by design -- see docs/limitations.md's "aliasing is shallow"
+// boundary). This intentionally costs coverage on the alias's own name
+// specifically -- it can no longer independently surface a real bug that
+// shows up *only* through calls made via the alias and never through the
+// original's own name -- in exchange for never again reporting one that
+// only exists because of this identity split. A real diagnostic on the
+// *original* binding's own name remains fully available and unaffected
+// by this rule, exactly as it always has been.
 func resolveAliasEscapes(cancels []*cancelState, groups []*groupState) {
 	for changed := true; changed; {
 		changed = false
@@ -1027,6 +1086,11 @@ func resolveAliasEscapes(cancels []*cancelState, groups []*groupState) {
 					break
 				}
 			}
+		}
+	}
+	for _, g := range groups {
+		for _, alias := range g.pendingAliasEscapes {
+			alias.group.Escapes = true
 		}
 	}
 }

@@ -1564,6 +1564,61 @@ func Start(){
 	}
 }
 
+func TestGroupIdentity_AliasedPointerVariableDoesNotFireSpuriousFinding(t *testing.T) {
+	// A *sync.WaitGroup-typed local variable is tracked as its own group
+	// binding purely by type (groupKind), the same as an ordinary
+	// function parameter receiving a group by pointer -- but p here is
+	// not a genuinely separate WaitGroup, just another name for wg's
+	// exact same underlying value. Before the second, unconditional rule
+	// in resolveAliasEscapes existed, this was a confirmed false
+	// positive: wg.Done() and wg.Wait() are attributed to wg's own
+	// binding (which stays silent regardless, since wg.Starts == 0 --
+	// wg.Add() is never called directly, only through p), while
+	// p.Add(1) is attributed to p's own, entirely separate binding,
+	// leaving p accounting for a start with no join ever observed
+	// through its own name -- spurious LL1003 on code that is actually
+	// correct and safe at runtime (wg's counter genuinely goes
+	// 0 -> 1 -> 0, and Wait() genuinely unblocks).
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	var p *sync.WaitGroup
+	p = &wg
+	p.Add(1)
+	go func(){ wg.Done() }()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a pointer variable that is merely an alias for an already-tracked group must not independently fire, got %#v", diags)
+	}
+}
+
+func TestGroupIdentity_AliasedPointerVariableUsedConsistentlyDoesNotFire(t *testing.T) {
+	// The same aliased pointer variable, but with every call (Add,
+	// Done, Wait) consistently made through p rather than split across
+	// p and wg. This was already silent before the fix (p's own
+	// accounting is internally balanced and joined), and must remain
+	// silent after it -- the unconditional alias-suppression rule
+	// applies regardless, since p is still a recorded alias target for
+	// wg, but the outcome here (silence) does not change.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(){
+	var wg sync.WaitGroup
+	var p *sync.WaitGroup
+	p = &wg
+	p.Add(1)
+	go func(){ p.Done() }()
+	p.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a consistently-used pointer alias should stay silent, got %#v", diags)
+	}
+}
+
 func TestCancelIdentity_ReassignedAliasDoesNotSuppressEitherCancel(t *testing.T) {
 	// The cancel-side analogue: two independently constructed cancel
 	// functions, with the first variable reassigned to hold the second's
