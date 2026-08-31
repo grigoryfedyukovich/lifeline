@@ -1058,6 +1058,120 @@ func Start(items []int){
 	}
 }
 
+func TestWaitGroupLoopConditionalArmSplitIsNotFullyKnownNotFalselyBalanced(t *testing.T) {
+	// Add(1) in one arm of an if/else and the matching spawned Done() in
+	// the *other*, mutually exclusive arm, both directly inside a loop
+	// body: on any one iteration, exactly one of the two branches runs,
+	// so this can never actually self-balance within a single iteration
+	// the way the ordinary `wg.Add(1); go worker()` loop idiom does (see
+	// TestWaitGroupLoopPairedIdiomBalancesRegardlessOfIterationCount) --
+	// whether the running totals happen to even out across iterations
+	// depends on how many times cond() returns true vs false, which this
+	// analysis does not, and should not, try to track. The if/else is
+	// walked through foldConditionalArms before either loopScope counter
+	// is ever touched: since the "if" arm's own delta (Add, no Done) is
+	// nonzero, foldConditionalArms marks the loop's own scope
+	// otherActivity rather than folding anything into addOnes/
+	// spawnedDones, which in turn makes the whole loop (and so the whole
+	// function's WaitGroup accounting) not fully known -- silent for the
+	// correct reason (genuine uncertainty), not because the mismatched
+	// per-branch counts were mistaken for a balanced total.
+	diags := analyzeSource(t, `package p
+import "sync"
+func cond() bool { return false }
+func Start(){
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		if cond() {
+			wg.Add(1)
+		} else {
+			go func(){ defer wg.Done() }()
+		}
+	}
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a loop-scoped conditional split between Add and its spawned Done must stay silent (not fully known), got %#v", diags)
+	}
+}
+
+func TestWaitGroupSwitchFallthroughMismatchIsNotFullyKnownNotFalselyBalanced(t *testing.T) {
+	// case 1 falls through into case 2, so an x == 1 run actually calls
+	// Add twice (once from each case's own body) against a single
+	// unconditional spawned Done after the switch -- but walkCaseClauses
+	// computes each case's own groupBalance in isolation, with no
+	// awareness that a preceding case's fallthrough would also run this
+	// one's statements on that path. This does not, however, make the
+	// switch's own per-case check unsound: foldConditionalArms requires
+	// *every* one of a switch's arms (case 1's own body alone: Add(1),
+	// no Done; case 2's own body alone: Add(1), no Done; the implicit
+	// "no case matches" arm) to *each independently* net to zero before
+	// treating the whole switch as balanced -- and here neither case 1
+	// nor case 2 does on its own, so the switch correctly falls back to
+	// not fully known, the same as it would for any other switch whose
+	// cases don't individually balance, fallthrough or not. See
+	// TestWaitGroupSwitchFallthroughBothArmsSelfBalancedIsRecognizedSafe
+	// for why this same isolated-arm check is also sound in the other
+	// direction: it never mistakes a genuinely mismatched fallthrough
+	// chain for a balanced one, either.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(x int){
+	var wg sync.WaitGroup
+	switch x {
+	case 1:
+		wg.Add(1)
+		fallthrough
+	case 2:
+		wg.Add(1)
+	}
+	go func(){ defer wg.Done() }()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a switch fallthrough with a per-case Add/Done mismatch must stay silent (not fully known), got %#v", diags)
+	}
+}
+
+func TestWaitGroupSwitchFallthroughBothArmsSelfBalancedIsRecognizedSafe(t *testing.T) {
+	// Each case here is independently self-balanced (its own Add(1)
+	// matched by its own spawned Done()), so whichever one actually runs
+	// -- and, via fallthrough, both together on the x == 1 path -- nets
+	// to zero either way: two independently-balanced pairs summed is
+	// still balanced. walkCaseClauses/foldConditionalArms's fallthrough-
+	// blind, "every arm independently nets to zero" check recognizes
+	// this correctly without needing to know fallthrough chains them:
+	// mathematically, summing any number of already-balanced (Add ==
+	// Done) arms can never produce an imbalance, so requiring every
+	// individual arm to balance is already sufficient to make the whole
+	// switch's contribution to the running total exactly zero. No
+	// Wait() call exists in this test on purpose, to isolate the balance
+	// question from the separate "was it joined" question: LL1003
+	// should still fire for being entirely unjoined (2 worker starts,
+	// nothing waits for them), but must not additionally claim a count
+	// mismatch, since there provably isn't one.
+	diags := analyzeSource(t, `package p
+import "sync"
+func Start(x int){
+	var wg sync.WaitGroup
+	switch x {
+	case 1:
+		wg.Add(1)
+		go func(){ defer wg.Done() }()
+		fallthrough
+	case 2:
+		wg.Add(1)
+		go func(){ defer wg.Done() }()
+	}
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" || !strings.Contains(diags[0].Message, "no Wait or ownership transfer is observed") || strings.Contains(diags[0].Message, "outstanding worker") {
+		t.Fatalf("a fallthrough chain of individually-self-balanced cases must not be reported as a count mismatch (only as unjoined), got %#v", diags)
+	}
+}
+
 func TestWaitGroupJoinedOnSomeButNotAllPathsFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "sync"
