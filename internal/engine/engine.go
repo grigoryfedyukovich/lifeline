@@ -159,6 +159,37 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 				default: // group.CountMismatch
 					suggestion = "check every Add call is matched by exactly one Done, including on early-return paths"
 				}
+				// The three cases above are meant to say which one of three
+				// independently-verified questions failed (see the big
+				// comment on the outer loop above), but they were only ever
+				// checked as an exclusive switch: whichever case matched
+				// first won, silently dropping any of the other two that
+				// also happened to be true for the same group. !Joined and
+				// !joinedOnAllPaths can never both be true together
+				// (joinedOnAllPaths defaults to true whenever Joined is
+				// false, so there is nothing to drop between those two),
+				// but CountMismatch is computed entirely independently of
+				// both -- literal Add/Done interval accounting, unrelated
+				// to whether a Wait call was ever seen or which paths reach
+				// it -- so a group can easily be genuinely unjoined (or
+				// joined on only some paths) *and* have a real, separately
+				// verified Add/Done imbalance underneath that. Evidence
+				// already carries both regardless (computeGroupBalances
+				// appends its own "count-mismatch" entry unconditionally),
+				// but the message/suggestion text a person actually reads
+				// first previously mentioned only whichever came first in
+				// the switch above. Confirmed concretely: `wg.Add(2); go
+				// worker; if cond { return }; wg.Wait()` reported only "is
+				// joined on some but not every path", with a suggestion to
+				// add a defer -- which would fix that path issue but leave
+				// the real, separately-verified Add/Done imbalance
+				// completely unmentioned in the actionable text, to be
+				// discovered only on a second run after the first fix, if
+				// at all.
+				if group.CountMismatch && (!group.Joined || !joinedOnAllPaths) {
+					msg += "; independently, literal Add/Done accounting also shows an outstanding worker"
+					suggestion += "; also check every Add call is matched by exactly one Done, including on early-return paths"
+				}
 				if group.Kind == "errgroup" {
 					rule, protocol = "LL1004", "errgroup-join"
 					if !group.Joined {
