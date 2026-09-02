@@ -170,6 +170,63 @@ func Start(){ var g errgroup.Group; g.Go(func() error { return nil }) }
 	}
 }
 
+func TestErrgroupDiagnosticNeverUsesWaitGroupAddDoneWording(t *testing.T) {
+	// engine.go rewrites LL1003/LL1004's message/suggestion text for
+	// errgroup only in the !group.Joined case; the !joinedOnAllPaths
+	// case is already kind-agnostic (no Add/Done wording to begin with),
+	// and the CountMismatch case's wording ("literal Add/Done
+	// accounting...") is WaitGroup-specific and was never rewritten for
+	// errgroup. That default branch is unreachable for an errgroup as
+	// things stand today: computeGroupBalances explicitly skips any
+	// group whose Kind isn't "waitgroup" (g.group.Kind != "waitgroup" ||
+	// g.obj == nil { continue }), with its own comment explaining why
+	// ("errgroup.Group's Add/Done-equivalent accounting is internal to
+	// the library"), so CountMismatch can never be true for one -- this
+	// test pins that invariant from the diagnostic-message side, so
+	// that if computeGroupBalances' errgroup skip is ever relaxed in the
+	// future (teaching it to recognize Go() the way it recognizes Add()),
+	// a contributor is forced to notice and update this wording at the
+	// same time rather than silently shipping a WaitGroup-flavored
+	// message on an errgroup finding.
+	diags := analyzeErrgroupSource(t, `package p
+import "golang.org/x/sync/errgroup"
+func Start(){ var g errgroup.Group; g.Go(func() error { return nil }) }
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1004" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	if strings.Contains(diags[0].Message, "Add") || strings.Contains(diags[0].Message, "Done") {
+		t.Fatalf("errgroup diagnostic message must never reference WaitGroup's Add/Done, got %q", diags[0].Message)
+	}
+	if strings.Contains(diags[0].Suggestion, "Add") || strings.Contains(diags[0].Suggestion, "Done") {
+		t.Fatalf("errgroup diagnostic suggestion must never reference WaitGroup's Add/Done, got %q", diags[0].Suggestion)
+	}
+}
+
+func analyzeErrgroupSource(t *testing.T, source string) []engine.Diagnostic {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	imp := &fixtureImporter{fallback: importer.Default(), errgroup: makeErrgroupPackage()}
+	pkg, err := (&types.Config{Importer: imp}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine.Analyze(program, cfg)
+}
+
 type fixtureImporter struct {
 	fallback types.Importer
 	errgroup *types.Package
