@@ -2398,6 +2398,21 @@ func stopProvenAfterWait(g *model.CFG, waitSites []flowgraph.CallSite, waitBlock
 // as "not proven after," silently defeating the very check this exists
 // to fix. As with the stop-signal candidacy check above, this is decided
 // per binding, not per group; see docs/limitations.md.
+//
+// The identical all-or-nothing test also applies to configured
+// stop_wrapper calls (collectStopWrapperCalls), treated as one flat
+// group the same way the rest of this function already treats them
+// (undifferentiated by which specific wrapper function produced each
+// call, matching the existing per-group correlation limitation noted
+// above): a stop_wrapper is exactly as capable of being called only via
+// `defer stopFn()` as a cancel function is, and internal/cfg's defer
+// mispositioning is not specific to context.CancelFunc values -- it
+// applies to any deferred call. This was originally missed when the
+// cancel-binding case above was fixed: confirmed concretely,
+// `defer Shutdown()` (Shutdown configured as a stop_wrapper) at the top
+// of a function, with no other call to it, deadlocks exactly like the
+// equivalent `defer cancel()` case, for the identical reason, but was
+// not caught until this was specifically checked for.
 func (b *builder) computeGroupOrdering(groups []*groupState, cancels []*cancelState, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite) {
 	if g == nil || len(groups) == 0 {
 		return
@@ -2413,7 +2428,11 @@ func (b *builder) computeGroupOrdering(groups []*groupState, cancels []*cancelSt
 			}
 		}
 	}
-	stopSignals = append(stopSignals, b.collectStopWrapperCalls(body)...)
+	stopWrapperCalls := b.collectStopWrapperCalls(body)
+	stopSignals = append(stopSignals, stopWrapperCalls...)
+	if allCallsDeferred(stopWrapperCalls, deferredCalls) {
+		deferOnlyStopSeen = true
+	}
 	stopSites := callSitesOf(stopSignals, callSites)
 
 	for _, gr := range groups {

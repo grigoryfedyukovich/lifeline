@@ -1384,6 +1384,92 @@ func Start(parent context.Context) {
 	}
 }
 
+func analyzeSourceWithStopWrapper(t *testing.T, source string, stopWrapper string) []engine.Diagnostic {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StopWrappers = []string{stopWrapper}
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine.Analyze(program, cfg)
+}
+
+func TestWaitGroupDeferOnlyStopWrapperStillFiresStopAfterWait(t *testing.T) {
+	// The exact same defer-mispositioning bug as
+	// TestWaitGroupDeferOnlyCancelStillFiresStopAfterWait, but for a
+	// configured stop_wrapper instead of a cancel function:
+	// internal/cfg's defer mispositioning is not specific to
+	// context.CancelFunc values, and this case was originally missed
+	// when the cancel-binding fix above was made. `defer shutdown()`
+	// (shutdown configured as a stop_wrapper) at the top of the
+	// function, with no other call to it, deadlocks exactly like the
+	// equivalent defer-cancel case: the deferred call cannot run until
+	// Start is already returning, which cannot happen until Wait() has
+	// returned, which cannot happen until the worker sees the signal
+	// shutdown() was meant to send.
+	diags := analyzeSourceWithStopWrapper(t, `package p
+import "sync"
+func shutdown() {}
+func waitForShutdown() {}
+func Start() {
+	defer shutdown()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		waitForShutdown()
+	}()
+	wg.Wait()
+}
+`, "example.test/input.shutdown")
+	if len(diags) != 1 || diags[0].RuleID != "LL1005" {
+		t.Fatalf("a stop_wrapper only ever called via defer should fire LL1005, got diagnostics = %#v", diags)
+	}
+}
+
+func TestWaitGroupDeferStopWrapperAlongsideExplicitStopBeforeWaitDoesNotFire(t *testing.T) {
+	// The stop_wrapper analogue of
+	// TestWaitGroupDeferCancelAlongsideExplicitStopBeforeWaitDoesNotFire:
+	// `defer shutdown()` as a panic/early-return safety net, plus an
+	// explicit shutdown() call guaranteed to run before Wait(), must not
+	// be flagged -- the explicit call's own correctly-recorded position
+	// already proves the signal is sent in time, regardless of the
+	// deferred call's misleading one.
+	diags := analyzeSourceWithStopWrapper(t, `package p
+import "sync"
+func shutdown() {}
+func waitForShutdown() {}
+func Start() {
+	defer shutdown()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		waitForShutdown()
+	}()
+	shutdown()
+	wg.Wait()
+}
+`, "example.test/input.shutdown")
+	if len(diags) != 0 {
+		t.Fatalf("a defer-as-safety-net alongside an explicit stop_wrapper call before Wait() should not fire, got diagnostics = %#v", diags)
+	}
+}
+
 func TestWaitGroupUnrelatedCancelNotCapturedByChildDoesNotFireStopAfterWait(t *testing.T) {
 	// cancel's own context is never captured by the started goroutine
 	// (UsedByChild stays false), so it isn't credited as this group's stop
