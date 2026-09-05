@@ -565,16 +565,17 @@ func Start(parent context.Context) {
 	}
 }
 
-// The following two tests document the exact, honest boundary of chained
-// (multi-hop) verification: computeParameterConsumption's pre-pass runs
-// once, in source declaration order, not call-graph order, so a chain is
-// only verified as far as a deeper callee's result happens to already be
-// computed by the time an earlier caller needs it. This is never a false
-// positive either way -- the fallback for an unverified check is always
-// "assume transferred" -- but it does mean multi-hop detection currently
-// depends on how the source happens to be organized. See docs/limitations.md
-// and docs/roadmap.md for the call-graph-ordered pre-pass that would make
-// this reliable regardless of declaration order.
+// The following tests cover chained (multi-hop) verification, now that
+// computeParameterConsumption runs to an interprocedural fixed point
+// (docs/cfg-migration-plan.md, Phase 5's interprocedural extension)
+// instead of a single declaration-order pass: Build keeps re-running it
+// for every function until a full sweep changes nothing, so a chain
+// resolves to the same answer regardless of which order its functions
+// happen to be declared in. Both declaration orders below cover the same
+// 3-hop leak/non-leak pair a single pass could only catch in one of the
+// two orders (see git history for the previous, order-dependent
+// behavior); a resolvable same-package chain is no longer a source of
+// declaration-order-dependent results.
 
 func TestParameterPassing_ChainedLeakCaughtWhenCalleesDeclaredFirst(t *testing.T) {
 	diags := analyzeSource(t, `package p
@@ -594,7 +595,14 @@ func Start(parent context.Context) {
 	}
 }
 
-func TestParameterPassing_ChainedLeakMissedWhenCallerDeclaredFirst(t *testing.T) {
+// TestParameterPassing_ChainedLeakCaughtWhenCallerDeclaredFirst is the
+// same 3-hop leak as the test above, with the declaration order reversed
+// (caller first, leaf last -- the more common style, and the order that
+// used to be the "honest gap" before the fixed point). It must now also
+// fire: the whole point of iterating computeParameterConsumption to a
+// fixed point, rather than running it once, is that this order no longer
+// changes the answer.
+func TestParameterPassing_ChainedLeakCaughtWhenCallerDeclaredFirst(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
 func Start(parent context.Context) {
@@ -607,15 +615,105 @@ func hop2(c context.CancelFunc) { hop3(c) }
 func hop3(c context.CancelFunc) { _ = c }
 func work(context.Context) {}
 `)
-	// This is the honest, current gap, not a desired outcome: the same
-	// 3-hop leak as the test above is missed here, purely because of
-	// declaration order, and safely falls back rather than ever producing
-	// a false positive. If this test starts failing because diagnostics
-	// now correctly catches this case, that's a genuine improvement --
-	// update this test (and docs/limitations.md's chaining paragraph)
-	// to match, don't just delete the inconvenient assertion.
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("3-hop leak with caller-first declaration order should now also be caught, got diagnostics = %#v", diags)
+	}
+}
+
+// TestParameterPassing_ChainedConsumptionCaughtRegardlessOfOrder mirrors
+// the leak tests above with the non-leaking case (the leaf hop actually
+// calls the cancel function) in both declaration orders, confirming the
+// fixed point doesn't just flip every chain to "leak" -- it converges to
+// the correct answer either way.
+func TestParameterPassing_ChainedConsumptionCaughtRegardlessOfOrder(t *testing.T) {
+	calleesFirst := analyzeSource(t, `package p
+import "context"
+func hop3(c context.CancelFunc) { c() }
+func hop2(c context.CancelFunc) { hop3(c) }
+func hop1(c context.CancelFunc) { hop2(c) }
+func work(context.Context) {}
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	hop1(cancel)
+	go work(ctx)
+}
+`)
+	if len(calleesFirst) != 0 {
+		t.Fatalf("3-hop consumption with leaf-first declaration order should not fire, got diagnostics = %#v", calleesFirst)
+	}
+	callerFirst := analyzeSource(t, `package p
+import "context"
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	hop1(cancel)
+	go work(ctx)
+}
+func hop1(c context.CancelFunc) { hop2(c) }
+func hop2(c context.CancelFunc) { hop3(c) }
+func hop3(c context.CancelFunc) { c() }
+func work(context.Context) {}
+`)
+	if len(callerFirst) != 0 {
+		t.Fatalf("3-hop consumption with caller-first declaration order should not fire, got diagnostics = %#v", callerFirst)
+	}
+}
+
+// TestParameterPassing_MutualRecursionConverges is a cycle in the
+// dependency graph the fixed point must still terminate on and resolve
+// correctly: two functions that only ever pass the cancel function to
+// each other, never calling or otherwise consuming it, is a genuine leak
+// (the least fixed point -- "not consumed unless proven otherwise" --
+// is the correct, safe answer for a cycle with no base-case evidence
+// either way), not a hang and not a false negative from the cycle itself.
+func TestParameterPassing_MutualRecursionConverges(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func work(context.Context) {}
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	ping(cancel, 0)
+	go work(ctx)
+}
+func ping(c context.CancelFunc, n int) {
+	if n < 10 {
+		pong(c, n+1)
+	}
+}
+func pong(c context.CancelFunc, n int) {
+	if n < 10 {
+		ping(c, n+1)
+	}
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("mutual recursion with no consumption anywhere should fire LL1001, got diagnostics = %#v", diags)
+	}
+}
+
+// TestParameterPassing_SelfRecursionWithConsumptionConverges is the same
+// cycle shape as above, but with a base case that actually calls the
+// cancel function, confirming the fixed point still finds real
+// consumption through a self-recursive call rather than only through
+// calls to other functions.
+func TestParameterPassing_SelfRecursionWithConsumptionConverges(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func work(context.Context) {}
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	countdown(cancel, 3)
+	go work(ctx)
+}
+func countdown(c context.CancelFunc, n int) {
+	if n <= 0 {
+		c()
+		return
+	}
+	countdown(c, n-1)
+}
+`)
 	if len(diags) != 0 {
-		t.Fatalf("expected the current honest gap (caller-first order misses the chain), got diagnostics = %#v", diags)
+		t.Fatalf("self-recursion that eventually consumes the cancel function should not fire, got diagnostics = %#v", diags)
 	}
 }
 
