@@ -46,6 +46,14 @@ type FunctionFact struct {
 	// loop). The prior booleans are kept for informational/JSON value and
 	// as a fallback for a fact whose Version predates this field.
 	LoopUnresolved bool
+	// ParamConsumption is model.Function.ParamConsumption, unchanged: by
+	// parameter position, whether this function's own body consumes a
+	// cancel-like/group-like parameter there, or (for its one trailing
+	// variadic parameter, when cancel-like-elemented) whether every
+	// element is demonstrably called. This is what lets argumentConsumed
+	// verify a cross-package callee via Input.LookupParamConsumption,
+	// the direct-parameter-passing counterpart of LoopUnresolved above.
+	ParamConsumption map[int]bool
 }
 
 func (*FunctionFact) AFact() {}
@@ -110,10 +118,22 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 			ImportedUnresolvedLoop: &loopUnresolved,
 		}, true
 	}
+	lookupParam := func(fn *types.Func, index int) (consumed, ok bool) {
+		if pass.ImportObjectFact == nil || fn == nil {
+			return false, false
+		}
+		var fact FunctionFact
+		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
+			return false, false
+		}
+		consumed, ok = fact.ParamConsumption[index]
+		return consumed, ok
+	}
 	cwd, _ := os.Getwd()
 	program, err := frontend.Build(frontend.Input{
 		Fset: pass.Fset, Files: frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd), Pkg: pass.Pkg, Info: pass.TypesInfo,
-		LookupFunctionSummary: lookup,
+		LookupFunctionSummary:   lookup,
+		LookupParamConsumption: lookupParam,
 	}, cfg)
 	if err != nil {
 		return nil, err
@@ -154,9 +174,9 @@ func exportFunctionFacts(pass *analysis.Pass, program model.Program) {
 	if pass.ExportObjectFact == nil {
 		return
 	}
-	byName := make(map[string]model.Goroutine, len(program.Functions))
+	byName := make(map[string]model.Function, len(program.Functions))
 	for _, fn := range program.Functions {
-		byName[fn.Name] = fn.BodyLifecycle
+		byName[fn.Name] = fn
 	}
 	for _, file := range pass.Files {
 		for _, decl := range file.Decls {
@@ -168,14 +188,16 @@ func exportFunctionFacts(pass *analysis.Pass, program model.Program) {
 			if obj == nil {
 				continue
 			}
-			summary, ok := byName[obj.FullName()]
+			fn, ok := byName[obj.FullName()]
 			if !ok { // function excluded by max_functions
 				continue
 			}
+			summary := fn.BodyLifecycle
 			pass.ExportObjectFact(obj, &FunctionFact{
 				Version: version.FactVersion, InfiniteLoop: summary.InfiniteLoop, HasReturn: summary.HasReturn,
 				ContextStop: summary.ContextStop, ChannelStop: summary.ChannelStop, ExplicitStop: summary.ExplicitStop,
-				LoopUnresolved: engine.UnresolvedLoop(summary.CFG),
+				LoopUnresolved:   engine.UnresolvedLoop(summary.CFG),
+				ParamConsumption: fn.ParamConsumption,
 			})
 		}
 	}

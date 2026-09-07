@@ -29,6 +29,20 @@ type Input struct {
 	// The go/analysis adapter backs this with versioned object facts. Standalone
 	// mode leaves it nil and reports such targets as unsupported.
 	LookupFunctionSummary func(*types.Func) (model.Goroutine, bool)
+
+	// LookupParamConsumption is LookupFunctionSummary's counterpart for
+	// argumentConsumed's question -- "does fn's own body consume the
+	// parameter at this position" -- for a callee whose source lies
+	// outside the current package, backed the same way by a versioned
+	// object fact (FunctionFact.ParamConsumption). A same-package callee
+	// never uses this: b.paramConsumption already answers it directly,
+	// with the added benefit of the interprocedural fixed point (a fact
+	// is a one-shot snapshot from whenever the callee's own package was
+	// last analyzed, not something this build's own sweep can improve on
+	// by trying again). Standalone mode leaves this nil, same as
+	// LookupFunctionSummary, and argumentConsumed falls back to "assume
+	// transferred" exactly as it does for any other unresolvable callee.
+	LookupParamConsumption func(fn *types.Func, paramIndex int) (consumed, ok bool)
 }
 
 type funcSource struct {
@@ -71,6 +85,18 @@ type builder struct {
 	// sweep happened to see, reintroducing the exact declaration-order
 	// dependence the fixed point exists to remove.
 	inParamPrepass bool
+	// singleAssignTargets records, for the function body currently being
+	// walked by observeFunctionBody, every local variable or parameter
+	// assigned exactly once in that body, mapped to that one assignment's
+	// right-hand side expression -- see singleAssignmentTargets for why
+	// "exactly once" is what makes this sound. Set fresh at the top of
+	// every observeFunctionBody call (both buildFunction's main pass and
+	// computeParameterConsumption's scratch pre-pass; observeFunctionBody
+	// is never called recursively for a nested function literal, so
+	// there is no reentrancy to guard against here the way
+	// inParamPrepass needs to). argumentConsumed's resolveCalleeFunc and
+	// compositeLitOf are the only two readers.
+	singleAssignTargets map[types.Object]ast.Expr
 	// returnFieldInfo records, for a cancel/group binding's own local
 	// identifier object (a cancelState.cancelObj or groupState.obj), the
 	// single narrow shape this file tracks for "constructor-returned
@@ -389,6 +415,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		name = source.obj.FullName()
 	}
 	fn := model.Function{Name: name, Span: b.span(fd)}
+	fn.ParamConsumption = b.exportedParamConsumption(fd)
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	states, groups := b.collectBindings(fd, contexts)
@@ -605,6 +632,7 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 }
 
 func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Object]string, cancels []*cancelState, groups []*groupState, fn *model.Function, fnObj *types.Func) {
+	b.singleAssignTargets = singleAssignmentTargets(body, b.in.Info)
 	// Field/constructor ownership tracking (docs/roadmap.md item 3): find
 	// every "stored struct" or "constructor" field-capture shape in body
 	// up front, before the main traversal below runs, so the generic
@@ -614,6 +642,17 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 	// instead settled by resolveFieldCaptures at the end of this
 	// function, once the whole body has been seen.
 	captures, claimed := b.collectFieldCaptures(body, cancels, groups)
+	// Same reasoning, for the same reason, for the direct-parameter-
+	// passing spread case (argumentIndexOf/compositeLitOf): a cancel
+	// placed in a composite literal that is itself spread into some
+	// call's variadic argument is also, unavoidably, "stored in a
+	// composite literal" as far as observeContainerEscape's generic walk
+	// is concerned, and would otherwise be marked transferred before
+	// observeCall's own, more precise argumentConsumed check ever gets a
+	// say -- this claim just defers to that more precise check once the
+	// call node is actually visited, below; it does not decide the
+	// verdict itself.
+	collectSpreadClaims(body, cancels, b.in.Info, b.singleAssignTargets, claimed)
 	// The same traversal observes lifecycle uses and goroutine start sites. A
 	// small depth stack keeps the enclosing function's own termination summary
 	// from inheriting loops or exits from nested function literals.
@@ -665,6 +704,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		return true
 	})
 	b.resolveFieldCaptures(fnObj, body, captures)
+	b.singleAssignTargets = nil
 }
 
 // computeParameterConsumption (re)computes, for every cancel-like or
@@ -723,8 +763,42 @@ func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) (reportChanged b
 			}
 		}
 	}
-	if len(paramCancels) == 0 && len(paramGroups) == 0 {
+	// variadicCancelParam is the one remaining shape this checks: a
+	// trailing `...context.CancelFunc`-like parameter, whose element type
+	// -- not the parameter itself -- is cancel-like. This is what a `...`
+	// spread call ultimately lands on (see argumentIndexOf and
+	// compositeLitOf): `dropAll([]context.CancelFunc{cancel}...)` calling
+	// `func dropAll(cancels ...context.CancelFunc)`. Its own Called/
+	// Escapes machinery doesn't apply -- there's no single scalar value
+	// to track -- so this is checked separately, below, via
+	// variadicCancelElementCalled. Deliberately scoped to only the actual
+	// trailing variadic parameter (never a same-shaped plain, non-`...`
+	// slice parameter elsewhere in the list): a `...` spread can only
+	// ever target that one position, so tracking any other slice-typed
+	// parameter here would answer a question argumentIndexOf never asks.
+	var variadicCancelParam types.Object
+	if params := fd.Type.Params.List; len(params) > 0 {
+		last := params[len(params)-1]
+		if _, ok := last.Type.(*ast.Ellipsis); ok && len(last.Names) > 0 {
+			name := last.Names[len(last.Names)-1]
+			if obj := b.in.Info.ObjectOf(name); obj != nil && name.Name != "_" {
+				if slice, ok := obj.Type().(*types.Slice); ok && isCancelFuncType(slice.Elem()) {
+					variadicCancelParam = obj
+				}
+			}
+		}
+	}
+	if len(paramCancels) == 0 && len(paramGroups) == 0 && variadicCancelParam == nil {
 		return false
+	}
+	if variadicCancelParam != nil {
+		next := variadicCancelElementCalled(fd.Body, variadicCancelParam, b.in.Info)
+		if b.recordParamConsumption(variadicCancelParam, next) {
+			reportChanged = true
+		}
+	}
+	if len(paramCancels) == 0 && len(paramGroups) == 0 {
+		return reportChanged
 	}
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
@@ -769,10 +843,15 @@ func (b *builder) recordParamConsumption(obj types.Object, next bool) bool {
 }
 
 // argumentConsumed reports whether obj, passed directly as call's argument
-// at some position, is consumed by the callee's own body: a pure
-// model.Function lookup into b.paramConsumption, populated by
-// computeParameterConsumption's fixed-point loop. This never triggers a
-// fresh analysis (unlike, say, functionSummary's on-demand fallback),
+// at some position -- a direct argument, or one element of a `...`-spread
+// composite literal (see argumentIndexOf) -- is consumed by the callee's
+// own body: for a same-package callee, a pure lookup into
+// b.paramConsumption, populated by computeParameterConsumption's
+// fixed-point loop; for a callee outside the current package, a
+// versioned fact via Input.LookupParamConsumption, the same way
+// Input.LookupFunctionSummary already answers the equivalent question for
+// goroutine targets. This never triggers a fresh analysis of the
+// callee's body (unlike, say, functionSummary's on-demand fallback),
 // which is what keeps it safe from recursion regardless of how functions
 // call each other: a lookup miss just means verified is false, not that
 // anything gets computed here.
@@ -781,14 +860,16 @@ func (b *builder) recordParamConsumption(obj types.Object, next bool) bool {
 // apart:
 //
 //   - pending == false: the check can never be made with confidence for
-//     this call, no matter how many times it's retried -- the callee isn't
-//     a statically resolvable same-package function, the call uses `...`
-//     spread (whose positional argument-to-parameter mapping this does not
-//     attempt), or obj isn't found as a direct argument expression (only
-//     the direct case is handled, not a nested sub-expression). Callers
-//     should fall back to the prior unconditional "assume the obligation
-//     was transferred" behavior here, never assume a leak from an
-//     inability to check.
+//     this call, no matter how many times it's retried -- the callee
+//     can't be resolved at all (see resolveCalleeFunc: not a statically
+//     named function, nor a local variable/parameter provably assigned
+//     to one exactly once), or obj isn't found at a resolvable argument
+//     position (see argumentIndexOf: not a direct argument expression,
+//     and not an element of a directly- or once-assigned composite
+//     literal spread into a matching variadic parameter). Callers should
+//     fall back to the prior unconditional "assume the obligation was
+//     transferred" behavior here, never assume a leak from an inability
+//     to check.
 //   - pending == true: the callee is a real, resolvable same-package
 //     function and its parameter was identified, but computeParameterConsumption
 //     hasn't recorded a result for that parameter yet -- either this
@@ -801,35 +882,344 @@ func (b *builder) recordParamConsumption(obj types.Object, next bool) bool {
 //     just reproduce the old single-pass, declaration-order-dependent
 //     result. Once the fixed point has finished, a lingering pending case
 //     can only be the truncation scenario, and should fall back the same
-//     as the never-resolvable case.
+//     as the never-resolvable case. A cross-package callee is never
+//     pending: a fact is either present (verified) or absent (falls
+//     back) on the spot -- there is no sweep to wait for, since this
+//     build has no way to ever compute that package's own result itself.
 func (b *builder) argumentConsumed(call *ast.CallExpr, obj types.Object) (consumed, verified, pending bool) {
-	if call.Ellipsis.IsValid() {
+	funcObj := b.resolveCalleeFunc(call.Fun)
+	if funcObj == nil {
 		return false, false, false
 	}
-	funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
-	if !ok {
-		return false, false, false
-	}
-	decl := b.funcs[funcObj]
-	if decl == nil {
-		return false, false, false
-	}
-	index := -1
-	for i, arg := range call.Args {
-		if identObject(arg, b.in.Info) == obj {
-			index = i
-			break
-		}
-	}
+	index := argumentIndexOf(call, obj, funcObj, b.in.Info, b.singleAssignTargets)
 	if index == -1 {
 		return false, false, false
 	}
-	paramObj := paramObjectAtIndex(b.in.Info, decl, index)
-	if paramObj == nil {
-		return false, false, false
+	if decl := b.funcs[funcObj]; decl != nil {
+		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
+		if paramObj == nil {
+			return false, false, false
+		}
+		paramConsumed, known := b.paramConsumption[paramObj]
+		return paramConsumed, known, !known
 	}
-	consumed, ok = b.paramConsumption[paramObj]
-	return consumed, ok, !ok
+	if b.in.LookupParamConsumption != nil {
+		if paramConsumed, known := b.in.LookupParamConsumption(funcObj, index); known {
+			return paramConsumed, true, false
+		}
+	}
+	return false, false, false
+}
+
+// resolveCalleeFunc resolves call's callee to a *types.Func for
+// argumentConsumed's purposes: first via the ordinary calledObject
+// resolution (a directly, statically named function or method), then,
+// only if that fails, via singleAssignTargets' narrow single-assignment
+// local/parameter resolution -- `var f func(context.CancelFunc) = drop`
+// (or the equivalent `:=` or plain `=` form), never reassigned anywhere
+// else in the function, called later as `f(cancel)`. This is
+// deliberately scoped to this one check: it does not change how a direct
+// call to the tracked cancel/group value itself is recognized
+// (observeCall's own funObj match still only matches a bare identifier
+// via calledObject), nor how a goroutine's target function is resolved
+// (buildGoroutine keeps its own, separately-reasoned, more conservative
+// behavior for a local variable of function type; see firstStartTarget's
+// doc comment for why that one stays as is).
+func (b *builder) resolveCalleeFunc(fun ast.Expr) *types.Func {
+	if fn, ok := calledObject(fun, b.in.Info).(*types.Func); ok {
+		return fn
+	}
+	id, ok := fun.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	obj := b.in.Info.ObjectOf(id)
+	if obj == nil {
+		return nil
+	}
+	target, ok := b.singleAssignTargets[obj].(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	fn, _ := b.in.Info.ObjectOf(target).(*types.Func)
+	return fn
+}
+
+// argumentIndexOf returns the parameter index obj is passed at: either a
+// direct argument (a bare identifier expression, matching the previous,
+// unconditional behavior exactly), or, when call uses `...`, the
+// callee's variadic parameter index (necessarily its last parameter,
+// since that is the only position `...` can ever target) when the
+// spread expression -- directly, or through one single-assignment level
+// of indirection (see compositeLitOf) -- is a composite literal listing
+// obj as one of its elements and the callee's variadic element type is
+// itself cancel-like (computeParameterConsumption's variadicCancelParam
+// is what will have computed *that* parameter's own consumed value, via
+// variadicCancelElementCalled, not the ordinary scalar Called/Escapes
+// check). Any other spread source (a slice built by append, returned
+// from a call, or reassigned more than once) is not attempted -- that
+// would mean tracing how the slice was built or flowed, a fundamentally
+// larger analysis than this narrow, purely syntactic check -- and
+// returns -1, same as any other unresolvable shape.
+func argumentIndexOf(call *ast.CallExpr, obj types.Object, funcObj *types.Func, info *types.Info, singleAssign map[types.Object]ast.Expr) int {
+	if call.Ellipsis.IsValid() {
+		if len(call.Args) == 0 {
+			return -1
+		}
+		lit := spreadCompositeLitOf(call.Args[len(call.Args)-1], info, singleAssign)
+		if lit == nil || !compositeLitContainsObject(lit, obj, info) {
+			return -1
+		}
+		sig, ok := funcObj.Type().Underlying().(*types.Signature)
+		if !ok || !sig.Variadic() {
+			return -1
+		}
+		return sig.Params().Len() - 1
+	}
+	for i, arg := range call.Args {
+		if identObject(arg, info) == obj {
+			return i
+		}
+	}
+	return -1
+}
+
+// collectSpreadClaims marks every entry in cancels whose object appears
+// (directly, or via one single-assignment level of indirection -- see
+// spreadCompositeLitOf) inside a composite literal spread (`...`) into
+// some call's last argument, as claimed: observeContainerEscape's
+// generic "stored in any composite literal => transferred" fallback must
+// not decide this binding's fate, the same way it already defers to
+// collectFieldCaptures for the struct-field-capture shape. The real
+// verdict is decided precisely, per call, by observeCall's own
+// argumentConsumed check when that call node is visited during the main
+// walk -- this claim only stops the generic fallback from pre-empting
+// that more precise answer with an unconditional "yes, transferred". It
+// does not matter here whether the callee turns out resolvable: an
+// unresolvable callee still correctly falls back to "assume transferred"
+// inside observeCall itself (argumentConsumed reports verified=false
+// there too), just via the intended path instead of this blunter one
+// firing first.
+func collectSpreadClaims(body *ast.BlockStmt, cancels []*cancelState, info *types.Info, singleAssign map[types.Object]ast.Expr, claimed map[types.Object]bool) {
+	if len(cancels) == 0 {
+		return
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !call.Ellipsis.IsValid() || len(call.Args) == 0 {
+			return true
+		}
+		lit := spreadCompositeLitOf(call.Args[len(call.Args)-1], info, singleAssign)
+		if lit == nil {
+			return true
+		}
+		for _, c := range cancels {
+			if c.cancelObj != nil && compositeLitContainsObject(lit, c.cancelObj, info) {
+				claimed[c.cancelObj] = true
+			}
+		}
+		return true
+	})
+}
+
+// spreadCompositeLitOf resolves expr to a composite literal: directly, or
+// (when expr is a bare identifier) through exactly one local,
+// single-assignment level of indirection via singleAssign --
+// `args := []T{cancel}; f(args...)` is exactly as staticaly readable as
+// `f([]T{cancel}...)`, just one control-flow-free step further back.
+// Distinct from the unrelated, unwrap-through-`&`/parens compositeLitOf
+// above (that one is for the constructor/field-ownership feature's
+// different question -- "what literal does this expression construct" --
+// and does not resolve through a variable at all).
+func spreadCompositeLitOf(expr ast.Expr, info *types.Info, singleAssign map[types.Object]ast.Expr) *ast.CompositeLit {
+	if lit, ok := expr.(*ast.CompositeLit); ok {
+		return lit
+	}
+	id, ok := expr.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	obj := info.ObjectOf(id)
+	if obj == nil {
+		return nil
+	}
+	lit, _ := singleAssign[obj].(*ast.CompositeLit)
+	return lit
+}
+
+// compositeLitContainsObject reports whether obj appears as one of lit's
+// elements, unwrapping a keyed element's value (`[]T{0: cancel}`) the
+// same as a plain one.
+func compositeLitContainsObject(lit *ast.CompositeLit, obj types.Object, info *types.Info) bool {
+	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			elt = kv.Value
+		}
+		if identObject(elt, info) == obj {
+			return true
+		}
+	}
+	return false
+}
+
+// singleAssignmentTargets finds every local variable or parameter in
+// body that is assigned exactly once, anywhere in body (including inside
+// nested function literals -- an assignment there still counts, since
+// it's the same underlying object and this needs to rule out every
+// possible write, not just top-level ones), and records that one
+// assignment's right-hand side expression, whatever shape it turns out
+// to be. This is a narrow, purely syntactic (no control-flow, no
+// points-to) resolution: "exactly once" is what makes it sound without
+// needing to trace which assignment reaches which use -- if a variable
+// is written in only one place in the entire function, whatever value it
+// holds at any later use must be either that write's value or the
+// type's zero value (a nil func or nil slice, meaning any use through it
+// would already panic, or range over nothing, before this analysis is
+// ever consulted) -- there is no other value it could hold. Two call
+// sites currently consult this, each interpreting the recorded
+// expression narrowly for its own purpose (see resolveCalleeFunc and
+// compositeLitOf); neither attempts anything like general alias analysis
+// (docs/roadmap.md item 5, an optional full SSA-backed alias/call-graph
+// experiment, not this).
+func singleAssignmentTargets(body *ast.BlockStmt, info *types.Info) map[types.Object]ast.Expr {
+	counts := map[types.Object]int{}
+	targets := map[types.Object]ast.Expr{}
+	record := func(lhs, rhs ast.Expr) {
+		id, ok := lhs.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			return
+		}
+		obj := info.ObjectOf(id)
+		if obj == nil {
+			return
+		}
+		counts[obj]++
+		if counts[obj] == 1 && rhs != nil {
+			targets[obj] = rhs
+		} else {
+			delete(targets, obj)
+		}
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range x.Lhs {
+				if i < len(x.Rhs) {
+					record(lhs, x.Rhs[i])
+				} else {
+					record(lhs, nil)
+				}
+			}
+		case *ast.ValueSpec:
+			for i, name := range x.Names {
+				if i < len(x.Values) {
+					record(name, x.Values[i])
+				} else {
+					record(name, nil)
+				}
+			}
+		}
+		return true
+	})
+	return targets
+}
+
+// variadicCancelElementCalled reports whether body demonstrably calls
+// every element of paramObj -- a variadic parameter whose element type
+// is cancel-like -- via the single recognized idiom `for _, v := range
+// param { v() }` (any range-loop variable name; called with no
+// arguments; matched by the loop variable's own object, not its name).
+// This is deliberately narrow, the collection equivalent of the direct-
+// call check already used for a scalar cancel parameter: it does not
+// follow the loop variable any further (storing it, passing it on, or
+// calling it only conditionally within the loop body are all left
+// unrecognized, falling back exactly like an unresolvable case would),
+// and it does not attempt index-based access (`param[i]()`) or a range
+// target reached through any indirection.
+func variadicCancelElementCalled(body *ast.BlockStmt, paramObj types.Object, info *types.Info) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		rng, ok := n.(*ast.RangeStmt)
+		if !ok {
+			return true
+		}
+		if identObject(rng.X, info) != paramObj {
+			return true
+		}
+		loopVar, ok := rng.Value.(*ast.Ident)
+		if !ok || loopVar.Name == "_" {
+			return true
+		}
+		loopObj := info.Defs[loopVar]
+		if loopObj == nil {
+			return true
+		}
+		ast.Inspect(rng.Body, func(m ast.Node) bool {
+			if found {
+				return false
+			}
+			call, ok := m.(*ast.CallExpr)
+			if ok && len(call.Args) == 0 && identObject(call.Fun, info) == loopObj {
+				found = true
+				return false
+			}
+			return true
+		})
+		return false
+	})
+	return found
+}
+
+// exportedParamConsumption returns, for each of fd's own cancel-like,
+// group-like, or variadic-cancel-collection parameters, by position,
+// whether computeParameterConsumption's fixed point (already fully
+// converged by the time buildFunction runs -- Build's pre-pass sweep
+// loop always finishes before its main per-function loop begins)
+// recorded it as consumed. This becomes model.Function.ParamConsumption,
+// which a cross-package caller can consult the same way argumentConsumed
+// already consults b.paramConsumption directly for a same-package one --
+// see analyzer.go's fact export and Input.LookupParamConsumption.
+func (b *builder) exportedParamConsumption(fd *ast.FuncDecl) map[int]bool {
+	if fd.Type.Params == nil {
+		return nil
+	}
+	var out map[int]bool
+	record := func(index int, obj types.Object) {
+		consumed, ok := b.paramConsumption[obj]
+		if !ok {
+			return
+		}
+		if out == nil {
+			out = map[int]bool{}
+		}
+		out[index] = consumed
+	}
+	index := 0
+	params := fd.Type.Params.List
+	for fieldIdx, field := range params {
+		for nameIdx, name := range field.Names {
+			obj := b.in.Info.ObjectOf(name)
+			if obj != nil && name.Name != "_" {
+				if isCancelFuncType(obj.Type()) || groupKind(obj.Type()) != "" {
+					record(index, obj)
+				} else if fieldIdx == len(params)-1 && nameIdx == len(field.Names)-1 {
+					if _, ok := field.Type.(*ast.Ellipsis); ok {
+						if slice, ok := obj.Type().(*types.Slice); ok && isCancelFuncType(slice.Elem()) {
+							record(index, obj)
+						}
+					}
+				}
+			}
+			index++
+		}
+		if len(field.Names) == 0 {
+			index++
+		}
+	}
+	return out
 }
 
 // paramObjectAtIndex returns the *types.Var for fd's parameter at the
@@ -857,6 +1247,33 @@ func paramObjectAtIndex(info *types.Info, fd *ast.FuncDecl, index int) types.Obj
 		}
 	}
 	return nil
+}
+
+// spreadArgumentContains reports whether obj appears inside the
+// composite literal that call's spread argument resolves to via exactly
+// one single-assignment level of indirection (spreadCompositeLitOf) --
+// the one case objectsUsedInExpressions' plain identifier walk cannot
+// already see on its own, since it has no reason to follow a variable to
+// its own, single, prior assignment. A composite literal spelled out
+// directly at the call site is already found by that ordinary walk
+// (ast.Inspect descends straight into it) and does not need this.
+func spreadArgumentContains(call *ast.CallExpr, obj types.Object, info *types.Info, singleAssign map[types.Object]ast.Expr) bool {
+	if !call.Ellipsis.IsValid() || len(call.Args) == 0 {
+		return false
+	}
+	id, ok := call.Args[len(call.Args)-1].(*ast.Ident)
+	if !ok {
+		return false
+	}
+	spreadObj := info.ObjectOf(id)
+	if spreadObj == nil {
+		return false
+	}
+	lit, ok := singleAssign[spreadObj].(*ast.CompositeLit)
+	if !ok {
+		return false
+	}
+	return compositeLitContainsObject(lit, obj, info)
 }
 
 func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups []*groupState) {
@@ -887,7 +1304,7 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 		// remove. Whether the call's result is discarded is unrelated to
 		// the callee receiving the function, so no assignment-context
 		// guard applies either way.
-		if c.cancelObj != nil && hasObject(argObjects, c.cancelObj) {
+		if c.cancelObj != nil && (hasObject(argObjects, c.cancelObj) || spreadArgumentContains(call, c.cancelObj, b.in.Info, b.singleAssignTargets)) {
 			if consumed, verified, pending := b.argumentConsumed(call, c.cancelObj); verified {
 				if consumed {
 					c.binding.Escapes = true

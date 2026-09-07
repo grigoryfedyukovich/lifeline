@@ -717,6 +717,234 @@ func countdown(c context.CancelFunc, n int) {
 	}
 }
 
+// The following tests cover the three shapes argumentConsumed previously
+// could never verify -- a function value, a callee outside the current
+// package, and a `...` spread call -- each now resolvable in a narrow,
+// bounded way (see resolveCalleeFunc, Input.LookupParamConsumption, and
+// argumentIndexOf/spreadCompositeLitOf/variadicCancelElementCalled for
+// exactly how far each one goes and where it deliberately stops rather
+// than guessing).
+
+func TestParameterPassing_FunctionValueSingleAssignmentVerified(t *testing.T) {
+	drop := analyzeSource(t, `package p
+import "context"
+func drop(c context.CancelFunc) { _ = c }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var f func(context.CancelFunc) = drop
+	f(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+		t.Fatalf("a cancel func passed through a singly-assigned function-value alias to a dropping callee should fire LL1001, got diagnostics = %#v", drop)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+func call(c context.CancelFunc) { c() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var f func(context.CancelFunc) = call
+	f(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("a cancel func passed through a singly-assigned function-value alias to a calling callee should not fire, got diagnostics = %#v", consumed)
+	}
+}
+
+func TestParameterPassing_FunctionValueReassignedFallsBack(t *testing.T) {
+	// f is written twice (the initial assignment and the conditional
+	// reassignment), so it is not resolvable at all -- resolveCalleeFunc
+	// requires exactly one write in the whole function, precisely because
+	// a second write means a call through f could reach either target
+	// depending on control flow this analysis does not trace. Falls back
+	// to "assume transferred", not a leak.
+	diags := analyzeSource(t, `package p
+import "context"
+func call(c context.CancelFunc) { c() }
+func drop(c context.CancelFunc) { _ = c }
+func Start(useDrop bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := call
+	if useDrop {
+		f = drop
+	}
+	f(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a function value assigned more than once should be unresolvable and fall back, got diagnostics = %#v", diags)
+	}
+}
+
+func TestParameterPassing_SpreadInlineCompositeLiteralVerified(t *testing.T) {
+	drop := analyzeSource(t, `package p
+import "context"
+func dropAll(cancels ...context.CancelFunc) { _ = cancels }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	dropAll([]context.CancelFunc{cancel}...)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+		t.Fatalf("a cancel func spread from an inline composite literal into a callee that never calls any element should fire LL1001, got diagnostics = %#v", drop)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+func callAll(cancels ...context.CancelFunc) {
+	for _, c := range cancels {
+		c()
+	}
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	callAll([]context.CancelFunc{cancel}...)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("a cancel func spread from an inline composite literal into a callee that ranges over and calls every element should not fire, got diagnostics = %#v", consumed)
+	}
+}
+
+func TestParameterPassing_SpreadSingleAssignmentVariableVerified(t *testing.T) {
+	// Same pair as the inline-literal test above, but the spread source
+	// is a variable holding the literal (`all := []T{cancel}; f(all...)`)
+	// instead of the literal spelled out at the call site -- one
+	// single-assignment level of indirection back (spreadCompositeLitOf),
+	// not the literal's presence in call.Args itself.
+	drop := analyzeSource(t, `package p
+import "context"
+func dropAll(cancels ...context.CancelFunc) { _ = cancels }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	all := []context.CancelFunc{cancel}
+	dropAll(all...)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+		t.Fatalf("a cancel func spread via a singly-assigned slice variable into a dropping callee should fire LL1001, got diagnostics = %#v", drop)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+func callAll(cancels ...context.CancelFunc) {
+	for _, c := range cancels {
+		c()
+	}
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	all := []context.CancelFunc{cancel}
+	callAll(all...)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("a cancel func spread via a singly-assigned slice variable into a calling callee should not fire, got diagnostics = %#v", consumed)
+	}
+}
+
+func TestParameterPassing_SpreadUnresolvableSourceFallsBack(t *testing.T) {
+	// The spread source here is reassigned (append grows a new slice
+	// value into the same variable, a second write), so it isn't
+	// singly-assigned and spreadCompositeLitOf can't resolve it -- falls
+	// back exactly like any other unresolvable case, never a leak.
+	diags := analyzeSource(t, `package p
+import "context"
+func dropAll(cancels ...context.CancelFunc) { _ = cancels }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var all []context.CancelFunc
+	all = append(all, cancel)
+	dropAll(all...)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a spread source built by append (not a single literal assignment) should be unresolvable and fall back, got diagnostics = %#v", diags)
+	}
+}
+
+func analyzeSourceWithLookup(t *testing.T, source string, lookup func(*types.Func, int) (bool, bool)) []engine.Diagnostic {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupParamConsumption: lookup}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine.Analyze(program, cfg)
+}
+
+func TestParameterPassing_CrossPackageCalleeVerifiedViaFact(t *testing.T) {
+	// context.AfterFunc stands in for "a real cross-package callee": its
+	// second parameter (func()) is exactly the shape a context.CancelFunc
+	// is assignable to, and since only this package's own input.go is
+	// parsed, context.AfterFunc necessarily has no local *ast.FuncDecl --
+	// b.funcs misses it the same way any genuinely external function
+	// would, exercising the Input.LookupParamConsumption path rather than
+	// b.paramConsumption.
+	source := `package p
+import "context"
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	context.AfterFunc(ctx, cancel)
+	go func() { <-ctx.Done() }()
+}
+`
+	afterFuncAt1 := func(fn *types.Func, index int) (consumed, ok bool) {
+		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "context" && fn.Name() == "AfterFunc" && index == 1 {
+			return consumed, true
+		}
+		return false, false
+	}
+
+	consumedTrue := func(fn *types.Func, index int) (bool, bool) {
+		if _, ok := afterFuncAt1(fn, index); ok {
+			return true, true
+		}
+		return false, false
+	}
+	if diags := analyzeSourceWithLookup(t, source, consumedTrue); len(diags) != 0 {
+		t.Fatalf("a cross-package callee a fact verifies as consuming the cancel func should not fire, got diagnostics = %#v", diags)
+	}
+
+	consumedFalse := func(fn *types.Func, index int) (bool, bool) {
+		if _, ok := afterFuncAt1(fn, index); ok {
+			return false, true
+		}
+		return false, false
+	}
+	diags := analyzeSourceWithLookup(t, source, consumedFalse)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("a cross-package callee a fact verifies as NOT consuming the cancel func is a genuine, checked leak and should fire LL1001, got diagnostics = %#v", diags)
+	}
+
+	if diags := analyzeSourceWithLookup(t, source, nil); len(diags) != 0 {
+		t.Fatalf("a cross-package callee with no LookupParamConsumption configured (standalone mode) should fall back to assume-transferred, got diagnostics = %#v", diags)
+	}
+}
+
 // The following tests cover field/constructor ownership tracking
 // (docs/roadmap.md item 3): a cancel/group binding stored into a named
 // struct field, either by a local variable ("stored struct") or by a

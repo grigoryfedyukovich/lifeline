@@ -368,6 +368,22 @@ type Function struct {
 	Groups        []JoinGroup     `json:"groups,omitempty"`
 	BodyLifecycle Goroutine       `json:"body_lifecycle"`
 	IR            []Instruction   `json:"ir,omitempty"`
+	// ParamConsumption records, by parameter position, whether this
+	// function's own body consumes a cancel-like/group-like parameter at
+	// that position (computeParameterConsumption's fixed-point result,
+	// docs/cfg-migration-plan.md Phase 5) or -- for the single trailing
+	// variadic parameter only, when its element type is cancel-like --
+	// whether the body demonstrably calls every element via a `for _, v
+	// := range param { v() }` loop. A same-package caller in this same
+	// build already has this via the builder's own paramConsumption map;
+	// this field exists so a caller in a *different* package can still
+	// answer the same question via a versioned fact (analyzer.go's
+	// FunctionFact, Input.LookupParamConsumption), the same way
+	// BodyLifecycle already travels across a package boundary for
+	// goroutine targets. Indices with no entry are simply parameters this
+	// analysis never reached a verified answer for, same as any other
+	// unresolvable case -- never a stand-in for "false".
+	ParamConsumption map[int]bool `json:"param_consumption,omitempty"`
 }
 
 type Program struct {
