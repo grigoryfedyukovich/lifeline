@@ -945,6 +945,59 @@ func Start(parent context.Context) {
 	}
 }
 
+// TestParameterPassing_MethodReceiverCalleeVerified confirms a same-
+// package method call (h.Do(cancel)) is verified exactly like a plain
+// function call, for both a value and a pointer receiver: calledObject
+// already resolves a *ast.SelectorExpr via info.Selections, and a
+// method's *ast.FuncDecl (its Recv field is separate from Type.Params,
+// so parameter indexing is unaffected) was never excluded from b.funcs
+// or from computeParameterConsumption's sources -- this predates every
+// change in this file and was already correct, this test exists only to
+// lock that in given how much adjacent code around it has since changed.
+// An interface-typed receiver is deliberately not covered here: that
+// resolves to the interface's own abstract method declaration, which has
+// no *ast.FuncDecl to look up regardless of receiver kind, and correctly
+// stays unresolvable -- devirtualizing it would be a fundamentally
+// different (and unsound, without whole-program analysis) feature; see
+// docs/limitations.md's "an interface method" exception.
+func TestParameterPassing_MethodReceiverCalleeVerified(t *testing.T) {
+	for _, recv := range []string{"h Handler", "h *Handler"} {
+		newHandler := "var h Handler"
+		if recv == "h *Handler" {
+			newHandler = "h := &Handler{}"
+		}
+		drop := analyzeSource(t, `package p
+import "context"
+type Handler struct{}
+func (`+recv+`) Do(c context.CancelFunc) { _ = c }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	`+newHandler+`
+	h.Do(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+		if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+			t.Fatalf("(%s) a cancel func passed to a method that drops it should fire LL1001, got diagnostics = %#v", recv, drop)
+		}
+
+		consumed := analyzeSource(t, `package p
+import "context"
+type Handler struct{}
+func (`+recv+`) Do(c context.CancelFunc) { c() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	`+newHandler+`
+	h.Do(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+		if len(consumed) != 0 {
+			t.Fatalf("(%s) a cancel func passed to a method that calls it should not fire, got diagnostics = %#v", recv, consumed)
+		}
+	}
+}
+
 // The following tests cover field/constructor ownership tracking
 // (docs/roadmap.md item 3): a cancel/group binding stored into a named
 // struct field, either by a local variable ("stored struct") or by a
