@@ -11,6 +11,7 @@ import (
 
 	"github.com/gfedyukovich/lifeline/internal/config"
 	"github.com/gfedyukovich/lifeline/internal/engine"
+	"github.com/gfedyukovich/lifeline/internal/model"
 )
 
 func analyzeSource(t *testing.T, source string) []engine.Diagnostic {
@@ -1653,6 +1654,111 @@ func Start(parent context.Context) {
 `)
 	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
 		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldOwnership_ExportedReturnFieldSitesPopulatedForConstructor
+// confirms model.Function.ReturnFieldSites -- the plain, object-free
+// shape a fact carries -- is populated correctly for a same-package
+// constructor, independent of any caller: this is the export half of
+// cross-package constructor-ownership support (Input.LookupReturnFieldSites'
+// own doc comment explains what the consume half can and can't achieve).
+func TestFieldOwnership_ExportedReturnFieldSitesPopulatedForConstructor(t *testing.T) {
+	source := `package p
+import "context"
+type Handle struct {
+	Label  string
+	Cancel context.CancelFunc
+}
+func NewHandle(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Label: "worker", Cancel: cancel}, ctx
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info}, config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sites []model.ReturnFieldSite
+	for _, fn := range program.Functions {
+		if strings.HasSuffix(fn.Name, "NewHandle") {
+			sites = fn.ReturnFieldSites
+		}
+	}
+	if len(sites) != 1 || sites[0].ResultIndex != 0 || sites[0].FieldName != "Cancel" || sites[0].Kind != "cancel" {
+		t.Fatalf("expected exactly one return field site {0, Cancel, cancel}, got %#v", sites)
+	}
+}
+
+// TestFieldOwnership_CrossPackageConstructorFactConsultedSafely confirms
+// the consume half of cross-package constructor-ownership support: the
+// mechanical dependency on a real, same-package types.Object is gone
+// (verifyConstructorCallerField now takes a plain kind string), so
+// Input.LookupReturnFieldSites is actually reached and does not panic or
+// misbehave for a cross-package callee -- and, matching this fact's own
+// documented architectural limit (see Input.LookupReturnFieldSites'
+// doc comment), neither response value changes Start's own diagnostics,
+// since Start has no cancel/group binding of its own for a verdict about
+// someone else's constructor to attach to.
+func TestFieldOwnership_CrossPackageConstructorFactConsultedSafely(t *testing.T) {
+	source := `package p
+import "fmt"
+func Start() {
+	h, _ := fmt.Println("x")
+	_ = h
+}
+`
+	// fmt.Println's actual signature doesn't matter for this plumbing
+	// check -- the lookup fires purely off the resolved *types.Func, the
+	// same way the other Lookup* tests use fmt.Println as a stand-in
+	// cross-package callee.
+	printlnSite := func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "fmt" && fn.Name() == "Println" {
+			return []model.ReturnFieldSite{{ResultIndex: 0, FieldName: "N", Kind: "cancel"}}, true
+		}
+		return nil, false
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	called := false
+	spy := func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+		called = true
+		return printlnSite(fn)
+	}
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupReturnFieldSites: spy}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("expected LookupReturnFieldSites to be consulted for a resolvable cross-package callee")
+	}
+	if diags := engine.Analyze(program, cfg); len(diags) != 0 {
+		t.Fatalf("Start has no cancel/group binding of its own; a fact about fmt.Println's return shape must not manufacture a finding, got diagnostics = %#v", diags)
 	}
 }
 

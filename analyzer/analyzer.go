@@ -61,6 +61,16 @@ type FunctionFact struct {
 	// transferred) -- what lets Input.LookupParamDoneCalled verify the
 	// `wg.Add(1); go worker(&wg)` idiom across a package boundary.
 	ParamDoneCalled map[int]bool
+	// ReturnFieldSites is model.Function.ReturnFieldSites, unchanged: see
+	// its own doc comment, and Input.LookupReturnFieldSites' doc comment
+	// for the architectural limit specific to this one fact (unlike
+	// ParamConsumption/ParamDoneCalled/LoopUnresolved, a positive result
+	// here cannot revise the exporting function's own, already-finalized
+	// diagnostic -- it only lets the caller's own verification run at
+	// all for a cross-package constructor, which previously wasn't
+	// reachable due to verifyConstructorCallerField's dependency on a
+	// real, same-package types.Object).
+	ReturnFieldSites []model.ReturnFieldSite
 }
 
 func (*FunctionFact) AFact() {}
@@ -147,12 +157,23 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		called, ok = fact.ParamDoneCalled[index]
 		return called, ok
 	}
+	lookupReturnFieldSites := func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+		if pass.ImportObjectFact == nil || fn == nil {
+			return nil, false
+		}
+		var fact FunctionFact
+		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
+			return nil, false
+		}
+		return fact.ReturnFieldSites, true
+	}
 	cwd, _ := os.Getwd()
 	program, err := frontend.Build(frontend.Input{
 		Fset: pass.Fset, Files: frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd), Pkg: pass.Pkg, Info: pass.TypesInfo,
 		LookupFunctionSummary:   lookup,
 		LookupParamConsumption: lookupParam,
 		LookupParamDoneCalled:  lookupParamDone,
+		LookupReturnFieldSites: lookupReturnFieldSites,
 	}, cfg)
 	if err != nil {
 		return nil, err
@@ -218,6 +239,7 @@ func exportFunctionFacts(pass *analysis.Pass, program model.Program) {
 				LoopUnresolved:   engine.UnresolvedLoop(summary.CFG),
 				ParamConsumption: fn.ParamConsumption,
 				ParamDoneCalled:  fn.ParamDoneCalled,
+				ReturnFieldSites: fn.ReturnFieldSites,
 			})
 		}
 	}

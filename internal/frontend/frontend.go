@@ -53,6 +53,37 @@ type Input struct {
 	// a cross-package callee then, same as it always did before this
 	// existed.
 	LookupParamDoneCalled func(fn *types.Func, paramIndex int) (called, ok bool)
+
+	// LookupReturnFieldSites is the constructor/field-ownership
+	// counterpart of LookupParamConsumption and LookupParamDoneCalled:
+	// for a callee outside the current package, describes which of its
+	// result positions carry a cancel-like or group-like value inside a
+	// named struct field (FunctionFact.ReturnFieldSites). Consulted by
+	// computeConstructorCallerConsumption when a call's callee isn't
+	// found among this package's own b.returnFieldInfo.
+	//
+	// Unlike the other two Lookup* hooks, a positive result here cannot
+	// ever change the constructor's own diagnostic the way a same-package
+	// verification does: that verdict is recorded into
+	// b.returnFieldConsumption, keyed by the constructor's own local
+	// binding object -- which exists only within the same build as the
+	// constructor's own source, i.e. only for a same-package constructor.
+	// A cross-package constructor's package has already been analyzed and
+	// its diagnostics already finalized by the time this package (a
+	// dependent) is analyzed; go/analysis facts flow from a dependency to
+	// its dependents, never backward, so there is no way for a finding
+	// made here to reach back and revise that already-reported verdict.
+	// This hook still lets computeConstructorCallerConsumption run the
+	// same verification against the *caller's* own body (mechanically
+	// removing verifyConstructorCallerField's dependency on a real,
+	// same-package types.Object to distinguish cancel from
+	// waitgroup/errgroup, which used to make this simply unreachable for
+	// a cross-package callee) -- its result is recorded the same way a
+	// same-package verdict is, keyed by the callee's own *types.Func
+	// (there being no local binding object to key it by instead), so it
+	// remains available to any future consumer that queries it directly,
+	// without inventing a new diagnostic location for it today.
+	LookupReturnFieldSites func(fn *types.Func) ([]model.ReturnFieldSite, bool)
 }
 
 type funcSource struct {
@@ -453,6 +484,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	fn := model.Function{Name: name, Span: b.span(fd)}
 	fn.ParamConsumption = b.exportedParamConsumption(fd)
 	fn.ParamDoneCalled = b.exportedParamDoneCalled(fd)
+	fn.ReturnFieldSites = b.exportedReturnFieldSites(source.obj)
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	states, groups := b.collectBindings(fd, contexts)
@@ -2356,6 +2388,36 @@ func (b *builder) recordReturnedField(fnObj *types.Func, fc *fieldCapture, resul
 // resulting scratch cancels/groups states are discarded, same as
 // computeParameterConsumption's own scratch model.Function: this call
 // exists only for its side effect on b.returnFieldInfo.
+// exportedReturnFieldSites returns, for fnObj, every entry of
+// b.returnFieldInfo whose site.fn is fnObj -- i.e. this function's own
+// recognized "constructor" fields (computeFieldOwnership's work,
+// already fully converged by the time buildFunction runs, same as
+// b.paramConsumption) -- in the plain, object-free shape a fact can
+// carry. This becomes model.Function.ReturnFieldSites; see
+// analyzer.go's fact export and Input.LookupReturnFieldSites.
+func (b *builder) exportedReturnFieldSites(fnObj *types.Func) []model.ReturnFieldSite {
+	if fnObj == nil || len(b.returnFieldInfo) == 0 {
+		return nil
+	}
+	var out []model.ReturnFieldSite
+	for bindingObj, site := range b.returnFieldInfo {
+		if site.fn != fnObj {
+			continue
+		}
+		var kind string
+		switch {
+		case isCancelFuncType(bindingObj.Type()):
+			kind = "cancel"
+		case groupKind(bindingObj.Type()) != "":
+			kind = groupKind(bindingObj.Type())
+		default:
+			continue
+		}
+		out = append(out, model.ReturnFieldSite{ResultIndex: site.resultIndex, FieldName: site.fieldName, Kind: kind})
+	}
+	return out
+}
+
 func (b *builder) computeFieldOwnership(source funcSource) {
 	fd := source.decl
 	if fd.Body == nil {
@@ -2388,7 +2450,7 @@ func (b *builder) computeFieldOwnership(source funcSource) {
 // lookup treats as "not verified" and falls back to the conservative
 // assume-transferred default, never a leak.
 func (b *builder) computeConstructorCallerConsumption(source funcSource) {
-	if len(b.returnFieldInfo) == 0 {
+	if len(b.returnFieldInfo) == 0 && b.in.LookupReturnFieldSites == nil {
 		return
 	}
 	fd := source.decl
@@ -2428,10 +2490,12 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) {
 		if !ok {
 			return true
 		}
+		matchedLocally := false
 		for bindingObj, site := range b.returnFieldInfo {
 			if site.fn != calleeObj || site.resultIndex >= len(as.Lhs) {
 				continue
 			}
+			matchedLocally = true
 			lhs, ok := as.Lhs[site.resultIndex].(*ast.Ident)
 			if !ok || lhs.Name == "_" {
 				continue
@@ -2440,7 +2504,39 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) {
 			if varObj == nil {
 				continue
 			}
-			b.verifyConstructorCallerField(fd.Body, bindingObj, varObj, site)
+			var kind string
+			switch {
+			case isCancelFuncType(bindingObj.Type()):
+				kind = "cancel"
+			case groupKind(bindingObj.Type()) != "":
+				kind = groupKind(bindingObj.Type())
+			default:
+				continue
+			}
+			b.verifyConstructorCallerField(fd.Body, bindingObj, kind, varObj, site)
+		}
+		// calleeObj has no same-package returnFieldInfo entry -- either
+		// because it isn't a recognized constructor at all, or because
+		// its own body lives outside this package. Only the latter is
+		// worth a fact lookup; see LookupReturnFieldSites' own doc
+		// comment for what this can and can't achieve for that case.
+		if !matchedLocally && b.funcs[calleeObj] == nil && b.in.LookupReturnFieldSites != nil {
+			if sites, ok := b.in.LookupReturnFieldSites(calleeObj); ok {
+				for _, fs := range sites {
+					if fs.ResultIndex >= len(as.Lhs) {
+						continue
+					}
+					lhs, ok := as.Lhs[fs.ResultIndex].(*ast.Ident)
+					if !ok || lhs.Name == "_" {
+						continue
+					}
+					varObj := b.in.Info.ObjectOf(lhs)
+					if varObj == nil {
+						continue
+					}
+					b.verifyConstructorCallerField(fd.Body, calleeObj, fs.Kind, varObj, returnFieldSite{fieldName: fs.FieldName, resultIndex: fs.ResultIndex, fn: calleeObj})
+				}
+			}
 		}
 		return true
 	})
@@ -2450,17 +2546,26 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) {
 // result variable (varObj, expected to hold site.fieldName's binding)
 // against the calling function's own body, via the same
 // walkFieldCaptureUses machinery a locally-declared "stored struct"
-// capture is resolved with. bindingObj's own static type (rather than a
-// stored kind flag) tells cancel and group bindings apart, since this
-// runs from the caller's side where no cancelState/groupState has ever
-// existed for this particular binding -- only computeFieldOwnership's
-// recorded field name and origin function.
-func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, varObj types.Object, site returnFieldSite) {
+// capture is resolved with. kind ("cancel", "waitgroup", or "errgroup")
+// tells cancel and group bindings apart -- for a same-package
+// constructor this is derived from bindingObj's own static type (see
+// this function's caller in computeConstructorCallerConsumption), and
+// for a cross-package one it comes directly from the imported fact
+// (Input.LookupReturnFieldSites), which is exactly why this takes a
+// plain kind string rather than deriving it here: a cross-package
+// binding has no real types.Object in this build to derive it from.
+// bindingObj itself remains an opaque identity used only as this
+// function's own map key (see setReturnFieldConsumption) and as the
+// synthetic cancelState/groupState's own field -- neither
+// classifyFieldCaptureUse nor walkFieldCaptureUses ever reads its
+// identity for anything beyond that, only fc.cancel/fc.group's presence
+// and fc.fieldName.
+func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, kind string, varObj types.Object, site returnFieldSite) {
 	fc := &fieldCapture{varObj: varObj, fieldName: site.fieldName, returnIndex: -1}
-	switch {
-	case isCancelFuncType(bindingObj.Type()):
+	switch kind {
+	case "cancel":
 		fc.cancel = &cancelState{cancelObj: bindingObj}
-	case groupKind(bindingObj.Type()) != "":
+	case "waitgroup", "errgroup":
 		fc.group = &groupState{obj: bindingObj}
 	default:
 		return

@@ -359,6 +359,16 @@ func (g *CFG) IsPersistentSCC(scc []BlockID) bool {
 	return false
 }
 
+// ReturnFieldSite is one entry of Function.ReturnFieldSites: at
+// ResultIndex, a struct field named FieldName holds a value of the given
+// Kind ("cancel", "waitgroup", or "errgroup"). Plain and self-contained
+// by design -- see Function.ReturnFieldSites' own doc comment.
+type ReturnFieldSite struct {
+	ResultIndex int    `json:"result_index"`
+	FieldName   string `json:"field_name"`
+	Kind        string `json:"kind"`
+}
+
 type Function struct {
 	Name          string          `json:"name"`
 	Span          Span            `json:"span"`
@@ -394,6 +404,17 @@ type Function struct {
 	// idiom's question the same way a same-package one already can --
 	// see analyzer.go's FunctionFact and Input.LookupParamDoneCalled.
 	ParamDoneCalled map[int]bool `json:"param_done_called,omitempty"`
+	// ReturnFieldSites records, for a function recognized as a
+	// "constructor" (computeFieldOwnership: it stores a cancel-like or
+	// group-like binding into a named field of a struct literal that is
+	// itself returned), one entry per such field: which result position
+	// carries it, the field's name, and its kind ("cancel", "waitgroup",
+	// or "errgroup"). This is deliberately a plain, self-contained
+	// description -- no object identity -- so it can travel as a fact
+	// across a package boundary the way ParamConsumption/ParamDoneCalled
+	// already do; see Input.LookupReturnFieldSites and
+	// verifyConstructorCallerField's kind parameter.
+	ReturnFieldSites []ReturnFieldSite `json:"return_field_sites,omitempty"`
 }
 
 type Program struct {
