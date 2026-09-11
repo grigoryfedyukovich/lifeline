@@ -43,6 +43,16 @@ type Input struct {
 	// LookupFunctionSummary, and argumentConsumed falls back to "assume
 	// transferred" exactly as it does for any other unresolvable callee.
 	LookupParamConsumption func(fn *types.Func, paramIndex int) (consumed, ok bool)
+
+	// LookupParamDoneCalled is calleeDoneParamMatches's cross-package
+	// counterpart, backed the same way by a versioned fact
+	// (FunctionFact.ParamDoneCalled): does fn's own body eventually call
+	// Done() on the sync.WaitGroup parameter at this position, to any
+	// depth. Standalone mode leaves this nil, same as the other two
+	// Lookup* hooks, and calleeDoneParamMatches simply reports false for
+	// a cross-package callee then, same as it always did before this
+	// existed.
+	LookupParamDoneCalled func(fn *types.Func, paramIndex int) (called, ok bool)
 }
 
 type funcSource struct {
@@ -72,6 +82,19 @@ type builder struct {
 	// a pure, stable map read; argumentConsumed itself never triggers a
 	// fresh computation, which is what keeps it non-recursive.
 	paramConsumption map[types.Object]bool
+	// paramDoneCalled records, for a sync.WaitGroup-typed parameter,
+	// whether calleeDoneParamMatches's own fixed point (computeParamDoneCalled)
+	// has established that Done() is eventually called on it -- directly,
+	// or via any number of further resolvable same-package functions it
+	// gets passed on to as a direct argument. Unlike paramConsumption,
+	// this needs no "pending" signal alongside it: a not-yet-true entry
+	// mid-sweep is exactly the same safe default ("no evidence yet") this
+	// analysis already treats it as everywhere else, and simply gets
+	// corrected upward on a later sweep if warranted -- there is no
+	// action taken on a false reading here that a later true reading
+	// would need to retroactively undo, the way "assume transferred"
+	// would for paramConsumption.
+	paramDoneCalled map[types.Object]bool
 	// inParamPrepass is true only while computeParameterConsumption's own
 	// call into observeFunctionBody is on the stack. It tells observeCall
 	// to treat a "pending" dependency (argumentConsumed's third return
@@ -277,6 +300,7 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		analyzed:               map[*types.Func]bool{},
 		summaries:              map[*types.Func]model.Goroutine{},
 		paramConsumption:       map[types.Object]bool{},
+		paramDoneCalled:        map[types.Object]bool{},
 		returnFieldInfo:        map[types.Object]returnFieldSite{},
 		returnFieldConsumption: map[types.Object]bool{},
 		contextInterface:       findContextInterface(in.Pkg),
@@ -339,10 +363,22 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	// unconditional-escape behavior) once the fixed point is reached and a
 	// callee still has no entry at all -- max_functions truncation being
 	// the main reason that would happen.
+	//
+	// computeParamDoneCalled runs in the same sweep, for the same
+	// structural reason (a named-worker's own "does it delegate to Done()
+	// eventually" answer can depend on a further helper's not-yet-computed
+	// one): it answers calleeDoneParamMatches's question -- does a
+	// sync.WaitGroup parameter eventually get Done() called on it,
+	// directly or via any number of further resolvable same-package
+	// functions -- which is independent of paramConsumption's own
+	// question and does not need its own separate loop.
 	for {
 		changed := false
 		for _, source := range sources[:limit] {
 			if b.computeParameterConsumption(source.decl) {
+				changed = true
+			}
+			if b.computeParamDoneCalled(source.decl) {
 				changed = true
 			}
 		}
@@ -416,6 +452,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	}
 	fn := model.Function{Name: name, Span: b.span(fd)}
 	fn.ParamConsumption = b.exportedParamConsumption(fd)
+	fn.ParamDoneCalled = b.exportedParamDoneCalled(fd)
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	states, groups := b.collectBindings(fd, contexts)
@@ -653,6 +690,16 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 	// call node is actually visited, below; it does not decide the
 	// verdict itself.
 	collectSpreadClaims(body, cancels, b.in.Info, b.singleAssignTargets, claimed)
+	// Same claimed mechanism again, this time for the slice/map half of
+	// "storing a cancel/group value into an arbitrary container is still
+	// treated as an unverified ownership transfer" (docs/limitations.md):
+	// a cancel value placed into a slice or map literal that is itself
+	// assigned, exactly once, to a local variable later ranged over and
+	// called is verified directly by collectContainerCaptures, which also
+	// claims it so observeContainerEscape's generic fallback doesn't
+	// pre-empt that verdict with an unconditional "transferred" the
+	// moment the literal is seen.
+	b.collectContainerCaptures(body, cancels, b.in.Info, b.singleAssignTargets, claimed)
 	// The same traversal observes lifecycle uses and goroutine start sites. A
 	// small depth stack keeps the enclosing function's own termination summary
 	// from inheriting loops or exits from nested function literals.
@@ -1000,6 +1047,130 @@ func argumentIndexOf(call *ast.CallExpr, obj types.Object, funcObj *types.Func, 
 // inside observeCall itself (argumentConsumed reports verified=false
 // there too), just via the intended path instead of this blunter one
 // firing first.
+// collectContainerCaptures finds every local variable in body that is
+// assigned exactly once (singleAssignmentTargets) to a slice or map
+// composite literal -- keyed or unkeyed, key-vs-position makes no
+// difference to a container's own elements -- containing one or more of
+// cancels' own tracked objects as an element (slice) or value (map), and
+// verifies each such binding directly against whether that same variable
+// is later ranged over and called anywhere in body via the single
+// recognized idiom `for _, v := range container { v() }`
+// (variadicCancelElementCalled, which already only depends on the
+// object being ranged over, not on it being a function parameter
+// specifically, so it is reused here unchanged). This is the slice/map
+// half of "storing a cancel/group value into an arbitrary container is
+// still treated as an unverified ownership transfer" (docs/limitations.md)
+// -- narrowly extended, not removed: a container built by append,
+// returned from a call, or reassigned more than once is left unresolved
+// by singleAssignmentTargets the same as it is everywhere else this file
+// uses it; a container passed on to a further function instead of ranged
+// over directly in the same function falls back to the ordinary
+// unverified default; and group values are deliberately not covered at
+// all here -- Wait()/Add()/Done() is a multi-call protocol, not the
+// single per-element call this idiom checks for, and a slice of group
+// values has no equivalent single recognized consuming shape.
+func (b *builder) collectContainerCaptures(body *ast.BlockStmt, cancels []*cancelState, info *types.Info, singleAssign map[types.Object]ast.Expr, claimed map[types.Object]bool) {
+	if len(cancels) == 0 {
+		return
+	}
+	for obj, rhs := range singleAssign {
+		lit, ok := rhs.(*ast.CompositeLit)
+		if !ok {
+			continue
+		}
+		var contained []*cancelState
+		for _, c := range cancels {
+			if c.cancelObj != nil && !claimed[c.cancelObj] && compositeLitContainsObject(lit, c.cancelObj, info) {
+				contained = append(contained, c)
+			}
+		}
+		if len(contained) == 0 {
+			continue
+		}
+		consumed := variadicCancelElementCalled(body, obj, info)
+		// A container not (yet) shown to be range-consumed is only a
+		// confirmed drop if it also has no other escaping use anywhere in
+		// body -- passed to a further function, returned, or stored into
+		// another container. Any of those means this container's fate
+		// isn't decided within this one function, so it must not be
+		// claimed at all: the existing unverified "assume transferred"
+		// default is the safe, correct answer there, the same one-hop
+        // boundary every other direct-verification path in this file
+        // already stops at, rather than a false "definitely leaked".
+		if !consumed && containerHasOtherEscapingUse(body, obj, info) {
+			continue
+		}
+		for _, c := range contained {
+			claimed[c.cancelObj] = true
+			if consumed {
+				c.binding.Escapes = true
+				c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "stored in a slice/map literal that is later ranged over and called", Span: ptrSpan(b.span(lit))})
+			} else {
+				c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "stored in a slice/map literal, but that variable is never ranged over and called", Span: ptrSpan(b.span(lit))})
+			}
+		}
+	}
+}
+
+// containerHasOtherEscapingUse reports whether obj (a container variable
+// already known to be assigned exactly once, to a composite literal) is
+// used anywhere in body in a way collectContainerCaptures cannot itself
+// resolve: passed as an argument to some call, returned, or stored as an
+// element of another composite literal. A range statement's own `range
+// obj` slot is a different node kind (*ast.RangeStmt, not matched by any
+// case below) and so never counts as an "other" use here -- that is the
+// one shape collectContainerCaptures already resolves directly via
+// variadicCancelElementCalled, not something this needs to also flag.
+func containerHasOtherEscapingUse(body ast.Node, obj types.Object, info *types.Info) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.CallExpr:
+			for _, arg := range x.Args {
+				if identObject(arg, info) == obj {
+					found = true
+					return false
+				}
+			}
+		case *ast.ReturnStmt:
+			for _, r := range x.Results {
+				if identObject(r, info) == obj {
+					found = true
+					return false
+				}
+			}
+		case *ast.CompositeLit:
+			if compositeLitContainsObject(x, obj, info) {
+				found = true
+				return false
+			}
+		case *ast.AssignStmt:
+			for i, rhs := range x.Rhs {
+				if identObject(rhs, info) != obj {
+					continue
+				}
+				// `_ = obj` is the standard explicit-discard idiom, not a
+				// real further use -- excluding it is what lets the
+				// genuinely-dropped case (a container built and then
+				// discarded, with no range consumption anywhere) still be
+				// reported, rather than this check itself suppressing it.
+				if i < len(x.Lhs) {
+					if id, ok := x.Lhs[i].(*ast.Ident); ok && id.Name == "_" {
+						continue
+					}
+				}
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
 func collectSpreadClaims(body *ast.BlockStmt, cancels []*cancelState, info *types.Info, singleAssign map[types.Object]ast.Expr, claimed map[types.Object]bool) {
 	if len(cancels) == 0 {
 		return
@@ -1125,18 +1296,23 @@ func singleAssignmentTargets(body *ast.BlockStmt, info *types.Info) map[types.Ob
 }
 
 // variadicCancelElementCalled reports whether body demonstrably calls
-// every element of paramObj -- a variadic parameter whose element type
-// is cancel-like -- via the single recognized idiom `for _, v := range
-// param { v() }` (any range-loop variable name; called with no
-// arguments; matched by the loop variable's own object, not its name).
-// This is deliberately narrow, the collection equivalent of the direct-
-// call check already used for a scalar cancel parameter: it does not
-// follow the loop variable any further (storing it, passing it on, or
-// calling it only conditionally within the loop body are all left
-// unrecognized, falling back exactly like an unresolvable case would),
-// and it does not attempt index-based access (`param[i]()`) or a range
-// target reached through any indirection.
-func variadicCancelElementCalled(body *ast.BlockStmt, paramObj types.Object, info *types.Info) bool {
+// every element of containerObj -- a variadic parameter or plain local
+// slice/map variable, either way whose element type is cancel-like -- via
+// the single recognized idiom `for _, v := range container { v() }` (any
+// range-loop variable name; called with no arguments; matched by the
+// loop variable's own object, not its name). Despite the name (kept for
+// its original, narrower call site -- computeParameterConsumption's
+// variadic-parameter case), this only depends on containerObj being
+// ranged over, not on it being a parameter specifically, so
+// collectContainerCaptures also reuses it unchanged for a plain local
+// slice/map variable. This is deliberately narrow, the collection
+// equivalent of the direct-call check already used for a scalar cancel
+// binding: it does not follow the loop variable any further (storing it,
+// passing it on, or calling it only conditionally within the loop body
+// are all left unrecognized, falling back exactly like an unresolvable
+// case would), and it does not attempt index-based access
+// (`container[i]()`) or a range target reached through any indirection.
+func variadicCancelElementCalled(body *ast.BlockStmt, containerObj types.Object, info *types.Info) bool {
 	found := false
 	ast.Inspect(body, func(n ast.Node) bool {
 		if found {
@@ -1146,7 +1322,7 @@ func variadicCancelElementCalled(body *ast.BlockStmt, paramObj types.Object, inf
 		if !ok {
 			return true
 		}
-		if identObject(rng.X, info) != paramObj {
+		if identObject(rng.X, info) != containerObj {
 			return true
 		}
 		loopVar, ok := rng.Value.(*ast.Ident)
@@ -1212,6 +1388,36 @@ func (b *builder) exportedParamConsumption(fd *ast.FuncDecl) map[int]bool {
 						}
 					}
 				}
+			}
+			index++
+		}
+		if len(field.Names) == 0 {
+			index++
+		}
+	}
+	return out
+}
+
+// exportedParamDoneCalled returns, for each of fd's own
+// sync.WaitGroup-typed parameters, by position, whether
+// computeParamDoneCalled's fixed point (already fully converged by the
+// time buildFunction runs) recorded Done() as eventually called on it.
+// This becomes model.Function.ParamDoneCalled -- see analyzer.go's fact
+// export and Input.LookupParamDoneCalled.
+func (b *builder) exportedParamDoneCalled(fd *ast.FuncDecl) map[int]bool {
+	if fd.Type.Params == nil {
+		return nil
+	}
+	var out map[int]bool
+	index := 0
+	for _, field := range fd.Type.Params.List {
+		for _, name := range field.Names {
+			obj := b.in.Info.ObjectOf(name)
+			if obj != nil && name.Name != "_" && groupKind(obj.Type()) == "waitgroup" && b.paramDoneCalled[obj] {
+				if out == nil {
+					out = map[int]bool{}
+				}
+				out[index] = true
 			}
 			index++
 		}
@@ -2693,26 +2899,23 @@ func literalNonNegativeInt(e ast.Expr, info *types.Info) (int, bool) {
 }
 
 // calleeDoneParamMatches reports whether call's target is a resolvable
-// same-package function that receives obj as a direct argument at some
-// position, and whose own body calls Done() on that corresponding
-// parameter -- the named-function counterpart to bodyCallsMethodOn's
-// closure-capture check above, for the equally common `wg.Add(1); go
-// worker(&wg)` idiom, where worker's whole job is to call Done() on
-// whatever it's given. This deliberately does not reuse
-// b.paramConsumption (Phase 5's own fixed point for cancel/group
+// function -- same-package (via b.paramDoneCalled, computeParamDoneCalled's
+// own fixed point) or, for a callee outside the current package, via a
+// versioned fact (Input.LookupParamDoneCalled) -- that receives obj as a
+// direct argument at some position, and whose own body eventually calls
+// Done() on that corresponding parameter, to any depth: the named-
+// function counterpart to bodyCallsMethodOn's closure-capture check
+// above, for the equally common `wg.Add(1); go worker(&wg)` idiom, where
+// worker's whole job (however many further named helpers it delegates
+// to) is to call Done() on whatever it's given. This deliberately does
+// not reuse b.paramConsumption (Phase 5's own fixed point for cancel/group
 // parameters): that answers a different question -- does the parameter
 // get Wait()ed or further transferred -- appropriate for verifying an
 // ownership handoff, not for a worker whose job is specifically to
-// decrement the counter its caller already incremented. This is a one-hop
-// existence check, not a fixed point: if worker itself delegates to a
-// further helper that calls Done(), that is not attempted here.
+// decrement the counter its caller already incremented.
 func (b *builder) calleeDoneParamMatches(call *ast.CallExpr, obj types.Object) bool {
 	funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
 	if !ok {
-		return false
-	}
-	decl := b.funcs[funcObj]
-	if decl == nil {
 		return false
 	}
 	index := -1
@@ -2725,11 +2928,129 @@ func (b *builder) calleeDoneParamMatches(call *ast.CallExpr, obj types.Object) b
 	if index == -1 {
 		return false
 	}
-	paramObj := paramObjectAtIndex(b.in.Info, decl, index)
-	if paramObj == nil {
+	if decl := b.funcs[funcObj]; decl != nil {
+		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
+		if paramObj == nil {
+			return false
+		}
+		return b.paramDoneCalled[paramObj]
+	}
+	if b.in.LookupParamDoneCalled != nil {
+		if called, ok := b.in.LookupParamDoneCalled(funcObj, index); ok {
+			return called
+		}
+	}
+	return false
+}
+
+// computeParamDoneCalled (re)computes, for every sync.WaitGroup-typed
+// parameter of fd, whether Done() is eventually called on it: directly
+// in fd's own body (bodyCallsMethodOn), or via fd passing it on, as a
+// direct argument to an ordinary call or a go-statement's call, to a
+// further resolvable same-package function whose own corresponding
+// parameter -- per this same fixed point, one step further along --
+// already eventually calls Done() (bodyDelegatesDone). Build calls this
+// once per function per sweep, in the same loop as
+// computeParameterConsumption and for the identical structural reason: a
+// chain of several named helpers (`worker(wg){ helper(wg) }`,
+// `helper(wg){ wg.Done() }`) needs helper's own answer known before
+// worker's can be, regardless of which order they happen to be declared
+// in. Unlike computeParameterConsumption, this needs no "pending"
+// signal: recordParamDoneCalled's OR-merge means a not-yet-true entry
+// mid-sweep is just today's correct answer, not a wrong one standing in
+// for a right one, and later sweeps can only ever raise it, never need to
+// retract it.
+func (b *builder) computeParamDoneCalled(fd *ast.FuncDecl) (reportChanged bool) {
+	if fd.Type.Params == nil || fd.Body == nil {
 		return false
 	}
-	return bodyCallsMethodOn(decl.Body, paramObj, "Done", b.in.Info)
+	var groupParams []types.Object
+	for _, field := range fd.Type.Params.List {
+		for _, name := range field.Names {
+			obj := b.in.Info.ObjectOf(name)
+			if obj != nil && name.Name != "_" && groupKind(obj.Type()) == "waitgroup" {
+				groupParams = append(groupParams, obj)
+			}
+		}
+	}
+	if len(groupParams) == 0 {
+		return false
+	}
+	for _, obj := range groupParams {
+		next := bodyCallsMethodOn(fd.Body, obj, "Done", b.in.Info) || b.bodyDelegatesDone(fd.Body, obj)
+		if b.recordParamDoneCalled(obj, next) {
+			reportChanged = true
+		}
+	}
+	return reportChanged
+}
+
+// recordParamDoneCalled merges next into b.paramDoneCalled[obj] via OR
+// (see the field's own doc comment for why no "pending"/existed
+// distinction is needed here, unlike recordParamConsumption) and reports
+// whether the recorded value changed, which is what tells Build's sweep
+// loop whether another pass is needed.
+func (b *builder) recordParamDoneCalled(obj types.Object, next bool) bool {
+	prev := b.paramDoneCalled[obj]
+	if next && !prev {
+		b.paramDoneCalled[obj] = true
+		return true
+	}
+	return false
+}
+
+// bodyDelegatesDone reports whether body passes obj as a direct argument,
+// at some call site (an ordinary call or a go-statement's call, but not
+// one reached only through a further-nested function literal -- the same
+// scoping bodyCallsMethodOn already uses), to a resolvable same-package
+// function whose own corresponding parameter is, per
+// computeParamDoneCalled's own fixed point, already known to eventually
+// call Done(). Existence-only, like bodyCallsMethodOn: it does not
+// establish this happens on every path, only that it appears somewhere.
+func (b *builder) bodyDelegatesDone(body ast.Node, obj types.Object) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		var call *ast.CallExpr
+		switch x := n.(type) {
+		case *ast.CallExpr:
+			call = x
+		case *ast.GoStmt:
+			call = x.Call
+		default:
+			return true
+		}
+		funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
+		if !ok {
+			return true
+		}
+		decl := b.funcs[funcObj]
+		if decl == nil {
+			return true
+		}
+		index := -1
+		for i, arg := range call.Args {
+			if identObject(arg, b.in.Info) == obj {
+				index = i
+				break
+			}
+		}
+		if index == -1 {
+			return true
+		}
+		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
+		if paramObj != nil && b.paramDoneCalled[paramObj] {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // bodyCallsMethodOn reports whether body contains a call obj.method(...)

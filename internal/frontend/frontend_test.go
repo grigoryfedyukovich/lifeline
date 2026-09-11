@@ -998,6 +998,248 @@ func Start() {
 	}
 }
 
+// The following tests cover collectContainerCaptures: a cancel value
+// stored in a slice or map literal, itself assigned exactly once to a
+// local variable, verified against whether that variable is later ranged
+// over and called (variadicCancelElementCalled) instead of being
+// unconditionally treated as transferred the moment it is stored. See
+// docs/limitations.md's "storing into an arbitrary container" paragraph
+// for exactly how far this goes and where it deliberately stops.
+
+func TestParameterPassing_SliceContainerVerified(t *testing.T) {
+	drop := analyzeSource(t, `package p
+import "context"
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	all := []context.CancelFunc{cancel}
+	_ = all
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+		t.Fatalf("a cancel func stored in a slice literal that is never ranged over should fire LL1001, got diagnostics = %#v", drop)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	all := []context.CancelFunc{cancel}
+	for _, c := range all {
+		c()
+	}
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("a cancel func stored in a slice literal that is ranged over and called should not fire, got diagnostics = %#v", consumed)
+	}
+}
+
+func TestParameterPassing_MapContainerVerified(t *testing.T) {
+	drop := analyzeSource(t, `package p
+import "context"
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	m := map[string]context.CancelFunc{"a": cancel}
+	_ = m
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+		t.Fatalf("a cancel func stored in a map literal that is never ranged over should fire LL1001, got diagnostics = %#v", drop)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	m := map[string]context.CancelFunc{"a": cancel}
+	for _, c := range m {
+		c()
+	}
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("a cancel func stored in a map literal that is ranged over and called should not fire, got diagnostics = %#v", consumed)
+	}
+}
+
+func TestParameterPassing_ContainerPassedOnFallsBack(t *testing.T) {
+	// all is passed to consume, not ranged over in Start's own body:
+	// consume might well call every element, but that can't be decided
+	// within Start alone, so this must fall back to "assume transferred"
+	// -- never a false "definitely leaked" just because the range loop
+	// that actually consumes it lives one function away.
+	diags := analyzeSource(t, `package p
+import "context"
+func consume(cancels []context.CancelFunc) {
+	for _, c := range cancels {
+		c()
+	}
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	all := []context.CancelFunc{cancel}
+	consume(all)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a container passed to a further function (not ranged over locally) should fall back, not report a leak, got diagnostics = %#v", diags)
+	}
+}
+
+func TestParameterPassing_ContainerBuiltByAppendFallsBack(t *testing.T) {
+	// all is reassigned by append (a second write), so singleAssignmentTargets
+	// can't resolve it to a single literal at all -- falls back exactly
+	// like any other unresolvable case, regardless of the range loop.
+	diags := analyzeSource(t, `package p
+import "context"
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var all []context.CancelFunc
+	all = append(all, cancel)
+	for _, c := range all {
+		c()
+	}
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a container built by append should be unresolvable and fall back, got diagnostics = %#v", diags)
+	}
+}
+
+// The following tests cover computeParamDoneCalled: calleeDoneParamMatches's
+// own fixed point for the `wg.Add(1); go worker(&wg)` idiom, extended
+// from a one-hop existence check to any number of hops of ordinary
+// same-package delegation, plus a versioned-fact counterpart
+// (Input.LookupParamDoneCalled) for a worker outside the current
+// package -- see docs/limitations.md for exactly what this covers.
+
+func TestParameterPassing_NamedWorkerDoneMultiHopVerified(t *testing.T) {
+	twoHop := analyzeSource(t, `package p
+import "sync"
+func helper(wg *sync.WaitGroup) { wg.Done() }
+func worker(wg *sync.WaitGroup) { helper(wg) }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go worker(&wg)
+	wg.Wait()
+}
+`)
+	if len(twoHop) != 0 {
+		t.Fatalf("a two-hop worker->helper->Done() chain should be recognized as balanced, got diagnostics = %#v", twoHop)
+	}
+
+	threeHopCallerFirst := analyzeSource(t, `package p
+import "sync"
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go worker(&wg)
+	wg.Wait()
+}
+func worker(wg *sync.WaitGroup) { hop2(wg) }
+func hop2(wg *sync.WaitGroup)   { hop3(wg) }
+func hop3(wg *sync.WaitGroup)   { wg.Done() }
+`)
+	if len(threeHopCallerFirst) != 0 {
+		t.Fatalf("a three-hop chain in caller-first declaration order should be recognized as balanced (declaration-order independence, same as computeParameterConsumption's own fixed point), got diagnostics = %#v", threeHopCallerFirst)
+	}
+
+	neverCalls := analyzeSource(t, `package p
+import "sync"
+func helper(wg *sync.WaitGroup) { _ = wg }
+func worker(wg *sync.WaitGroup) { helper(wg) }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go worker(&wg)
+	wg.Wait()
+}
+`)
+	if len(neverCalls) != 1 || neverCalls[0].RuleID != "LL1003" {
+		t.Fatalf("a two-hop worker->helper chain that never calls Done() is a genuine, checked undercount and should fire LL1003, got diagnostics = %#v", neverCalls)
+	}
+}
+
+func TestParameterPassing_NamedWorkerDoneCrossPackageViaFact(t *testing.T) {
+	// fmt.Println stands in for a real cross-package worker: it has no
+	// local *ast.FuncDecl, exercising Input.LookupParamDoneCalled rather
+	// than b.paramDoneCalled. Both LookupParamConsumption and
+	// LookupParamDoneCalled are supplied together, matching how a real
+	// build's single FunctionFact always carries both -- see
+	// docs/limitations.md for why supplying only one in isolation
+	// produces a misleading result (the other question, "is this
+	// transferred at all", falls back to assume-transferred and masks
+	// the group from LL1003 entirely).
+	source := `package p
+import (
+	"fmt"
+	"sync"
+)
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go fmt.Println(&wg)
+	wg.Wait()
+}
+`
+	printlnAt0 := func(fn *types.Func, index int) (bool, bool) {
+		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "fmt" && fn.Name() == "Println" && index == 0 {
+			return false, true // verified: fmt.Println neither transfers nor consumes the group
+		}
+		return false, false
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+
+	doneCalledTrue := func(fn *types.Func, index int) (bool, bool) {
+		if _, ok := printlnAt0(fn, index); ok {
+			return true, true
+		}
+		return false, false
+	}
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupParamConsumption: printlnAt0, LookupParamDoneCalled: doneCalledTrue}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diags := engine.Analyze(program, cfg); len(diags) != 0 {
+		t.Fatalf("a cross-package worker a fact verifies as eventually calling Done() should not fire, got diagnostics = %#v", diags)
+	}
+
+	doneCalledFalse := func(fn *types.Func, index int) (bool, bool) {
+		if _, ok := printlnAt0(fn, index); ok {
+			return false, true
+		}
+		return false, false
+	}
+	program, err = Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupParamConsumption: printlnAt0, LookupParamDoneCalled: doneCalledFalse}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diags := engine.Analyze(program, cfg)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a cross-package worker a fact verifies as NOT calling Done() is a genuine, checked undercount and should fire LL1003, got diagnostics = %#v", diags)
+	}
+}
+
 // The following tests cover field/constructor ownership tracking
 // (docs/roadmap.md item 3): a cancel/group binding stored into a named
 // struct field, either by a local variable ("stored struct") or by a

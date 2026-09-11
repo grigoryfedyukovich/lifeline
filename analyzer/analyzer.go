@@ -54,6 +54,13 @@ type FunctionFact struct {
 	// verify a cross-package callee via Input.LookupParamConsumption,
 	// the direct-parameter-passing counterpart of LoopUnresolved above.
 	ParamConsumption map[int]bool
+	// ParamDoneCalled is model.Function.ParamDoneCalled, unchanged:
+	// calleeDoneParamMatches's own question for a sync.WaitGroup
+	// parameter, distinct from ParamConsumption's (does something
+	// eventually call Done() on it, versus is it eventually Wait()ed or
+	// transferred) -- what lets Input.LookupParamDoneCalled verify the
+	// `wg.Add(1); go worker(&wg)` idiom across a package boundary.
+	ParamDoneCalled map[int]bool
 }
 
 func (*FunctionFact) AFact() {}
@@ -129,11 +136,23 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		consumed, ok = fact.ParamConsumption[index]
 		return consumed, ok
 	}
+	lookupParamDone := func(fn *types.Func, index int) (called, ok bool) {
+		if pass.ImportObjectFact == nil || fn == nil {
+			return false, false
+		}
+		var fact FunctionFact
+		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
+			return false, false
+		}
+		called, ok = fact.ParamDoneCalled[index]
+		return called, ok
+	}
 	cwd, _ := os.Getwd()
 	program, err := frontend.Build(frontend.Input{
 		Fset: pass.Fset, Files: frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd), Pkg: pass.Pkg, Info: pass.TypesInfo,
 		LookupFunctionSummary:   lookup,
 		LookupParamConsumption: lookupParam,
+		LookupParamDoneCalled:  lookupParamDone,
 	}, cfg)
 	if err != nil {
 		return nil, err
@@ -198,6 +217,7 @@ func exportFunctionFacts(pass *analysis.Pass, program model.Program) {
 				ContextStop: summary.ContextStop, ChannelStop: summary.ChannelStop, ExplicitStop: summary.ExplicitStop,
 				LoopUnresolved:   engine.UnresolvedLoop(summary.CFG),
 				ParamConsumption: fn.ParamConsumption,
+				ParamDoneCalled:  fn.ParamDoneCalled,
 			})
 		}
 	}

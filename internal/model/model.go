@@ -384,6 +384,16 @@ type Function struct {
 	// analysis never reached a verified answer for, same as any other
 	// unresolvable case -- never a stand-in for "false".
 	ParamConsumption map[int]bool `json:"param_consumption,omitempty"`
+	// ParamDoneCalled records, by parameter position, whether this
+	// function's own body -- or a further resolvable same-package
+	// function it delegates to, to any depth -- eventually calls Done()
+	// on a sync.WaitGroup parameter there (computeParamDoneCalled's
+	// fixed point, calleeDoneParamMatches's own question, distinct from
+	// ParamConsumption's "is it Wait()ed or transferred"). Exists so a
+	// cross-package caller can answer the `wg.Add(1); go worker(&wg)`
+	// idiom's question the same way a same-package one already can --
+	// see analyzer.go's FunctionFact and Input.LookupParamDoneCalled.
+	ParamDoneCalled map[int]bool `json:"param_done_called,omitempty"`
 }
 
 type Program struct {
