@@ -2844,17 +2844,22 @@ func Start(){
 	}
 }
 
-func TestOrderingSemantics_ReusedWaitGroupSecondRoundUnverified(t *testing.T) {
-	// item 9, the known gap this documents rather than silently ignores:
-	// reusing one WaitGroup for a second round of work with no matching
-	// second Wait() is not caught. Joined is satisfied by the first
-	// Wait() call found anywhere in the function; per-"round" temporal
-	// tracking (is every Add() eventually followed by a Wait() that
-	// precedes the *next* Add()) is a materially larger undertaking than
-	// the reachability and literal-sum checks Phase 6 implements, and is
-	// explicitly out of scope -- see docs/limitations.md. This test
-	// exists so a future fix to this gap is a deliberate, documented
-	// change, not a silent regression either way.
+func TestOrderingSemantics_ReusedWaitGroupSecondRoundNowVerified(t *testing.T) {
+	// item 9, previously a documented, deliberate gap: reusing one
+	// WaitGroup for a second round of work with no matching second
+	// Wait() was not caught, because Joined was satisfied by the first
+	// Wait() call found anywhere in the function. Fixed by
+	// computeGroupRoundBalances: splitting the function's own top-level
+	// statement sequence into segments at each bare Wait() call, and
+	// checking the segment after the *last* one specifically for any
+	// recognized worker-start at all (UnjoinedRound) -- not a per-round
+	// Add/Done imbalance (this round's own counts are perfectly
+	// balanced; the bug is that nothing ever calls Wait() to observe
+	// it), which is why this needed its own field distinct from
+	// CountMismatch rather than reusing it. See docs/limitations.md for
+	// exactly what is and isn't covered (bounded to a straight-line,
+	// top-level sequence; a Wait() or a further round reached only
+	// through a branch or loop is not attempted).
 	diags := analyzeSource(t, `package p
 import "sync"
 func Start(){
@@ -2867,8 +2872,147 @@ func Start(){
 	// second round never waited
 }
 `)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a WaitGroup reused for a second round with no matching second Wait() should now fire LL1003, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_ReusedWaitGroupBothRoundsWaitedDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) { wg.Done() }
+func Start() bool {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go worker(&wg)
+	wg.Wait()
+	wg.Add(1)
+	go worker(&wg)
+	wg.Wait()
+	return true
+}
+`)
 	if len(diags) != 0 {
-		t.Fatalf("documented known gap: a reused WaitGroup's second round is not currently verified; if this now fires, update this test and docs/limitations.md to match the improvement, got %#v", diags)
+		t.Fatalf("a WaitGroup reused for a second round that is itself waited on should not fire, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_ReusedWaitGroupTwoIndependentGroupsNoCrossContamination(t *testing.T) {
+	// wg2's own Wait() call must not be treated as a segmentation
+	// boundary for wg1's own accounting, and vice versa -- segmentation
+	// is per-group (keyed on g.obj), not per-function.
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) { wg.Done() }
+func Start() {
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1)
+	go worker(&wg1)
+	wg2.Add(1)
+	go worker(&wg2)
+	wg2.Wait()
+	wg1.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("two independent WaitGroups, each properly waited on, should not cross-contaminate and should not fire, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_ReusedWaitGroupInLoopNotATopLevelBoundary(t *testing.T) {
+	// A Wait() reached only inside a loop is not a top-level boundary --
+	// computeGroupRoundBalances must not attempt to segment across loop
+	// iterations (see its own doc comment on why: that is exactly the
+	// interval/temporal reasoning this stays narrow to avoid). This
+	// pattern is left entirely to the existing, unrelated loop-scoped
+	// accounting and join-before-owner-return checks.
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) { wg.Done() }
+func Start() {
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go worker(&wg)
+		wg.Wait()
+	}
+}
+`)
+	for _, d := range diags {
+		for _, e := range d.Evidence {
+			if e.Kind == "unjoined-round" {
+				t.Fatalf("a Wait() reached only inside a loop must not be treated as a top-level segmentation boundary, got unjoined-round evidence in %#v", diags)
+			}
+		}
+	}
+}
+
+func TestOrderingSemantics_ReusedWaitGroupNestedBlockFlattened(t *testing.T) {
+	// A Wait() reached only through a bare, unconditionally-executed
+	// nested block (not a loop or conditional) is still a top-level
+	// boundary once flattenTopLevelStmts unwraps it.
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) { wg.Done() }
+func Start() bool {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go worker(&wg)
+	{
+		wg.Wait()
+	}
+	wg.Add(1)
+	go worker(&wg)
+	return true
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a Wait() inside a bare nested block should still be recognized as a top-level boundary via flattening, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_ReusedWaitGroupDeferredWaitNotABoundary(t *testing.T) {
+	// defer wg.Wait() runs at function exit, not inline at that point, so
+	// it must not be treated as a segmentation boundary the way a bare,
+	// sequential wg.Wait() is.
+	diags := analyzeSource(t, `package p
+import "sync"
+func worker(wg *sync.WaitGroup) { wg.Done() }
+func Start() {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	wg.Add(1)
+	go worker(&wg)
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a deferred wg.Wait() should not be treated as an inline segmentation boundary, got %#v", diags)
+	}
+}
+
+func TestOrderingSemantics_ReusedWaitGroupEarlierRoundCumulativeMismatch(t *testing.T) {
+	// The check at each intermediate Wait() call is cumulative from the
+	// start of the function, not that Wait()'s own segment in isolation:
+	// Wait() blocks based on the counter's value at the point it's
+	// reached, which includes every earlier segment's contribution. Here
+	// the whole-function total is balanced (Add(1), and a Done() later
+	// in the function) -- computeGroupBalances' own flat, whole-function
+	// tally would not catch this -- but the *first* Wait() call is
+	// reached with the counter still at 1, since the balancing Done()
+	// call happens only afterward: that Wait() may block forever.
+	diags := analyzeSource(t, `package p
+import "sync"
+func neverCalls(wg *sync.WaitGroup) { _ = wg }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go neverCalls(&wg)
+	wg.Wait()
+	wg.Done()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("an intermediate Wait() reached with the counter still nonzero (even though the whole-function total later balances) should fire LL1003, got %#v", diags)
 	}
 }
 

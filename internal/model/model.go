@@ -132,6 +132,20 @@ type JoinGroup struct {
 	// a mere inability to prove the safe order, only from a positive CFG
 	// proof of the unsafe one.
 	StopAfterWait bool `json:"stop_after_wait"`
+	// UnjoinedRound is true iff a sync.WaitGroup is reused for a further
+	// round of asynchronous work (a `go` statement recognized as a
+	// worker-start, computeGroupRoundBalances) after this group's own
+	// last top-level Wait() call, with no further Wait() to join that
+	// round before the owner returns. This is a different failure from
+	// CountMismatch: the Add/Done counts for that round can be perfectly
+	// balanced (the worker does call Done()) and this can still be true
+	// -- the bug is the missing synchronization point itself, not an
+	// imbalance in what's being synchronized. Never true from an
+	// inability to verify: a Wait() reached only through a branch or a
+	// loop, a conditionally-started round, or a round whose own worker-
+	// start isn't itself a recognized shape, all leave this false. Always
+	// false for an errgroup.Group, for the same reason CountMismatch is.
+	UnjoinedRound bool `json:"unjoined_round"`
 }
 
 // BlockID identifies a basic block within a CFG. It is stable within a

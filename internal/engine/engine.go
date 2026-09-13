@@ -125,13 +125,18 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 			}
 			// Phase 3 completion (docs/cfg-migration-plan.md): what used to
 			// be a single flat "was Wait observed anywhere" check is now
-			// three independently-verified questions, each with its own
+			// four independently-verified questions, each with its own
 			// message so the finding says which one actually failed --
 			// unjoined (unchanged from before this phase), joined but not
 			// on every path back to the owner's return (join-before-owner-
-			// return), and joined on every path but literal accounting
-			// still proves an outstanding worker (count intervals). Only
-			// the unjoined case existed before; the other two are real,
+			// return), joined on every path but literal accounting still
+			// proves an outstanding worker (count intervals), and joined at
+			// least once but a further round of work started after that
+			// group's last Wait() call is never itself joined (second-round
+			// reuse -- computeGroupRoundBalances -- a different failure from
+			// count intervals: that round's own Add/Done can be perfectly
+			// balanced, the bug is the missing Wait() itself). Only the
+			// unjoined case existed originally; the other three are real,
 			// checked findings the old flat Joined bool could not tell
 			// apart from "everything's fine". JoinedOnAllPaths == nil (not
 			// established at all -- no CFG, or Joined came from a
@@ -140,13 +145,15 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 			// meaning: this only ever downgrades a verdict on positive
 			// evidence, never on an inability to check.
 			joinedOnAllPaths := group.JoinedOnAllPaths == nil || *group.JoinedOnAllPaths
-			if !(group.Joined && joinedOnAllPaths && !group.CountMismatch) {
+			if !(group.Joined && joinedOnAllPaths && !group.CountMismatch && !group.UnjoinedRound) {
 				rule, protocol, msg := "LL1003", "waitgroup-join", ""
 				switch {
 				case !group.Joined:
 					msg = fmt.Sprintf("%s %q accounts for %d worker start(s) but no Wait or ownership transfer is observed", group.Kind, group.Name, group.Starts)
 				case !joinedOnAllPaths:
 					msg = fmt.Sprintf("%s %q is joined on some but not every path back to the owner's return", group.Kind, group.Name)
+				case group.UnjoinedRound:
+					msg = fmt.Sprintf("%s %q starts a further round of work after its last observed Wait call, with no further Wait to join it", group.Kind, group.Name)
 				default: // group.CountMismatch
 					msg = fmt.Sprintf("%s %q is joined on every path, but literal Add/Done accounting proves an outstanding worker; Wait may never return", group.Kind, group.Name)
 				}
@@ -156,6 +163,8 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 					// keep the default suggestion above
 				case !joinedOnAllPaths:
 					suggestion = "move the Wait call so every return path reaches it, e.g. with defer"
+				case group.UnjoinedRound:
+					suggestion = "add a further Wait call to join that later round of work"
 				default: // group.CountMismatch
 					suggestion = "check every Add call is matched by exactly one Done, including on early-return paths"
 				}
@@ -186,9 +195,13 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 				// completely unmentioned in the actionable text, to be
 				// discovered only on a second run after the first fix, if
 				// at all.
-				if group.CountMismatch && (!group.Joined || !joinedOnAllPaths) {
+				if group.CountMismatch && (!group.Joined || !joinedOnAllPaths || group.UnjoinedRound) {
 					msg += "; independently, literal Add/Done accounting also shows an outstanding worker"
 					suggestion += "; also check every Add call is matched by exactly one Done, including on early-return paths"
+				}
+				if group.UnjoinedRound && (!group.Joined || !joinedOnAllPaths) {
+					msg += "; independently, a further round of work after the last Wait call is never joined"
+					suggestion += "; also add a further Wait call for that later round"
 				}
 				if group.Kind == "errgroup" {
 					rule, protocol = "LL1004", "errgroup-join"

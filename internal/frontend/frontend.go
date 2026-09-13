@@ -494,6 +494,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn, source.obj)
 	resolveAliasEscapes(states, groups)
 	b.computeGroupBalances(groups, fd.Body, b.in.Info)
+	b.computeGroupRoundBalances(groups, fd.Body, b.in.Info)
 	// computeGroupOrdering needs real control-flow reachability, not
 	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
 	// receiving a tracked context is trusted to eventually terminate",
@@ -2629,7 +2630,18 @@ func (b *builder) markChildUses(call *ast.CallExpr, cancels []*cancelState) {
 // exclusive arm of a conditional. See computeGroupBalances.
 type groupBalance struct {
 	addTotal, doneTotal int
-	fullyKnown          bool
+	// spawned counts specifically how many `go` statements were
+	// recognized as a legitimate worker-start for this group
+	// (noteSpawnedDoneInto), independent of doneTotal: a spawned worker
+	// that itself calls Done() still contributes to both, but only
+	// spawned distinguishes "asynchronous work was started here" from a
+	// synchronous, inline Add()/Done() pair that never needed a Wait()
+	// at all -- see computeGroupRoundBalances, the one consumer that
+	// cares about this distinction specifically for a function's
+	// trailing segment (the one after its last Wait(), which by
+	// definition has no Wait() of its own to close it out).
+	spawned    int
+	fullyKnown bool
 }
 
 // loopScope accumulates same-idiom Add(1)/spawned-Done counts found
@@ -2679,6 +2691,157 @@ func (b *builder) computeGroupBalances(groups []*groupState, body *ast.BlockStmt
 			})
 		}
 	}
+}
+
+// computeGroupRoundBalances catches a specific bug computeGroupBalances'
+// own single, whole-function tally cannot: reusing one WaitGroup for a
+// second round of work with no matching second Wait(). That whole-
+// function tally treats `wg.Add(1); go worker(&wg); wg.Wait(); wg.Add(1);
+// go worker(&wg); return` (a genuine bug -- the second round is never
+// waited on) as perfectly balanced, since it only ever sums Add and Done
+// across the entire function; and Joined itself is satisfied by the
+// first Wait() call found anywhere, so neither existing check reports
+// anything.
+//
+// The fix: split the function's own top-level statement sequence into
+// segments at each bare, top-level `wg.Wait()` call (splitAtTopLevelWait)
+// and evaluate each segment against the *specific* thing that could go
+// wrong for it:
+//
+//   - The segment after this group's last Wait() call (the "trailing"
+//     segment) has, by construction, no Wait() of its own following it.
+//     If it contains a recognized worker-start (bal.spawned > 0) at all,
+//     that round is never joined -- regardless of whether its own
+//     Add/Done happen to balance (a spawned worker that does call Done()
+//     is still a real bug here: the counter reaching zero eventually
+//     doesn't help if nothing ever calls Wait() to observe it). This is
+//     UnjoinedRound, a different failure from CountMismatch: the missing
+//     synchronization point itself, not an imbalance in what's being
+//     synchronized.
+//   - Every other segment *is* followed by a Wait() call, and that
+//     Wait() blocks based on the counter's cumulative value at the point
+//     it's reached -- not that one segment's own isolated contribution --
+//     so segments are accumulated in execution order and checked after
+//     each one: if the running total is fullyKnown and its addTotal
+//     exceeds its doneTotal at the point a Wait() is reached, that
+//     specific Wait() call may block forever. This is CountMismatch,
+//     the same field and meaning computeGroupBalances' own whole-function
+//     check already uses, just caught at the earliest Wait() call it
+//     actually affects rather than only at the end of the function.
+//
+// Deliberately bounded to the function's own top-level, straight-line
+// sequence (flattenTopLevelStmts unwraps a bare nested block or labeled
+// statement, since those are just syntactic scope and always run in
+// order regardless; a loop or conditional's own body is left untouched,
+// opaque, exactly like computeGroupBalances treats it) -- a Wait()
+// reached only through a branch or only on some loop iterations does not
+// unconditionally close a round the way a bare, top-level one does, and
+// reasoning about that soundly would mean the interval/temporal analysis
+// this stays narrow enough to avoid. A `defer wg.Wait()` is deliberately
+// not treated as a boundary either (isWaitCall only matches a bare
+// expression statement, not a DeferStmt): it runs at function exit, not
+// inline at that point, so it cannot close out an earlier round the way
+// a plain, sequential call does.
+func (b *builder) computeGroupRoundBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info) {
+	if body == nil {
+		return
+	}
+	for _, g := range groups {
+		if g.group.Kind != "waitgroup" || g.obj == nil {
+			continue
+		}
+		segments := splitAtTopLevelWait(flattenTopLevelStmts(body.List), g.obj, info)
+		if len(segments) < 2 {
+			continue // no top-level Wait() found for this group at all
+		}
+		running := groupBalance{fullyKnown: true}
+		for i, seg := range segments {
+			bal := b.walkGroupBalanceStmts(seg, g.obj, info)
+			if i == len(segments)-1 {
+				// Trailing segment: no Wait() follows it by construction.
+				if bal.spawned > 0 {
+					g.group.UnjoinedRound = true
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{
+						Kind:    "unjoined-round",
+						Message: "a further round of work is started after this group's last Wait call, with no further Wait to join it",
+					})
+				}
+				break
+			}
+			running.addTotal += bal.addTotal
+			running.doneTotal += bal.doneTotal
+			if !bal.fullyKnown {
+				running.fullyKnown = false
+			}
+			if running.fullyKnown && running.addTotal > running.doneTotal && !g.group.CountMismatch {
+				g.group.CountMismatch = true
+				g.group.Evidence = append(g.group.Evidence, model.Evidence{
+					Kind:    "count-mismatch",
+					Message: fmt.Sprintf("literal accounting shows %d more Add than Done by this group's Wait call %d; that call may never return", running.addTotal-running.doneTotal, i+1),
+				})
+			}
+		}
+	}
+}
+
+// flattenTopLevelStmts expands every bare, unconditionally-executed
+// nested block (`{ ... }`, not an if/for/switch/etc.'s own body) and
+// labeled statement into its own constituent statements, in the same
+// order, so a Wait() call reached only through such wrapping is still
+// recognized as the same kind of unconditional, top-level boundary a
+// bare one at the function's own top level would be. A loop or
+// conditional's own body is deliberately left untouched, opaque to this
+// flattening: nothing inside either is guaranteed to run at all, let
+// alone exactly once, the way a bare block's contents are.
+func flattenTopLevelStmts(list []ast.Stmt) []ast.Stmt {
+	var out []ast.Stmt
+	for _, s := range list {
+		switch x := s.(type) {
+		case *ast.BlockStmt:
+			out = append(out, flattenTopLevelStmts(x.List)...)
+		case *ast.LabeledStmt:
+			out = append(out, flattenTopLevelStmts([]ast.Stmt{x.Stmt})...)
+		default:
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// isWaitCall reports whether s is a bare `obj.Wait()` expression
+// statement -- not a DeferStmt (see computeGroupRoundBalances' own doc
+// comment for why a deferred Wait() is never treated as a boundary), and
+// not wrapped in any further expression form.
+func isWaitCall(s ast.Stmt, obj types.Object, info *types.Info) bool {
+	exprStmt, ok := s.(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	call, ok := exprStmt.X.(*ast.CallExpr)
+	if !ok || selectorReceiverObject(call.Fun, info) != obj {
+		return false
+	}
+	return selectorMethod(call.Fun) == "Wait"
+}
+
+// splitAtTopLevelWait splits list into consecutive segments at each
+// element isWaitCall matches for obj, returning one more segment than
+// the number of such calls found (an empty leading or trailing segment
+// is possible, and fine: walkGroupBalanceStmts on an empty list is
+// trivially, fully-known balanced). The Wait() statement itself is
+// excluded from both neighboring segments -- it has nothing of its own
+// to contribute to Add/Done accounting.
+func splitAtTopLevelWait(list []ast.Stmt, obj types.Object, info *types.Info) [][]ast.Stmt {
+	segments := [][]ast.Stmt{{}}
+	for _, s := range list {
+		if isWaitCall(s, obj, info) {
+			segments = append(segments, []ast.Stmt{})
+			continue
+		}
+		last := len(segments) - 1
+		segments[last] = append(segments[last], s)
+	}
+	return segments
 }
 
 // walkGroupBalance computes obj's own Add()/Done() accounting for the
@@ -2860,6 +3023,7 @@ func noteDoneInto(bal *groupBalance, scope *loopScope) {
 func noteSpawnedDoneInto(bal *groupBalance, scope *loopScope) {
 	if scope == nil {
 		bal.doneTotal++
+		bal.spawned++
 		return
 	}
 	scope.spawnedDones++
