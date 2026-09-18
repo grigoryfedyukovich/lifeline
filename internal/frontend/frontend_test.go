@@ -1657,6 +1657,183 @@ func Start(parent context.Context) {
 	}
 }
 
+// The following tests cover computeConstructorCallerConsumption's own
+// fixed point (previously a single verified hop, matching Phase 5's own
+// one-hop guarantee for direct parameter passing before that too became
+// a fixed point -- this brought constructor-ownership tracking in line
+// with it): a caller that itself just returns the constructor's result
+// onward, in either shape (`h, ctx := New(parent); return h, ctx` or a
+// bare `return New(parent)`), is registered as a further, equally valid
+// site for the same binding, so a chain of several pass-through wrappers
+// is resolved to any depth and regardless of declaration order.
+
+func TestFieldOwnership_ConstructorBareReturnPassThroughTwoHop(t *testing.T) {
+	drop := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func New(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+func Middle(parent context.Context) (*Handle, context.Context) {
+	return New(parent)
+}
+func Start(parent context.Context) {
+	h, ctx := Middle(parent)
+	_ = h
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+		t.Fatalf("a two-hop bare pass-through (Middle returns New's result directly) ending in a drop should fire LL1001, got %#v", drop)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func New(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+func Middle(parent context.Context) (*Handle, context.Context) {
+	return New(parent)
+}
+func Start(parent context.Context) {
+	h, ctx := Middle(parent)
+	h.Cancel()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("a two-hop bare pass-through ending in consumption should not fire, got %#v", consumed)
+	}
+}
+
+func TestFieldOwnership_ConstructorThreeHopCallerFirstDeclaredStillVerifies(t *testing.T) {
+	// Start (the eventual dropper) is declared before Outer, which is
+	// declared before Middle, which is declared before New -- the
+	// harder direction, requiring the sweep to run to convergence rather
+	// than resolving in a single declaration-order pass.
+	drop := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start(parent context.Context) {
+	h, ctx := Outer(parent)
+	_ = h
+	go func() { <-ctx.Done() }()
+}
+func Outer(parent context.Context) (*Handle, context.Context) {
+	return Middle(parent)
+}
+func Middle(parent context.Context) (*Handle, context.Context) {
+	return New(parent)
+}
+func New(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1001" {
+		t.Fatalf("a three-hop chain in caller-first declaration order ending in a drop should fire LL1001, got %#v", drop)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start(parent context.Context) {
+	h, ctx := Outer(parent)
+	h.Cancel()
+	go func() { <-ctx.Done() }()
+}
+func Outer(parent context.Context) (*Handle, context.Context) {
+	return Middle(parent)
+}
+func Middle(parent context.Context) (*Handle, context.Context) {
+	return New(parent)
+}
+func New(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("the same three-hop chain ending in consumption should not fire, got %#v", consumed)
+	}
+}
+
+func TestFieldOwnership_ConstructorMixedPassThroughShapesChain(t *testing.T) {
+	// Middle uses a bare `return New(parent)`; Outer uses an
+	// intermediate `h, ctx := Middle(parent); return h, ctx` -- both
+	// pass-through shapes chained together in the same three-hop path.
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func New(parent context.Context) (*Handle, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}, ctx
+}
+func Middle(parent context.Context) (*Handle, context.Context) {
+	return New(parent)
+}
+func Outer(parent context.Context) (*Handle, context.Context) {
+	h, ctx := Middle(parent)
+	return h, ctx
+}
+func Start(parent context.Context) {
+	h, ctx := Outer(parent)
+	_ = h
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("a chain mixing both pass-through shapes should still resolve and fire LL1001, got %#v", diags)
+	}
+}
+
+func TestFieldOwnership_ConstructorGroupPassThroughTwoHop(t *testing.T) {
+	drop := analyzeSource(t, `package p
+import "sync"
+type Handle struct{ WG *sync.WaitGroup }
+func New() *Handle {
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() { defer wg.Done() }()
+	return &Handle{WG: wg}
+}
+func Middle() *Handle {
+	return New()
+}
+func Start() {
+	h := Middle()
+	_ = h
+}
+`)
+	if len(drop) != 1 || drop[0].RuleID != "LL1003" {
+		t.Fatalf("a two-hop group pass-through ending in a drop should fire LL1003, got %#v", drop)
+	}
+
+	joined := analyzeSource(t, `package p
+import "sync"
+type Handle struct{ WG *sync.WaitGroup }
+func New() *Handle {
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() { defer wg.Done() }()
+	return &Handle{WG: wg}
+}
+func Middle() *Handle {
+	return New()
+}
+func Start() {
+	h := Middle()
+	h.WG.Wait()
+}
+`)
+	if len(joined) != 0 {
+		t.Fatalf("a two-hop group pass-through ending in Wait() should not fire, got %#v", joined)
+	}
+}
+
 // TestFieldOwnership_ExportedReturnFieldSitesPopulatedForConstructor
 // confirms model.Function.ReturnFieldSites -- the plain, object-free
 // shape a fact carries -- is populated correctly for a same-package
