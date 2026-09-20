@@ -199,6 +199,14 @@ type builder struct {
 	startWrappers          map[string]struct{}
 	joinWrappers           map[string]struct{}
 	stopWrappers           map[string]struct{}
+
+	// receiverSummaries memoizes receiverSummaryOf's per-method result
+	// (what a same-package method body does with its own receiver), and
+	// receiverStack is the chain of methods currently being summarized --
+	// the cycle guard that keeps a mutually recursive pair of methods
+	// from looping forever. See receiverSummaryOf.
+	receiverSummaries map[*types.Func]*receiverSummary
+	receiverStack     []*types.Func
 }
 
 // returnFieldSite is the shape computeFieldOwnership records into
@@ -368,6 +376,7 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		startWrappers:          stringSet(cfg.StartWrappers),
 		joinWrappers:           stringSet(cfg.JoinWrappers),
 		stopWrappers:           stringSet(cfg.StopWrappers),
+		receiverSummaries:      map[*types.Func]*receiverSummary{},
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
@@ -2204,11 +2213,17 @@ func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*
 // captured variable (id, resolving to obj, tracked by fcs) means for
 // resolveFieldCaptures' final verdict:
 //
-//   - h.otherField or h.otherMethod(...), where otherField/otherMethod
-//     doesn't match any of fcs' own field names: an incidental, harmless
-//     use of the same variable for something unrelated (e.g. reading a
-//     sibling field for a log message) -- neither consumption nor
-//     disqualifying, so it is silently ignored.
+//   - h.otherField, where otherField doesn't match any of fcs' own field
+//     names: an incidental, harmless use of the same variable for
+//     something unrelated (e.g. reading a sibling field for a log
+//     message) -- neither consumption nor disqualifying, so it is
+//     silently ignored.
+//   - h.method(...), where method is a method (not a field): followed
+//     into the method's own body by followHandleMethod, which credits
+//     whichever of fcs' fields that body consumes (through the receiver,
+//     to any depth of same-package method calls) back to this call site,
+//     and falls back to otherUse if the body can't be seen or does
+//     something with the receiver this check does not follow.
 //   - h.field(...), where field matches a tracked cancel binding's field
 //     name and the selector is itself being called: verified consumption
 //     -- marks Called and records evidence, the same shape a direct
@@ -2238,13 +2253,18 @@ func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj t
 			}
 		}
 		if !matches {
-			return // an unrelated field/method access through the same variable; harmless
+			// Either an unrelated field (harmless) or a method call
+			// through the handle, whose body may well consume one of the
+			// tracked fields on the handle's behalf (`w.Stop()` calling
+			// `w.cancel()`) -- see followHandleMethod.
+			b.followHandleMethod(stack, sel, obj, fcs, consumed, otherUse)
+			return
 		}
 		grand := ancestor(stack, 2)
 		if call, ok := grand.(*ast.CallExpr); ok && call.Fun == ast.Expr(sel) {
 			for _, fc := range fcs {
 				if fc.cancel != nil && fc.fieldName == fieldName {
-					b.markCancelFieldConsumed(fc, consumed, call)
+					b.markCancelFieldConsumed(fc, consumed, call, "")
 					return
 				}
 			}
@@ -2255,7 +2275,7 @@ func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj t
 				if call, ok := ancestor(stack, 3).(*ast.CallExpr); ok && call.Fun == ast.Expr(outer) {
 					for _, fc := range fcs {
 						if fc.group != nil && fc.fieldName == fieldName {
-							b.markGroupFieldConsumed(fc, method, consumed, call)
+							b.markGroupFieldConsumed(fc, method, consumed, call, "")
 							return
 						}
 					}
@@ -2287,17 +2307,342 @@ func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj t
 	otherUse[obj] = true
 }
 
+// noReceiverCycle is receiverSummaryOf's "no cycle detected" marker: larger
+// than any real receiverStack index, so taking a minimum over several
+// results leaves it untouched unless one of them actually saw a cycle.
+const noReceiverCycle = int(^uint(0) >> 1)
+
+// maxReceiverDepth bounds how deep receiverSummaryOf follows a chain of
+// same-package method calls on the same receiver. Real chains are a
+// handful of methods long; the bound exists only so a pathological or
+// generated call graph cannot make one handle's verdict arbitrarily
+// expensive. Hitting it is treated as "cannot resolve" (assume
+// transferred), never as "not consumed".
+const maxReceiverDepth = 16
+
+// receiverSummary is what one same-package method's own body does with its
+// receiver variable, recorded independently of which fields any particular
+// caller happens to be tracking -- which is what makes it safe to memoize
+// per method (builder.receiverSummaries) and reuse for every handle whose
+// type has that method. It is the method-call analog of
+// paramConsumption for a bare cancel parameter: the same "is it called,
+// or does it go somewhere this check can't follow" question, asked of a
+// struct's fields through its receiver instead of a function's
+// parameter.
+type receiverSummary struct {
+	// called holds the name of every direct field of the receiver that
+	// the body (or a further same-package method it calls on the same
+	// receiver) calls: `r.f()`.
+	called map[string]bool
+	// waited holds every direct field the body joins: `r.f.Wait()`.
+	// Add/Go through a field are deliberately not recorded: they don't
+	// consume anything, and crediting worker starts made inside a method
+	// to the caller's own Add/Done accounting is a separate, larger
+	// question than this summary answers.
+	waited map[string]bool
+	// fieldEscaped holds every direct field the body references in any
+	// way other than the calls above (nil-checked, assigned, passed on,
+	// method called through it other than Wait/Add/Go, ...) -- the
+	// receiver-side twin of classifyFieldCaptureUse's "anything else"
+	// fallback for a tracked field.
+	fieldEscaped map[string]bool
+	// escapes is true if the receiver itself is used in a way this check
+	// does not follow: returned, passed as an argument, assigned
+	// anywhere, method value taken without being called, or the body of
+	// a further method call on it could not be resolved.
+	escapes bool
+}
+
+func newReceiverSummary() *receiverSummary {
+	return &receiverSummary{called: map[string]bool{}, waited: map[string]bool{}, fieldEscaped: map[string]bool{}}
+}
+
+// merge folds o (a further method's summary, reached through a call on
+// the same receiver) into s.
+func (s *receiverSummary) merge(o *receiverSummary) {
+	for f := range o.called {
+		s.called[f] = true
+	}
+	for f := range o.waited {
+		s.waited[f] = true
+	}
+	for f := range o.fieldEscaped {
+		s.fieldEscaped[f] = true
+	}
+	s.escapes = s.escapes || o.escapes
+}
+
+// receiverObject returns the receiver variable declared by decl, or nil
+// if there is none a body could refer to (a plain function, an unnamed
+// receiver, or `_`).
+func (b *builder) receiverObject(decl *ast.FuncDecl) types.Object {
+	if decl.Recv == nil || len(decl.Recv.List) != 1 {
+		return nil
+	}
+	names := decl.Recv.List[0].Names
+	if len(names) != 1 || names[0].Name == "_" {
+		return nil
+	}
+	return b.in.Info.Defs[names[0]]
+}
+
+// followHandleMethod is classifyFieldCaptureUse's handling of `h.M`
+// where M is not one of the fields being tracked. If M is a field, it is
+// simply an unrelated sibling and harmless. If M is a method, its body
+// may consume a tracked field on the handle's behalf -- the ordinary
+// shape of a handle type (`func (w *Worker) Stop() { w.cancel() }`),
+// which classifyFieldCaptureUse used to ignore entirely, leaving the
+// capture "never consumed" and firing LL1001/LL1003 on code that in fact
+// stops its worker.
+//
+// The verdict comes from receiverSummaryOf(M):
+//
+//   - a tracked cancel field the method calls, or a tracked group field
+//     it Waits, is credited as consumed at *this* call (the caller's
+//     `h.M()`), the same bookkeeping a direct `h.cancel()` gets;
+//   - a method that cannot be resolved to a same-package body (another
+//     package, an interface, beyond max_functions), that is not called
+//     directly (a method value), or that does anything with the receiver
+//     itself this check does not follow (see receiverSummary.escapes),
+//     marks the handle otherUse -- the same conservative
+//     assume-transferred fallback the rest of this mechanism uses;
+//   - a tracked field the method touches in some other way (see
+//     receiverSummary.fieldEscaped) and does not consume also marks
+//     otherUse;
+//   - anything else -- the method exists, is fully visible, and simply
+//     doesn't consume this field -- leaves that field unconsumed, so a
+//     handle whose method only consumes *some* of its fields still gets
+//     its remaining fields reported.
+//
+// A method promoted from an embedded struct (a selection through more
+// than one field) is ignored: its receiver is the embedded value, which
+// cannot reach the enclosing struct's own tracked fields.
+func (b *builder) followHandleMethod(stack []ast.Node, sel *ast.SelectorExpr, obj types.Object, fcs []*fieldCapture, consumed map[*fieldCapture]bool, otherUse map[types.Object]bool) {
+	selection := b.in.Info.Selections[sel]
+	if selection == nil || selection.Kind() != types.MethodVal {
+		return // an unrelated field access through the same variable; harmless
+	}
+	if len(selection.Index()) != 1 {
+		return // promoted from an embedded field: cannot see this handle's own fields
+	}
+	call, isCall := ancestor(stack, 2).(*ast.CallExpr)
+	if !isCall || call.Fun != ast.Expr(sel) {
+		// `f := h.Stop` / `defer h.Stop` / passed as a value: the call
+		// happens somewhere this check does not follow.
+		otherUse[obj] = true
+		return
+	}
+	fn, _ := selection.Obj().(*types.Func)
+	if fn == nil {
+		otherUse[obj] = true
+		return
+	}
+	sum, _, ok := b.receiverSummaryOf(fn)
+	if !ok {
+		otherUse[obj] = true
+		return
+	}
+	for _, fc := range fcs {
+		switch {
+		case fc.cancel != nil && sum.called[fc.fieldName]:
+			b.markCancelFieldConsumed(fc, consumed, call, fn.Name())
+		case fc.group != nil && sum.waited[fc.fieldName]:
+			b.markGroupFieldConsumed(fc, "Wait", consumed, call, fn.Name())
+		}
+	}
+	if sum.escapes {
+		otherUse[obj] = true
+		return
+	}
+	for _, fc := range fcs {
+		if sum.fieldEscaped[fc.fieldName] && !consumed[fc] {
+			otherUse[obj] = true
+			return
+		}
+	}
+}
+
+// receiverSummaryOf summarizes what fn's own body does with its receiver
+// (see receiverSummary), following further method calls on that same
+// receiver into their own bodies. ok is false when fn has no same-package
+// body this build can inspect (a different package, an interface method,
+// a method beyond the max_functions bound, or a chain deeper than
+// maxReceiverDepth): the caller must treat that as "unresolved", never as
+// "does not consume".
+//
+// Results are memoized per method, except that a summary computed while a
+// cycle back into an in-progress method was hit is incomplete for
+// everything above that cycle's entry point (the cycle's contribution was
+// cut off to guarantee termination) and must not be cached: the second
+// return value is the lowest receiverStack index of any such cycle target
+// (noReceiverCycle if none), which each frame compares against its own
+// index to decide whether its result is complete. A frame that is itself
+// the cycle target is complete -- its own walk already covers everything
+// the cycle would have re-added -- so the marker stops there.
+func (b *builder) receiverSummaryOf(fn *types.Func) (sum *receiverSummary, lowestCycle int, ok bool) {
+	fn = fn.Origin()
+	decl := b.funcs[fn]
+	if decl == nil || decl.Body == nil || decl.Recv == nil || !b.analyzed[fn] {
+		return nil, noReceiverCycle, false
+	}
+	if done, cached := b.receiverSummaries[fn]; cached {
+		return done, noReceiverCycle, true
+	}
+	for i, active := range b.receiverStack {
+		if active == fn {
+			return newReceiverSummary(), i, true
+		}
+	}
+	if len(b.receiverStack) >= maxReceiverDepth {
+		// -1 (lower than any real index) keeps every frame above from
+		// caching a result that depended on where the chain happened to
+		// start.
+		return nil, -1, false
+	}
+	index := len(b.receiverStack)
+	b.receiverStack = append(b.receiverStack, fn)
+	sum = newReceiverSummary()
+	lowestCycle = noReceiverCycle
+	if recv := b.receiverObject(decl); recv != nil {
+		lowestCycle = b.walkReceiverUses(decl.Body, recv, sum)
+	}
+	b.receiverStack = b.receiverStack[:index]
+	if lowestCycle >= index {
+		b.receiverSummaries[fn] = sum
+		lowestCycle = noReceiverCycle
+	}
+	return sum, lowestCycle, true
+}
+
+// walkReceiverUses classifies every occurrence of recv in body into sum,
+// using the same explicit-ancestor-stack idiom walkFieldCaptureUses does,
+// and returns the lowest cycle marker any of them reported (see
+// receiverSummaryOf).
+func (b *builder) walkReceiverUses(body *ast.BlockStmt, recv types.Object, sum *receiverSummary) int {
+	lowest := noReceiverCycle
+	var stack []ast.Node
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if id, ok := n.(*ast.Ident); ok && b.in.Info.Uses[id] == recv {
+			if low := b.classifyReceiverUse(stack, id, sum); low < lowest {
+				lowest = low
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+	return lowest
+}
+
+// classifyReceiverUse is classifyFieldCaptureUse's counterpart for one
+// occurrence of a method's own receiver variable, recording into sum
+// rather than into any particular capture's verdict. It returns a cycle
+// marker exactly as receiverSummaryOf defines it.
+func (b *builder) classifyReceiverUse(stack []ast.Node, id *ast.Ident, sum *receiverSummary) int {
+	switch parent := ancestor(stack, 1).(type) {
+	case *ast.SelectorExpr:
+		if parent.X != ast.Expr(id) {
+			sum.escapes = true
+			return noReceiverCycle
+		}
+		selection := b.in.Info.Selections[parent]
+		if selection == nil {
+			sum.escapes = true
+			return noReceiverCycle
+		}
+		switch selection.Kind() {
+		case types.FieldVal:
+			if len(selection.Index()) == 1 {
+				b.classifyReceiverFieldUse(stack, parent, sum)
+			}
+			// A promoted field (through an embedded struct) can't be one
+			// of the keyed-literal fields anything tracks.
+		case types.MethodVal:
+			if len(selection.Index()) != 1 {
+				return noReceiverCycle // promoted: cannot reach this receiver's own fields
+			}
+			call, isCall := ancestor(stack, 2).(*ast.CallExpr)
+			callee, _ := selection.Obj().(*types.Func)
+			if !isCall || call.Fun != ast.Expr(parent) || callee == nil {
+				sum.escapes = true
+				return noReceiverCycle
+			}
+			calleeSum, low, ok := b.receiverSummaryOf(callee)
+			if !ok {
+				sum.escapes = true
+				return low
+			}
+			sum.merge(calleeSum)
+			return low
+		default:
+			sum.escapes = true
+		}
+	case *ast.AssignStmt:
+		for i, rhs := range parent.Rhs {
+			if rhs == ast.Expr(id) && pairedLHSIsBlank(parent, i) {
+				return noReceiverCycle // `_ = r`: not a real use
+			}
+		}
+		sum.escapes = true
+	default:
+		// Returned, passed as an argument, stored, address taken, ranged
+		// over, ...: not something this check follows.
+		sum.escapes = true
+	}
+	return noReceiverCycle
+}
+
+// classifyReceiverFieldUse records what one `r.f` (a direct field of the
+// receiver) is used for, mirroring the tracked-field half of
+// classifyFieldCaptureUse: called, Waited, Add/Go'd (neutral), or
+// anything else (fieldEscaped).
+func (b *builder) classifyReceiverFieldUse(stack []ast.Node, sel *ast.SelectorExpr, sum *receiverSummary) {
+	field := sel.Sel.Name
+	grand := ancestor(stack, 2)
+	if call, ok := grand.(*ast.CallExpr); ok && call.Fun == ast.Expr(sel) {
+		sum.called[field] = true
+		return
+	}
+	if outer, ok := grand.(*ast.SelectorExpr); ok && outer.X == ast.Expr(sel) {
+		if call, ok := ancestor(stack, 3).(*ast.CallExpr); ok && call.Fun == ast.Expr(outer) {
+			switch outer.Sel.Name {
+			case "Wait":
+				sum.waited[field] = true
+				return
+			case "Add", "Go":
+				return
+			}
+		}
+	}
+	sum.fieldEscaped[field] = true
+}
+
 // markCancelFieldConsumed records verified consumption of a cancel
 // binding through a struct field: the same Called flag and call-site
 // bookkeeping a direct `cancel()` call gets from observeCall, so every
 // downstream consumer (LL1001's own check, computeGroupOrdering's stop-
 // signal detection) treats the two identically.
-func (b *builder) markCancelFieldConsumed(fc *fieldCapture, consumed map[*fieldCapture]bool, call *ast.CallExpr) {
+//
+// via is empty for a call made directly through the field (`h.cancel()`),
+// and otherwise names the same-package method (`h.Stop()`) whose own body
+// makes that call on the handle's behalf -- in which case call is still
+// the *caller's* call expression (`h.Stop()`), never a node inside the
+// method's body: computeGroupOrdering and the LL1005 stop-signal check
+// look call sites up in the CFG of the function being analyzed, which
+// only contains the caller's own nodes.
+func (b *builder) markCancelFieldConsumed(fc *fieldCapture, consumed map[*fieldCapture]bool, call *ast.CallExpr, via string) {
+	message := fmt.Sprintf("cancellation function is called through field %q", fc.fieldName)
+	if via != "" {
+		message = fmt.Sprintf("cancellation function is called through field %q inside method %s", fc.fieldName, via)
+	}
 	consumed[fc] = true
 	fc.cancel.binding.Called = true
 	fc.cancel.callSites = append(fc.cancel.callSites, call)
 	fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{
-		Kind: "field-consumed", Message: fmt.Sprintf("cancellation function is called through field %q", fc.fieldName), Span: ptrSpan(b.span(call)),
+		Kind: "field-consumed", Message: message, Span: ptrSpan(b.span(call)),
 	})
 }
 
@@ -2311,7 +2656,10 @@ func (b *builder) markCancelFieldConsumed(fc *fieldCapture, consumed map[*fieldC
 // consumption/return/other-use verdict for its own sake, since seeing a
 // worker started through the field says nothing about whether it is
 // ever joined through the field too.
-func (b *builder) markGroupFieldConsumed(fc *fieldCapture, method string, consumed map[*fieldCapture]bool, call *ast.CallExpr) {
+//
+// via has the same meaning as in markCancelFieldConsumed; only Wait is
+// ever credited through a method (see followHandleMethod).
+func (b *builder) markGroupFieldConsumed(fc *fieldCapture, method string, consumed map[*fieldCapture]bool, call *ast.CallExpr, via string) {
 	switch method {
 	case "Add", "Go":
 		fc.group.group.Starts++
@@ -2319,7 +2667,11 @@ func (b *builder) markGroupFieldConsumed(fc *fieldCapture, method string, consum
 	case "Wait":
 		fc.group.group.Joined = true
 		fc.group.waitCallSites = append(fc.group.waitCallSites, call)
-		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "join", Message: fmt.Sprintf("group is joined here, through field %q", fc.fieldName), Span: ptrSpan(b.span(call))})
+		message := fmt.Sprintf("group is joined here, through field %q", fc.fieldName)
+		if via != "" {
+			message = fmt.Sprintf("group is joined here, through field %q inside method %s", fc.fieldName, via)
+		}
+		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "join", Message: message, Span: ptrSpan(b.span(call))})
 		consumed[fc] = true
 	}
 }

@@ -1453,6 +1453,502 @@ func Start() {
 	}
 }
 
+// The following tests cover method calls on a tracked handle
+// (followHandleMethod / receiverSummaryOf): `w.Stop()` where Stop's own
+// body calls `w.cancel()` (or Waits `w.wg`) consumes the captured field
+// on w's behalf, exactly like a direct call through the field does.
+// Before this, every non-field selector on a tracked variable was ignored
+// as "harmless", so the ordinary handle-with-a-Stop-method shape fired
+// LL1001/LL1003 on code that in fact stops its worker.
+
+func analyzeSourceWithMaxFunctions(t *testing.T, source string, maxFunctions int) []engine.Diagnostic {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.MaxFunctions = maxFunctions
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine.Analyze(program, cfg)
+}
+
+func evidenceMessages(d engine.Diagnostic, kind string) []string {
+	var out []string
+	for _, e := range d.Evidence {
+		if e.Kind == kind {
+			out = append(out, e.Message)
+		}
+	}
+	return out
+}
+
+func TestFieldCapture_MethodConsumingCancelFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Stop()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Only the field the method actually consumes is credited: the sibling
+// field the method never touches is still a genuine, confirmed leak.
+func TestFieldCapture_MethodConsumesOneFieldOtherStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct {
+	cancel context.CancelFunc
+	other  context.CancelFunc
+}
+func (w *Worker) Stop() { w.cancel() }
+func Start() {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel1, other: cancel2}
+	w.Stop()
+	go func() { <-ctx2.Done() }()
+	_ = ctx1
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("expected exactly one LL1001, got %#v", diags)
+	}
+	msgs := evidenceMessages(diags[0], "field-not-consumed")
+	if len(msgs) != 1 || !strings.Contains(msgs[0], `"other"`) {
+		t.Fatalf("the leak reported should be field %q, got evidence %#v", "other", diags[0].Evidence)
+	}
+	if consumed := evidenceMessages(diags[0], "field-consumed"); len(consumed) != 0 {
+		t.Fatalf("the reported binding must not carry the other field's consumption evidence, got %#v", consumed)
+	}
+}
+
+// A visible method that simply never consumes the field must not hide
+// the leak: following the method is not a blanket "assume transferred".
+func TestFieldCapture_MethodNotConsumingFieldStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct {
+	name   string
+	cancel context.CancelFunc
+}
+func (w *Worker) Name() string { return w.name }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{name: "x", cancel: cancel}
+	_ = w.Name()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_MethodValueReceiverConsumingDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w Worker) Stop() { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := Worker{cancel: cancel}
+	w.Stop()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_DeferredMethodConsumingDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	defer w.Stop()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_MethodChainMultiHopDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop()     { w.shutdown() }
+func (w *Worker) shutdown() { w.release() }
+func (w *Worker) release()  { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Stop()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Mutually recursive methods must terminate, and the consumption that
+// sits inside the cycle must still be found from either entry point --
+// including when the callee that closes the cycle is reached first.
+func TestFieldCapture_MutuallyRecursiveMethodsTerminateAndConsume(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc; n int }
+func (w *Worker) A() { if w.n > 0 { w.B() } }
+func (w *Worker) B() { w.A(); w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.A()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_MutuallyRecursiveMethodsNeverConsumingStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc; n int }
+func (w *Worker) A() { if w.n > 0 { w.B() } }
+func (w *Worker) B() { w.A() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.A()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// A summary computed while a cycle back into a still-in-progress method
+// was being cut off is missing that cycle's contribution, and must not be
+// memoized: B is summarized first here (B -> A -> B), and A's own summary
+// from that walk lacks B's `w.b()`. Reusing it for the later `w2.A()`
+// would report w2's field as never consumed.
+func TestFieldCapture_CycleTruncatedSummaryIsNotReused(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct {
+	b context.CancelFunc
+	n int
+}
+func (w *Worker) A() { if w.n > 0 { w.B() } }
+func (w *Worker) B() { w.A(); w.b() }
+func Start() {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	w1 := &Worker{b: cancel1}
+	w2 := &Worker{b: cancel2}
+	w1.B()
+	w2.A()
+	go func() { <-ctx1.Done() }()
+	go func() { <-ctx2.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// A guard around the call reads the field as a value too (`!= nil`),
+// which the direct-call classifier treats as an unverifiable use; through
+// a method it is still consumed, because the call is there.
+func TestFieldCapture_MethodNilGuardedCancelDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Stop()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Every way a method can hand the receiver, or the tracked field itself,
+// somewhere this check does not follow must fall back to the
+// assume-transferred default rather than fire.
+func TestFieldCapture_MethodEscapingReceiverOrFieldFallsBack(t *testing.T) {
+	cases := map[string]string{
+		"receiver passed on": `func (w *Worker) Stop() { register(w) }`,
+		"receiver returned":  `func (w *Worker) Stop() *Worker { return w }`,
+		"field passed on":    `func (w *Worker) Stop() { register2(w.cancel) }`,
+		"field stored":       `func (w *Worker) Stop() { global = w.cancel }`,
+		"method value":       `func (w *Worker) Stop() { f := w.inner; f() }` + "\nfunc (w *Worker) inner() {}",
+	}
+	for name, method := range cases {
+		t.Run(name, func(t *testing.T) {
+			diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+var global context.CancelFunc
+func register(w *Worker) {}
+func register2(c context.CancelFunc) {}
+`+method+`
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Stop()
+	go func() { <-ctx.Done() }()
+}
+`)
+			if len(diags) != 0 {
+				t.Fatalf("diagnostics = %#v", diags)
+			}
+		})
+	}
+}
+
+// Taking the method as a value (rather than calling it) defers the call
+// to somewhere this check cannot see.
+func TestFieldCapture_MethodValueTakenFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	stop := w.Stop
+	_ = stop
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// A method beyond the max_functions bound is not inspected, so it cannot
+// be verified either way: assume transferred.
+func TestFieldCapture_MethodBeyondMaxFunctionsFallsBack(t *testing.T) {
+	source := `package p
+import "context"
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Name()
+	go func() { <-ctx.Done() }()
+}
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Name() string { return "w" }
+`
+	if diags := analyzeSourceWithMaxFunctions(t, source, 100); len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("with the method inside the bound the leak is confirmed, got %#v", diags)
+	}
+	// The truncated run still reports its own LL9001 bound notice; what
+	// matters here is that no leak is claimed about the handle.
+	for _, d := range analyzeSourceWithMaxFunctions(t, source, 1) {
+		if d.RuleID == "LL1001" {
+			t.Fatalf("with the method beyond the bound the handle must fall back, got %#v", d)
+		}
+	}
+}
+
+// A method promoted from an embedded struct receives only the embedded
+// value and cannot reach the enclosing struct's tracked field, so it is
+// neither consumption nor a reason to give up on the verdict.
+func TestFieldCapture_PromotedMethodIsIgnored(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Base struct{}
+func (Base) Hello() {}
+type Worker struct {
+	Base
+	cancel context.CancelFunc
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Hello()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_GroupMethodWaitingDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Pool struct{ wg *sync.WaitGroup }
+func (p *Pool) Close() { p.wg.Wait() }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	p := &Pool{wg: &wg}
+	go func() { defer wg.Done() }()
+	p.Close()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_GroupMethodNotWaitingStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Pool struct {
+	name string
+	wg   *sync.WaitGroup
+}
+func (p *Pool) Name() string { return p.name }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	p := &Pool{name: "p", wg: &wg}
+	go func() { defer wg.Done() }()
+	_ = p.Name()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// The credited call site must be the caller's own `w.Stop()` so the
+// CFG-based ordering checks can find it: a deferred Stop that Waits for a
+// worker which is itself waiting on the cancelled context is the
+// ordinary "cancel then join" shape and must stay clean, while a
+// deferred Stop that runs *after* a Wait it was supposed to unblock is
+// LL1005, exactly as it is for a direct deferred cancel().
+func TestFieldCapture_MethodStopSignalParticipatesInOrdering(t *testing.T) {
+	clean := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); <-ctx.Done() }()
+	w.Stop()
+	wg.Wait()
+}
+`)
+	if len(clean) != 0 {
+		t.Fatalf("stop-then-wait must be clean, got %#v", clean)
+	}
+	late := analyzeSource(t, `package p
+import (
+	"context"
+	"sync"
+)
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	defer w.Stop()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); <-ctx.Done() }()
+	wg.Wait()
+}
+`)
+	if len(late) != 1 || late[0].RuleID != "LL1005" {
+		t.Fatalf("a deferred method Stop that only runs after Wait must be LL1005 like a deferred cancel(), got %#v", late)
+	}
+}
+
+// The constructor-returned shape shares walkFieldCaptureUses with the
+// local stored-struct shape, so a caller consuming through a method is
+// verified the same way.
+func TestFieldOwnership_ConstructorCallerConsumesThroughMethodDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { w.cancel() }
+func New(parent context.Context) (*Worker, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Worker{cancel: cancel}, ctx
+}
+func Start(parent context.Context) {
+	w, ctx := New(parent)
+	go func() { <-ctx.Done() }()
+	w.Stop()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldOwnership_ConstructorCallerOnlyCallsUnrelatedMethodStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct {
+	name   string
+	cancel context.CancelFunc
+}
+func (w *Worker) Name() string { return w.name }
+func New(parent context.Context) (*Worker, context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	return &Worker{name: "w", cancel: cancel}, ctx
+}
+func Start(parent context.Context) {
+	w, ctx := New(parent)
+	go func() { <-ctx.Done() }()
+	_ = w.Name()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
 func TestFieldOwnership_ConstructorCancelDroppedByCallerFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
