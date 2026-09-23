@@ -1949,6 +1949,214 @@ func Start(parent context.Context) {
 	}
 }
 
+// The following tests cover a field being overwritten after it was
+// captured (captureFieldReassignment / classifyFieldCaptureUse's
+// generation-aware matching): `h.cancel = cancel2` after
+// `h := Holder{cancel: cancel1}` used to be classified as a generic,
+// unresolved use of h and fall back to assume-transferred for every
+// field on h -- silently discarding the fact that cancel1 was never
+// called before being replaced. The old binding is now credited (or
+// left leaked) independently of whatever the new one goes on to do.
+
+func TestFieldCapture_OverwrittenFieldLeaksOldBindingEvenWhenNewOneIsCalledDirectly(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Holder struct{ cancel context.CancelFunc }
+func Start() {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	h := Holder{cancel: cancel1}
+	_, cancel2 := context.WithCancel(context.Background())
+	h.cancel = cancel2
+	cancel2()
+	go func() { <-ctx1.Done() }()
+	_ = h
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, `"cancel1"`) {
+		t.Fatalf("the leak reported should name cancel1, got %#v", diags[0])
+	}
+}
+
+func TestFieldCapture_OverwrittenFieldLeaksOldBindingWhenNewOneConsumedThroughField(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func Start() {
+	ctx, cancel1 := context.WithCancel(context.Background())
+	_, cancel2 := context.WithCancel(context.Background())
+	w := worker{cancel: cancel1}
+	w.cancel = cancel2
+	w.cancel()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, `"cancel1"`) {
+		t.Fatalf("the leak reported should name cancel1 (cancel2 is verified consumed through the field), got %#v", diags[0])
+	}
+}
+
+// A field called through before it is overwritten must not be affected
+// by the later reassignment: the old generation's own verified
+// consumption stands regardless of what replaces it.
+func TestFieldCapture_FieldConsumedBeforeOverwriteDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func Start() {
+	_, cancel1 := context.WithCancel(context.Background())
+	_, cancel2 := context.WithCancel(context.Background())
+	w := worker{cancel: cancel1}
+	w.cancel()
+	w.cancel = cancel2
+	cancel2()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Chained reassignment: three generations of the same field. The read
+// through the field sits between the second and third reassignment and
+// must attribute to the second generation (cancel2), not the first
+// (cancel1, whose span it comes well after) or the third (cancel3,
+// which does not yet exist at that point). A read wrongly attributed to
+// cancel1 would mark it (incorrectly) consumed and hide the leak this
+// test exists to catch; a bound that let a not-yet-live generation match
+// early would just get lucky here, since cancel3 is separately
+// conservative (assumed transferred, like any plain assignment into a
+// field) whether or not it is ever called -- the assertion that matters
+// is that cancel1, and only cancel1, still fires.
+func TestFieldCapture_ChainedReassignmentAttributesReadToLiveGeneration(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type h struct{ cancel context.CancelFunc }
+func Start() {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	_, cancel2 := context.WithCancel(context.Background())
+	_, cancel3 := context.WithCancel(context.Background())
+	x := h{cancel: cancel1}
+	x.cancel = cancel2
+	x.cancel()
+	x.cancel = cancel3
+	go func() { <-ctx1.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, `"cancel1"`) {
+		t.Fatalf("the leak reported should be cancel1, got %#v", diags[0])
+	}
+}
+
+// The old binding is positive-evidence leaked even when it is replaced
+// by a value this build has no separate binding for at all (an
+// untracked function): the old generation's own fate does not depend on
+// the new value being itself trackable.
+func TestFieldCapture_OverwriteWithUntrackedValueStillLeaksOldBinding(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type h struct{ cancel context.CancelFunc }
+func other() context.CancelFunc { return func() {} }
+func Start() {
+	ctx, cancel1 := context.WithCancel(context.Background())
+	x := h{cancel: cancel1}
+	x.cancel = other()
+	x.cancel()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, `"cancel1"`) {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Reassigning an unrelated, untracked field on the same handle is
+// harmless and must not disturb the tracked field's own verdict.
+func TestFieldCapture_UnrelatedFieldReassignmentDoesNotAffectTrackedField(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type h struct {
+	name   string
+	cancel context.CancelFunc
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	x := h{name: "a", cancel: cancel}
+	x.name = "b"
+	go func() { <-ctx.Done() }()
+	_ = x
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// When the handle also escapes in some other, unresolved way, the
+// existing conservative default still wins for every generation of the
+// field, overwritten or not -- this fix narrows the specific overwrite
+// case, it does not disable the broader fallback.
+func TestFieldCapture_OverwrittenFieldFallsBackWhenHandleAlsoEscapes(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type h struct{ cancel context.CancelFunc }
+func register(x h) {}
+func Start() {
+	_, cancel1 := context.WithCancel(context.Background())
+	_, cancel2 := context.WithCancel(context.Background())
+	x := h{cancel: cancel1}
+	x.cancel = cancel2
+	register(x)
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("handle passed elsewhere must still fall back conservatively for both generations, got %#v", diags)
+	}
+}
+
+// The same generation tracking applies to a WaitGroup field: the group
+// replaced before ever being waited on is a genuine LL1003, independent
+// of the new group's own fate.
+// The pre-fix version of this bug did not fail silently for a group the
+// way it does for a cancel func: the misattributed Wait credited wg1 as
+// joined, so the diagnostic that did fire blamed a coincidental Add/Done
+// count mismatch rather than saying what is actually wrong (wg1 is never
+// joined at all). This checks the corrected diagnosis, not just that a
+// diagnostic of some kind still fires.
+func TestFieldCapture_OverwrittenGroupFieldLeaksOldBinding(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type pool struct{ wg *sync.WaitGroup }
+func Start() {
+	var wg1 sync.WaitGroup
+	wg1.Add(1)
+	p := pool{wg: &wg1}
+	var wg2 sync.WaitGroup
+	wg2.Add(1)
+	p.wg = &wg2
+	go func() { defer wg2.Done() }()
+	p.wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, "no Wait or ownership transfer is observed") {
+		t.Fatalf("expected wg1 to be diagnosed as never joined (not merely a coincidental count mismatch from being misattributed as joined), got %#v", diags[0])
+	}
+}
+
 func TestFieldOwnership_ConstructorCancelDroppedByCallerFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"

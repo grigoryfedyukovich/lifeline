@@ -258,6 +258,16 @@ type fieldCapture struct {
 	cancel      *cancelState
 	group       *groupState
 	returnIndex int
+	// startPos and supersededAt bound the span of source positions over
+	// which this specific generation of (varObj, fieldName) is the value
+	// classifyFieldCaptureUse should attribute a read through the field
+	// to -- see captureFieldReassignment. token.NoPos (the zero value)
+	// leaves that end of the span open: a literal-established capture's
+	// startPos is always NoPos (live from the start of the body), and a
+	// capture's supersededAt is NoPos for as long as it is the most
+	// recent generation of that field.
+	startPos     token.Pos
+	supersededAt token.Pos
 }
 
 // generatedFilePattern matches the standard Go convention for marking a
@@ -1174,8 +1184,8 @@ func (b *builder) collectContainerCaptures(body *ast.BlockStmt, cancels []*cance
 		// isn't decided within this one function, so it must not be
 		// claimed at all: the existing unverified "assume transferred"
 		// default is the safe, correct answer there, the same one-hop
-        // boundary every other direct-verification path in this file
-        // already stops at, rather than a false "definitely leaked".
+		// boundary every other direct-verification path in this file
+		// already stops at, rather than a false "definitely leaked".
 		if !consumed && containerHasOtherEscapingUse(body, obj, info) {
 			continue
 		}
@@ -1941,23 +1951,34 @@ func (b *builder) observeContainerEscape(n ast.Node, cancels []*cancelState, gro
 	}
 }
 
-// collectFieldCaptures scans body for the two "selected struct fields"
-// shapes field/constructor ownership tracking recognizes (docs/roadmap.md
-// item 3): a cancel/group binding already recognized in cancels/groups
-// used as the value of a named field in a struct composite literal,
-// either (a) that literal assigned whole to a single local variable via
-// `:=`/`=`/a `var` declaration with an initializer, or (b) that literal
-// constructed directly inline as one of a return statement's own result
-// expressions. Only a keyed struct literal is recognized -- a positional
-// literal, or a literal for a slice/array/map type, is left to the
-// existing generic escape fallback untouched, the same as multi-name or
-// blank-discarded assignments and any other shape not matching this exact
-// narrow pattern. claimed is populated with every binding object captured
-// this way, so the caller's generic composite-literal/return escape
-// handling knows to defer to resolveFieldCaptures's own verdict instead
-// of unconditionally marking it transferred on sight. Nested function
-// literals have independent locals and are not descended into, matching
-// the rest of this file's scoping.
+// collectFieldCaptures scans body for the shapes field/constructor
+// ownership tracking recognizes (docs/roadmap.md item 3): a cancel/group
+// binding already recognized in cancels/groups used as the value of a
+// named field in a struct composite literal, either (a) that literal
+// assigned whole to a single local variable via `:=`/`=`/a `var`
+// declaration with an initializer, or (b) that literal constructed
+// directly inline as one of a return statement's own result expressions;
+// and (c) such a binding assigned directly into an already-tracked
+// field via a plain `h.field = value` (captureFieldReassignment), which
+// also closes off whichever earlier generation of that same field this
+// scan has already captured. Only a keyed struct literal is recognized
+// for (a)/(b) -- a positional literal, or a literal for a slice/array/map
+// type, is left to the existing generic escape fallback untouched, the
+// same as multi-name or blank-discarded assignments and any other shape
+// not matching one of these exact narrow patterns. claimed is populated
+// with every binding object captured this way, so the caller's generic
+// composite-literal/return escape handling knows to defer to
+// resolveFieldCaptures's own verdict instead of unconditionally marking
+// it transferred on sight -- though a plain `h.field = value` (case (c))
+// is deliberately not claimed against the *pre-existing*, unconditional
+// escape-assignment fallback (observeEscapeAssignment) the way (a)/(b)
+// are: that fallback still marks such a value's own binding Escapes on
+// sight, same as before this shape was recognized here at all. What
+// changes is only which generation of the *field* a later read
+// attributes to -- see fieldCapture.startPos/supersededAt and
+// classifyFieldCaptureUse. Nested function literals have independent
+// locals and are not descended into, matching the rest of this file's
+// scoping.
 func (b *builder) collectFieldCaptures(body *ast.BlockStmt, cancels []*cancelState, groups []*groupState) (captures []*fieldCapture, claimed map[types.Object]bool) {
 	claimed = map[types.Object]bool{}
 	if body == nil || (len(cancels) == 0 && len(groups) == 0) {
@@ -1992,16 +2013,23 @@ func (b *builder) collectFieldCaptures(body *ast.BlockStmt, cancels []*cancelSta
 			if len(x.Lhs) != 1 || len(x.Rhs) != 1 {
 				return true
 			}
-			lhs, ok := x.Lhs[0].(*ast.Ident)
-			if !ok || lhs.Name == "_" {
-				return true
-			}
-			varObj := b.in.Info.ObjectOf(lhs)
-			if varObj == nil {
-				return true
-			}
-			if lit := compositeLitOf(x.Rhs[0]); lit != nil {
-				captures = append(captures, b.captureFieldsFromLiteral(lit, varObj, -1, cancels, groups, claimed)...)
+			switch lhs := x.Lhs[0].(type) {
+			case *ast.Ident:
+				if lhs.Name == "_" {
+					return true
+				}
+				varObj := b.in.Info.ObjectOf(lhs)
+				if varObj == nil {
+					return true
+				}
+				if lit := compositeLitOf(x.Rhs[0]); lit != nil {
+					captures = append(captures, b.captureFieldsFromLiteral(lit, varObj, -1, cancels, groups, claimed)...)
+				}
+			case *ast.SelectorExpr:
+				if x.Tok != token.ASSIGN {
+					return true
+				}
+				captures = b.captureFieldReassignment(x, lhs, captures, cancels, groups, claimed)
 			}
 		case *ast.ValueSpec:
 			if len(x.Names) != 1 || len(x.Values) != 1 || x.Names[0].Name == "_" {
@@ -2066,6 +2094,66 @@ func (b *builder) captureFieldsFromLiteral(lit *ast.CompositeLit, varObj types.O
 		}
 	}
 	return out
+}
+
+// captureFieldReassignment handles `h.field = value`, a plain (non-
+// composite-literal) assignment into a struct field -- the shape
+// collectFieldCaptures' own AssignStmt case cannot see, since it only
+// recognizes a literal on the right of a whole-variable definition or
+// assignment. Two things follow from it, independently of one another:
+//
+//   - whichever earlier generation of (varObj, fieldName) is still live
+//     in captures (supersededAt not yet set -- there is at most one,
+//     since each reassignment closes off the previous one the same way)
+//     is superseded as of this assignment: the old value is no longer
+//     reachable through the field from here on, so a later read through
+//     the field must not be credited back to it, and if it was never
+//     consumed before this point it is a genuine, positive-evidence
+//     leak (resolveFieldCaptures' ordinary "stored, never called" case)
+//     rather than the conservative assume-transferred fallback a bare
+//     reassignment used to trigger by falling through
+//     classifyFieldCaptureUse's own generic otherUse case.
+//   - if value is itself one of cancels'/groups' own tracked bindings,
+//     not yet claimed some other way, a new generation is opened for it
+//     starting immediately after this assignment (fieldCapture.startPos),
+//     so a later `h.field()` verifies against the value actually held
+//     there rather than against whatever it replaced.
+//
+// This intentionally only recognizes the same shape captureFieldsFromLiteral
+// does one level up: a direct `ident.field = expr`, not a chained or
+// double-indirected selector.
+func (b *builder) captureFieldReassignment(assign *ast.AssignStmt, lhs *ast.SelectorExpr, captures []*fieldCapture, cancels []*cancelState, groups []*groupState, claimed map[types.Object]bool) []*fieldCapture {
+	base, ok := lhs.X.(*ast.Ident)
+	if !ok {
+		return captures
+	}
+	varObj := b.in.Info.Uses[base]
+	if varObj == nil {
+		return captures
+	}
+	fieldName := lhs.Sel.Name
+	for _, fc := range captures {
+		if fc.varObj == varObj && fc.fieldName == fieldName && fc.supersededAt == token.NoPos {
+			fc.supersededAt = assign.Pos()
+		}
+	}
+	valueObj := identObject(assign.Rhs[0], b.in.Info)
+	if valueObj == nil || claimed[valueObj] {
+		return captures
+	}
+	for _, c := range cancels {
+		if c.cancelObj != nil && valueObj == c.cancelObj {
+			claimed[valueObj] = true
+			return append(captures, &fieldCapture{varObj: varObj, fieldName: fieldName, cancel: c, returnIndex: -1, startPos: assign.End()})
+		}
+	}
+	for _, g := range groups {
+		if g.obj != nil && valueObj == g.obj {
+			claimed[valueObj] = true
+			return append(captures, &fieldCapture{varObj: varObj, fieldName: fieldName, group: g, returnIndex: -1, startPos: assign.End()})
+		}
+	}
+	return captures
 }
 
 // compositeLitOf unwraps expr down to the struct/slice/map composite
@@ -2135,7 +2223,13 @@ func ancestor(stack []ast.Node, n int) ast.Node {
 // returned, nor used any other way at all is left exactly as constructed
 // (Called/Joined/Escapes all false) so the ordinary LL1001/LL1003 checks
 // fire on this positive evidence of an unconsumed capability -- the
-// "stored struct" leak this mechanism exists to catch.
+// "stored struct" leak this mechanism exists to catch. A variable's own
+// field can hold more than one capture over the body's lifetime, one per
+// generation captureFieldReassignment recognized (the original literal,
+// plus one per later `h.field = value`) -- these are resolved exactly
+// the same way, independently of each other, with walkFieldCaptureUses
+// crediting a given read only to whichever generation was live at that
+// read's position.
 func (b *builder) resolveFieldCaptures(fnObj *types.Func, body *ast.BlockStmt, captures []*fieldCapture) {
 	if len(captures) == 0 {
 		return
@@ -2227,32 +2321,50 @@ func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*
 //   - h.field(...), where field matches a tracked cancel binding's field
 //     name and the selector is itself being called: verified consumption
 //     -- marks Called and records evidence, the same shape a direct
-//     `cancel()` call already gets.
+//     `cancel()` call already gets. If field has been reassigned earlier
+//     in the body (see captureFieldReassignment), this credits whichever
+//     generation of the binding is actually live at this position, not
+//     necessarily the one fcs was originally built from.
 //   - h.field.Add(...)/.Go(...)/.Wait(...), where field matches a tracked
 //     group binding's field name: verified worker-accounting/consumption
 //     through the field, mirroring observeCall's direct-receiver handling
 //     for the same three methods.
+//   - h.field = value, a direct write to a tracked field: neither a read
+//     nor a disqualifying use. captureFieldReassignment already recorded
+//     its consequences when the body was first scanned -- the old
+//     generation's supersededAt, and a new generation if value is itself
+//     one of this build's own tracked bindings -- so the write itself is
+//     a no-op here, rather than the otherUse fallback a plain
+//     reassignment used to trigger.
 //   - h appearing directly as one of a return statement's own result
 //     expressions: recorded by position for resolveFieldCaptures to hand
 //     to recordReturnedField (the "constructor" shape).
 //   - anything else -- the field is referenced but not called, an
-//     unrelated method is called on it, h is passed as an argument,
-//     reassigned, or used any other way this narrow check does not
-//     attempt to follow: marked otherUse, resolveFieldCaptures' signal to
-//     fall back to the conservative assume-transferred default rather
-//     than guess.
+//     unrelated method is called on it, h is passed as an argument, or
+//     used any other way this narrow check does not attempt to follow:
+//     marked otherUse, resolveFieldCaptures' signal to fall back to the
+//     conservative assume-transferred default rather than guess.
 func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj types.Object, fcs []*fieldCapture, consumed map[*fieldCapture]bool, returnedAt map[types.Object]int, otherUse map[types.Object]bool) {
 	parent := ancestor(stack, 1)
 	if sel, ok := parent.(*ast.SelectorExpr); ok && sel.X == ast.Expr(id) {
 		fieldName := sel.Sel.Name
-		matches := false
+		named := false
+		var active *fieldCapture
 		for _, fc := range fcs {
-			if fc.fieldName == fieldName {
-				matches = true
-				break
+			if fc.fieldName != fieldName {
+				continue
 			}
+			named = true
+			if fc.startPos != token.NoPos && id.Pos() < fc.startPos {
+				continue // this generation didn't exist yet at this point
+			}
+			if fc.supersededAt != token.NoPos && id.Pos() >= fc.supersededAt {
+				continue // a later assignment had already replaced it by here
+			}
+			active = fc
+			break
 		}
-		if !matches {
+		if !named {
 			// Either an unrelated field (harmless) or a method call
 			// through the handle, whose body may well consume one of the
 			// tracked fields on the handle's behalf (`w.Stop()` calling
@@ -2260,24 +2372,38 @@ func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj t
 			b.followHandleMethod(stack, sel, obj, fcs, consumed, otherUse)
 			return
 		}
+		if assign, ok := ancestor(stack, 2).(*ast.AssignStmt); ok && assign.Tok == token.ASSIGN && len(assign.Lhs) == 1 && assign.Lhs[0] == ast.Expr(sel) {
+			// `h.field = value`: the overwrite itself. captureFieldReassignment
+			// already recorded its consequences (the old generation's
+			// supersededAt, and a new generation if value is itself
+			// trackable) when the body was first scanned; the write
+			// occurrence here is neither a read of the old value nor a
+			// use this check needs to fall back on.
+			return
+		}
+		if active == nil {
+			// fieldName names a field this build tracks somewhere in the
+			// function, but no generation covers this exact position --
+			// the field holds a value at this point (e.g. overwritten
+			// with something not itself tracked) that nothing here can
+			// verify one way or the other. Neither consumption nor a
+			// disqualifying use of the capture that does exist.
+			return
+		}
 		grand := ancestor(stack, 2)
 		if call, ok := grand.(*ast.CallExpr); ok && call.Fun == ast.Expr(sel) {
-			for _, fc := range fcs {
-				if fc.cancel != nil && fc.fieldName == fieldName {
-					b.markCancelFieldConsumed(fc, consumed, call, "")
-					return
-				}
+			if active.cancel != nil {
+				b.markCancelFieldConsumed(active, consumed, call, "")
+				return
 			}
 		}
 		if outer, ok := grand.(*ast.SelectorExpr); ok && outer.X == ast.Expr(sel) {
 			method := outer.Sel.Name
 			if method == "Add" || method == "Go" || method == "Wait" {
 				if call, ok := ancestor(stack, 3).(*ast.CallExpr); ok && call.Fun == ast.Expr(outer) {
-					for _, fc := range fcs {
-						if fc.group != nil && fc.fieldName == fieldName {
-							b.markGroupFieldConsumed(fc, method, consumed, call, "")
-							return
-						}
+					if active.group != nil {
+						b.markGroupFieldConsumed(active, method, consumed, call, "")
+						return
 					}
 				}
 			}
