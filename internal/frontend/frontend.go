@@ -200,13 +200,16 @@ type builder struct {
 	joinWrappers           map[string]struct{}
 	stopWrappers           map[string]struct{}
 
-	// receiverSummaries memoizes receiverSummaryOf's per-method result
-	// (what a same-package method body does with its own receiver), and
-	// receiverStack is the chain of methods currently being summarized --
-	// the cycle guard that keeps a mutually recursive pair of methods
-	// from looping forever. See receiverSummaryOf.
-	receiverSummaries map[*types.Func]*receiverSummary
-	receiverStack     []*types.Func
+	// receiverSummaries memoizes handleSummaryOf's per-local-variable
+	// result (what a same-package function body does with one of its own
+	// receiver or parameter variables), keyed by that variable's own
+	// object so a method's receiver and a plain function's parameter
+	// share one cache and one cycle guard uniformly. receiverStack is the
+	// chain of such variables currently being summarized -- the cycle
+	// guard that keeps a mutually recursive chain (methods, functions, or
+	// a mix) from looping forever. See handleSummaryOf.
+	receiverSummaries map[types.Object]*receiverSummary
+	receiverStack     []types.Object
 }
 
 // returnFieldSite is the shape computeFieldOwnership records into
@@ -386,7 +389,7 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		startWrappers:          stringSet(cfg.StartWrappers),
 		joinWrappers:           stringSet(cfg.JoinWrappers),
 		stopWrappers:           stringSet(cfg.StopWrappers),
-		receiverSummaries:      map[*types.Func]*receiverSummary{},
+		receiverSummaries:      map[types.Object]*receiverSummary{},
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
@@ -2339,11 +2342,20 @@ func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*
 //   - h appearing directly as one of a return statement's own result
 //     expressions: recorded by position for resolveFieldCaptures to hand
 //     to recordReturnedField (the "constructor" shape).
+//   - h passed as a direct argument to a same-package call (`register(h)`,
+//     not h itself being called as a function value): followed into the
+//     callee's own body, at the corresponding parameter, by
+//     followHandleArgument -- the argument-passing analog of
+//     followHandleMethod above, crediting whatever the callee consumes on
+//     h's behalf back to this call site, and falling back to otherUse on
+//     the same terms (an unresolvable callee, a spread/variadic argument,
+//     or anything the callee's own body does with its parameter this
+//     check does not follow).
 //   - anything else -- the field is referenced but not called, an
-//     unrelated method is called on it, h is passed as an argument, or
-//     used any other way this narrow check does not attempt to follow:
-//     marked otherUse, resolveFieldCaptures' signal to fall back to the
-//     conservative assume-transferred default rather than guess.
+//     unrelated method is called on it, or used any other way this
+//     narrow check does not attempt to follow: marked otherUse,
+//     resolveFieldCaptures' signal to fall back to the conservative
+//     assume-transferred default rather than guess.
 func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj types.Object, fcs []*fieldCapture, consumed map[*fieldCapture]bool, returnedAt map[types.Object]int, otherUse map[types.Object]bool) {
 	parent := ancestor(stack, 1)
 	if sel, ok := parent.(*ast.SelectorExpr); ok && sel.X == ast.Expr(id) {
@@ -2430,6 +2442,16 @@ func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj t
 			}
 		}
 	}
+	if call, ok := parent.(*ast.CallExpr); ok && call.Fun != ast.Expr(id) {
+		// h passed as a direct argument to some call (`register(h)`):
+		// may well be dropped harmlessly, or consumed on h's behalf
+		// through the callee's own parameter -- see followHandleArgument.
+		// (call.Fun != id excludes h itself being called as a function
+		// value, which isn't this shape and falls through to otherUse
+		// below like any other unresolvable use.)
+		b.followHandleArgument(call, ast.Expr(id), obj, fcs, consumed, otherUse)
+		return
+	}
 	otherUse[obj] = true
 }
 
@@ -2438,23 +2460,26 @@ func (b *builder) classifyFieldCaptureUse(stack []ast.Node, id *ast.Ident, obj t
 // results leaves it untouched unless one of them actually saw a cycle.
 const noReceiverCycle = int(^uint(0) >> 1)
 
-// maxReceiverDepth bounds how deep receiverSummaryOf follows a chain of
-// same-package method calls on the same receiver. Real chains are a
-// handful of methods long; the bound exists only so a pathological or
-// generated call graph cannot make one handle's verdict arbitrarily
-// expensive. Hitting it is treated as "cannot resolve" (assume
-// transferred), never as "not consumed".
+// maxReceiverDepth bounds how deep handleSummaryOf follows a chain of
+// same-package calls reachable from one handle -- method calls, calls
+// passing the handle on as an argument, or any mix of the two. Real
+// chains are a handful of hops long; the bound exists only so a
+// pathological or generated call graph cannot make one handle's verdict
+// arbitrarily expensive. Hitting it is treated as "cannot resolve"
+// (assume transferred), never as "not consumed".
 const maxReceiverDepth = 16
 
-// receiverSummary is what one same-package method's own body does with its
-// receiver variable, recorded independently of which fields any particular
-// caller happens to be tracking -- which is what makes it safe to memoize
-// per method (builder.receiverSummaries) and reuse for every handle whose
-// type has that method. It is the method-call analog of
+// receiverSummary is what one same-package function body does with one of
+// its own local variables -- a method's receiver, or a plain function's
+// parameter -- recorded independently of which fields any particular
+// caller happens to be tracking, which is what makes it safe to memoize
+// per variable (builder.receiverSummaries) and reuse for every call site
+// that reaches that same variable, whether through a method call or a
+// same-package function argument. It is the handle-passing analog of
 // paramConsumption for a bare cancel parameter: the same "is it called,
 // or does it go somewhere this check can't follow" question, asked of a
-// struct's fields through its receiver instead of a function's
-// parameter.
+// struct's fields reachable through one of the callee's own local
+// variables instead of the cancel/group value itself.
 type receiverSummary struct {
 	// called holds the name of every direct field of the receiver that
 	// the body (or a further same-package method it calls on the same
@@ -2472,10 +2497,16 @@ type receiverSummary struct {
 	// receiver-side twin of classifyFieldCaptureUse's "anything else"
 	// fallback for a tracked field.
 	fieldEscaped map[string]bool
-	// escapes is true if the receiver itself is used in a way this check
-	// does not follow: returned, passed as an argument, assigned
-	// anywhere, method value taken without being called, or the body of
-	// a further method call on it could not be resolved.
+	// escapes is true if self is used in a way this check does not
+	// follow: returned, assigned anywhere, a method or function value
+	// taken without being called, passed as an argument to a call this
+	// check could not resolve to a same-package parameter (see
+	// resolveCallArgumentParam), or the body of a further method call or
+	// argument-passed call on it could not itself be resolved. Passed as
+	// an argument that *does* resolve is not automatically an escape --
+	// see the CallExpr case in classifyReceiverUse -- self's own summary
+	// merges the callee's instead, the same as a method call already
+	// does.
 	escapes bool
 }
 
@@ -2496,6 +2527,118 @@ func (s *receiverSummary) merge(o *receiverSummary) {
 		s.fieldEscaped[f] = true
 	}
 	s.escapes = s.escapes || o.escapes
+}
+
+// argumentPositionOf returns the index of expr within call's own direct
+// argument list (matched by AST identity, not by variadic spread -- see
+// argumentIndexOf for that separate, narrower case Phase 5's direct-
+// cancel-argument check also handles), or -1 if expr is not one of them
+// (in particular, if expr is call.Fun itself: self called as a value,
+// not passed as an argument).
+func argumentPositionOf(call *ast.CallExpr, expr ast.Expr) int {
+	for i, arg := range call.Args {
+		if arg == expr {
+			return i
+		}
+	}
+	return -1
+}
+
+// resolveCallArgumentParam resolves, for argExpr appearing as one of
+// call's own direct arguments, the same-package callee function and the
+// specific parameter object argExpr is passed into -- the "same-package
+// handle argument" shape followHandleArgument and classifyReceiverUse's
+// own CallExpr case both resolve through, reusing resolveCalleeFunc (the
+// same callee resolution Phase 5's direct-cancel-argument check uses) and
+// paramObjectAtIndex. fn is nil if the callee itself can't be resolved;
+// paramObj is nil if the callee resolves but argExpr isn't one of its
+// direct arguments, or its own AST declaration isn't available to name a
+// parameter from (a cross-package or otherwise unavailable callee) --
+// callers must treat either as "unresolved", not as "does not consume".
+func (b *builder) resolveCallArgumentParam(call *ast.CallExpr, argExpr ast.Expr) (fn *types.Func, paramObj types.Object) {
+	fn = b.resolveCalleeFunc(call.Fun)
+	if fn == nil {
+		return nil, nil
+	}
+	index := argumentPositionOf(call, argExpr)
+	if index == -1 {
+		return fn, nil
+	}
+	decl := b.funcs[fn]
+	if decl == nil {
+		return fn, nil
+	}
+	return fn, paramObjectAtIndex(b.in.Info, decl, index)
+}
+
+// followHandleArgument is classifyFieldCaptureUse's handling of h
+// appearing as a direct argument to a same-package function call
+// (`register(h)`), the "handle passed as an argument" analog of
+// followHandleMethod: passing a struct handle to a function is not the
+// same as passing the cancel func stored inside it, which already gets
+// Phase 5's own verified-consumption treatment via observeCall/
+// argumentConsumed -- without this, a call receiving the *handle*
+// (rather than the cancel func directly) fell straight to the
+// conservative assume-transferred fallback regardless of what the
+// callee's own body actually did with it, even a same-package callee
+// that plainly drops it on the floor.
+//
+// The verdict comes from paramSummaryOf(calleeFn, argIndex), the same
+// per-local-variable summary followHandleMethod uses for a method's own
+// receiver, applied here to the callee's corresponding parameter instead:
+//
+//   - a tracked cancel field the callee's body calls (through its own
+//     parameter, to any depth of further same-package calls or method
+//     calls reachable from it), or a tracked group field it Waits, is
+//     credited as consumed at *this* call site (the caller's own
+//     `register(h)`), the same bookkeeping a direct `h.cancel()` or
+//     `h.Stop()` gets;
+//   - a callee that can't be resolved to a same-package body (another
+//     package, a variable of function type Phase 5's own
+//     resolveCalleeFunc single-assignment case aside, beyond
+//     max_functions), that isn't called with h at a fixed, single
+//     argument position (h is spread from a slice, or passed via `...`;
+//     unlike Phase 5's own argumentIndexOf, that narrower case is not
+//     attempted here), or does anything with its parameter this check
+//     does not follow (see receiverSummary.escapes), marks the handle
+//     otherUse -- the same conservative fallback the rest of this
+//     mechanism uses;
+//   - a tracked field the callee's body touches in some other way (see
+//     receiverSummary.fieldEscaped) and does not consume also marks
+//     otherUse;
+//   - anything else -- the parameter is fully visible and simply
+//     doesn't consume this field -- leaves that field unconsumed, so a
+//     callee that only consumes *some* of the handle's fields still
+//     leaves the rest reported.
+func (b *builder) followHandleArgument(call *ast.CallExpr, argExpr ast.Expr, obj types.Object, fcs []*fieldCapture, consumed map[*fieldCapture]bool, otherUse map[types.Object]bool) {
+	fn, paramObj := b.resolveCallArgumentParam(call, argExpr)
+	if fn == nil {
+		otherUse[obj] = true
+		return
+	}
+	sum, _, ok := b.handleSummaryOf(fn, paramObj)
+	if !ok {
+		otherUse[obj] = true
+		return
+	}
+	for _, fc := range fcs {
+		switch {
+		case fc.cancel != nil && sum.called[fc.fieldName]:
+			b.markCancelFieldConsumed(fc, consumed, call, fn.Name())
+		case fc.group != nil && sum.waited[fc.fieldName]:
+			b.markGroupFieldConsumed(fc, "Wait", consumed, call, fn.Name())
+		}
+	}
+	if sum.escapes {
+		otherUse[obj] = true
+		return
+	}
+	for _, fc := range fcs {
+		if sum.fieldEscaped[fc.fieldName] && !consumed[fc] {
+			otherUse[obj] = true
+			return
+		}
+	}
 }
 
 // receiverObject returns the receiver variable declared by decl, or nil
@@ -2588,34 +2731,47 @@ func (b *builder) followHandleMethod(stack []ast.Node, sel *ast.SelectorExpr, ob
 	}
 }
 
-// receiverSummaryOf summarizes what fn's own body does with its receiver
-// (see receiverSummary), following further method calls on that same
-// receiver into their own bodies. ok is false when fn has no same-package
-// body this build can inspect (a different package, an interface method,
-// a method beyond the max_functions bound, or a chain deeper than
-// maxReceiverDepth): the caller must treat that as "unresolved", never as
-// "does not consume".
+// handleSummaryOf is the shared implementation behind receiverSummaryOf
+// and paramSummaryOf: it summarizes what fn's own body does with one of
+// its own local variables, self -- fn's receiver or one of its
+// parameters, whichever the caller already resolved -- following further
+// same-package calls reachable from self (a method call on it, or self
+// passed on as a plain function argument) into their own bodies in turn.
+// See receiverSummary for what the result records.
 //
-// Results are memoized per method, except that a summary computed while a
-// cycle back into an in-progress method was hit is incomplete for
-// everything above that cycle's entry point (the cycle's contribution was
-// cut off to guarantee termination) and must not be cached: the second
-// return value is the lowest receiverStack index of any such cycle target
-// (noReceiverCycle if none), which each frame compares against its own
-// index to decide whether its result is complete. A frame that is itself
-// the cycle target is complete -- its own walk already covers everything
-// the cycle would have re-added -- so the marker stops there.
-func (b *builder) receiverSummaryOf(fn *types.Func) (sum *receiverSummary, lowestCycle int, ok bool) {
+// ok is false when fn has no same-package body this build can inspect
+// (a different package, an interface method, a function beyond the
+// max_functions bound, or a chain deeper than maxReceiverDepth), or self
+// itself could not be resolved (an unnamed or blank receiver/parameter):
+// the caller must treat that as "unresolved", never as "does not
+// consume".
+//
+// Results are memoized per local-variable object, except that a summary
+// computed while a cycle back into an in-progress variable was hit is
+// incomplete for everything above that cycle's entry point (the cycle's
+// contribution was cut off to guarantee termination) and must not be
+// cached: the second return value is the lowest receiverStack index of
+// any such cycle target (noReceiverCycle if none), which each frame
+// compares against its own index to decide whether its result is
+// complete. A frame that is itself the cycle target is complete -- its
+// own walk already covers everything the cycle would have re-added -- so
+// the marker stops there. Keying the cache and the cycle guard by the
+// variable object itself, rather than by (function, which-parameter),
+// means a mutually recursive chain that mixes methods and plain
+// functions -- `Stop` calling `helper(w)` which calls `w.shutdown()` --
+// is guarded correctly however it loops back, since each hop's "self" is
+// a distinct object regardless of which shape reached it.
+func (b *builder) handleSummaryOf(fn *types.Func, self types.Object) (sum *receiverSummary, lowestCycle int, ok bool) {
 	fn = fn.Origin()
 	decl := b.funcs[fn]
-	if decl == nil || decl.Body == nil || decl.Recv == nil || !b.analyzed[fn] {
+	if decl == nil || decl.Body == nil || !b.analyzed[fn] || self == nil {
 		return nil, noReceiverCycle, false
 	}
-	if done, cached := b.receiverSummaries[fn]; cached {
+	if done, cached := b.receiverSummaries[self]; cached {
 		return done, noReceiverCycle, true
 	}
 	for i, active := range b.receiverStack {
-		if active == fn {
+		if active == self {
 			return newReceiverSummary(), i, true
 		}
 	}
@@ -2626,18 +2782,43 @@ func (b *builder) receiverSummaryOf(fn *types.Func) (sum *receiverSummary, lowes
 		return nil, -1, false
 	}
 	index := len(b.receiverStack)
-	b.receiverStack = append(b.receiverStack, fn)
+	b.receiverStack = append(b.receiverStack, self)
 	sum = newReceiverSummary()
-	lowestCycle = noReceiverCycle
-	if recv := b.receiverObject(decl); recv != nil {
-		lowestCycle = b.walkReceiverUses(decl.Body, recv, sum)
-	}
+	lowestCycle = b.walkReceiverUses(decl.Body, self, sum)
 	b.receiverStack = b.receiverStack[:index]
 	if lowestCycle >= index {
-		b.receiverSummaries[fn] = sum
+		b.receiverSummaries[self] = sum
 		lowestCycle = noReceiverCycle
 	}
 	return sum, lowestCycle, true
+}
+
+// receiverSummaryOf is handleSummaryOf specialized to fn's own receiver,
+// for a method call (`h.M()`, followHandleMethod) or a method called on
+// some other local variable partway through a chain
+// (classifyReceiverUse's own MethodVal case).
+func (b *builder) receiverSummaryOf(fn *types.Func) (sum *receiverSummary, lowestCycle int, ok bool) {
+	fn = fn.Origin()
+	decl := b.funcs[fn]
+	if decl == nil {
+		return nil, noReceiverCycle, false
+	}
+	return b.handleSummaryOf(fn, b.receiverObject(decl))
+}
+
+// paramSummaryOf is handleSummaryOf specialized to one of fn's own
+// parameters, identified by its zero-based index (flattening grouped
+// names, matching paramObjectAtIndex/argumentIndexOf's own indexing) --
+// for a same-package function called with a tracked handle as a direct
+// argument (`register(h)`, followHandleArgument), or such a call made
+// partway through a chain (classifyReceiverUse's own CallExpr case).
+func (b *builder) paramSummaryOf(fn *types.Func, index int) (sum *receiverSummary, lowestCycle int, ok bool) {
+	fn = fn.Origin()
+	decl := b.funcs[fn]
+	if decl == nil {
+		return nil, noReceiverCycle, false
+	}
+	return b.handleSummaryOf(fn, paramObjectAtIndex(b.in.Info, decl, index))
 }
 
 // walkReceiverUses classifies every occurrence of recv in body into sum,
@@ -2664,9 +2845,15 @@ func (b *builder) walkReceiverUses(body *ast.BlockStmt, recv types.Object, sum *
 }
 
 // classifyReceiverUse is classifyFieldCaptureUse's counterpart for one
-// occurrence of a method's own receiver variable, recording into sum
-// rather than into any particular capture's verdict. It returns a cycle
-// marker exactly as receiverSummaryOf defines it.
+// occurrence of a same-package function's own receiver or parameter
+// variable (self, whichever handleSummaryOf resolved), recording into
+// sum rather than into any particular capture's verdict. A further
+// same-package call reachable from self -- a method call on it, or self
+// passed on as a direct argument to another function -- recurses via
+// handleSummaryOf and merges the result, the same as followHandleMethod
+// and followHandleArgument do at the top level; anything else this
+// narrow check does not follow marks sum.escapes. It returns a cycle
+// marker exactly as handleSummaryOf defines it.
 func (b *builder) classifyReceiverUse(stack []ast.Node, id *ast.Ident, sum *receiverSummary) int {
 	switch parent := ancestor(stack, 1).(type) {
 	case *ast.SelectorExpr:
@@ -2713,6 +2900,23 @@ func (b *builder) classifyReceiverUse(stack []ast.Node, id *ast.Ident, sum *rece
 			}
 		}
 		sum.escapes = true
+	case *ast.CallExpr:
+		if parent.Fun == ast.Expr(id) {
+			sum.escapes = true // called as a function value: not attempted
+			return noReceiverCycle
+		}
+		fn, paramObj := b.resolveCallArgumentParam(parent, id)
+		if fn == nil {
+			sum.escapes = true
+			return noReceiverCycle
+		}
+		calleeSum, low, ok := b.handleSummaryOf(fn, paramObj)
+		if !ok {
+			sum.escapes = true
+			return low
+		}
+		sum.merge(calleeSum)
+		return low
 	default:
 		// Returned, passed as an argument, stored, address taken, ranged
 		// over, ...: not something this check follows.

@@ -1323,14 +1323,37 @@ func Start() {
 }
 
 // TestFieldCapture_PassedToUnresolvedFunctionFallsBack is the safety
-// check for the "stored struct" mechanism, mirroring
-// TestParameterPassing_VerifiedFurtherEscapeDoesNotFire for direct
-// arguments: once h is passed on to another function, this narrow,
-// single-variable check does not attempt to follow it, and must fall back
-// to the same conservative assume-transferred default used everywhere
-// else in this file rather than guess -- getting this wrong would turn
-// every struct handle passed onward into a new false positive.
+// check for followHandleArgument's own fallback: when the callee itself
+// can't be resolved to a concrete same-package function at all (here, a
+// parameter of func type -- the same shape
+// TestParameterPassing_UnresolvableCalleeFallsBack uses for a direct
+// cancel argument), this narrow check has nothing to follow and must
+// fall back to the same conservative assume-transferred default used
+// everywhere else in this file rather than guess.
 func TestFieldCapture_PassedToUnresolvedFunctionFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start(register func(*Handle)) {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	register(h)
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// TestFieldCapture_PassedToDroppingFunctionFires is followHandleArgument's
+// core case: passing a struct handle to a same-package function is not
+// the same as passing the cancel func stored inside it directly (which
+// Phase 5 already verifies) -- before followHandleArgument existed, this
+// exact shape (register receives h and drops it) fell to the same
+// conservative fallback as a genuinely unresolvable callee, silently
+// hiding that h's cancel func is never called anywhere.
+func TestFieldCapture_PassedToDroppingFunctionFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
 type Handle struct{ Cancel context.CancelFunc }
@@ -1341,6 +1364,279 @@ func Start() {
 	register(h)
 }
 func register(h *Handle) { _ = h }
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// The callee consuming the handle's cancel field through its own
+// parameter is verified the same way a direct `h.Cancel()` call is.
+func TestFieldCapture_PassedToFunctionConsumingFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	register(h)
+}
+func register(h *Handle) { h.Cancel() }
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Only the field the callee actually consumes is credited: a sibling
+// field it never touches is still reported.
+func TestFieldCapture_PassedToFunctionConsumingOneFieldOtherStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Cancel context.CancelFunc
+	Other  context.CancelFunc
+}
+func Start() {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel1, Other: cancel2}
+	go func() { <-ctx2.Done() }()
+	register(h)
+	_ = ctx1
+}
+func register(h *Handle) { h.Cancel() }
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+	msgs := evidenceMessages(diags[0], "field-not-consumed")
+	if len(msgs) != 1 || !strings.Contains(msgs[0], `"Other"`) {
+		t.Fatalf("the leak reported should be field %q, got evidence %#v", "Other", diags[0].Evidence)
+	}
+}
+
+// A same-package function that itself never touches the handle, but
+// passes it on to a second same-package function that does, must be
+// followed transitively -- the argument-passing analog of
+// TestFieldCapture_MethodChainMultiHopDoesNotFire.
+func TestFieldCapture_PassedThroughTwoFunctionsConsumingFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	forward(h)
+}
+func forward(h *Handle) { register(h) }
+func register(h *Handle) { h.Cancel() }
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// A tracked group field, Waited by the callee through its own parameter,
+// is verified the same way a direct `h.wg.Wait()` call is; a callee that
+// never Waits it still leaves the leak reported.
+func TestFieldCapture_PassedToFunctionWaitingGroupDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Pool struct{ wg *sync.WaitGroup }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	p := &Pool{wg: &wg}
+	go func() { defer wg.Done() }()
+	closeIt(p)
+}
+func closeIt(p *Pool) { p.wg.Wait() }
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_PassedToFunctionNotWaitingGroupFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Pool struct{ wg *sync.WaitGroup }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	p := &Pool{wg: &wg}
+	go func() { defer wg.Done() }()
+	closeIt(p)
+}
+func closeIt(p *Pool) { _ = p }
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Mutually recursive functions passing the same handle back and forth
+// must terminate, and the consumption sitting inside the cycle must
+// still be found -- the argument-passing analog of
+// TestFieldCapture_MutuallyRecursiveMethodsTerminateAndConsume.
+func TestFieldCapture_MutuallyRecursiveFunctionArgumentsTerminateAndConsume(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Cancel context.CancelFunc
+	N      int
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel, N: 1}
+	go func() { <-ctx.Done() }()
+	a(h)
+}
+func a(h *Handle) {
+	if h.N > 0 {
+		b(h)
+	}
+}
+func b(h *Handle) {
+	a(h)
+	h.Cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_MutuallyRecursiveFunctionArgumentsNeverConsumingStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct {
+	Cancel context.CancelFunc
+	N      int
+}
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel, N: 1}
+	go func() { <-ctx.Done() }()
+	a(h)
+}
+func a(h *Handle) {
+	if h.N > 0 {
+		b(h)
+	}
+}
+func b(h *Handle) { a(h) }
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// An *unnamed* callee parameter (`func register(*Handle) {}`) has no
+// identifier at all for paramObjectAtIndex to resolve to an object, so
+// there is nothing for handleSummaryOf to search the callee's body for
+// -- a real, narrower boundary than the "beyond max_functions" or
+// "callee unresolvable" fallbacks above, and distinct from a blank `_`
+// name (which still defines a real, if unreferenceable, parameter
+// object -- see TestFieldOwnership_ConstructorCallerPassedToDroppingFunctionFires).
+func TestFieldCapture_PassedToFunctionWithUnnamedParamFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	register(h)
+}
+func register(*Handle) {}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// A callee beyond the max_functions bound is not inspected, so its
+// parameter cannot be verified either way: assume transferred -- the
+// argument-passing analog of TestFieldCapture_MethodBeyondMaxFunctionsFallsBack.
+func TestFieldCapture_PassedToFunctionBeyondMaxFunctionsFallsBack(t *testing.T) {
+	source := `package p
+import "context"
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	register(h)
+}
+type Handle struct{ Cancel context.CancelFunc }
+func register(h *Handle) { _ = h }
+`
+	if diags := analyzeSourceWithMaxFunctions(t, source, 100); len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("with register inside the bound the leak is confirmed, got %#v", diags)
+	}
+	for _, d := range analyzeSourceWithMaxFunctions(t, source, 1) {
+		if d.RuleID == "LL1001" {
+			t.Fatalf("with register beyond the bound the handle must fall back, got %#v", d)
+		}
+	}
+}
+
+// Every way the callee can hand its own parameter, or the tracked field
+// itself, somewhere this check does not follow must fall back to the
+// assume-transferred default rather than fire -- the argument-passing
+// analog of TestFieldCapture_MethodEscapingReceiverOrFieldFallsBack.
+func TestFieldCapture_PassedToFunctionEscapingParamOrFieldFallsBack(t *testing.T) {
+	cases := map[string]string{
+		"param passed on":  `func register(h *Handle) { keep(h) }`,
+		"param returned":   `func register(h *Handle) *Handle { return h }`,
+		"field passed on":  `func register(h *Handle) { keepField(h.Cancel) }`,
+		"field stored":     `func register(h *Handle) { global = h.Cancel }`,
+		"param reassigned": `func register(h *Handle) { h = nil; _ = h }`,
+	}
+	for name, callee := range cases {
+		t.Run(name, func(t *testing.T) {
+			diags := analyzeSource(t, `package p
+import "context"
+type Handle struct{ Cancel context.CancelFunc }
+var global context.CancelFunc
+var keptHandle *Handle
+func keep(h *Handle) { keptHandle = h }
+func keepField(c context.CancelFunc) { global = c }
+`+callee+`
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handle{Cancel: cancel}
+	go func() { <-ctx.Done() }()
+	register(h)
+}
+`)
+			if len(diags) != 0 {
+				t.Fatalf("diagnostics = %#v", diags)
+			}
+		})
+	}
+}
+
+// A method's own receiver forwarded to a plain same-package function
+// that consumes it is followed too: classifyReceiverUse's own CallExpr
+// case merges the callee's paramSummary into the receiver's, so a chain
+// mixing a method call and a function-argument hop is verified the same
+// as a chain of either shape alone.
+func TestFieldCapture_MethodForwardsReceiverToConsumingFunctionDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { finish(w) }
+func finish(w *Worker) { w.cancel() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Stop()
+	go func() { <-ctx.Done() }()
+}
 `)
 	if len(diags) != 0 {
 		t.Fatalf("diagnostics = %#v", diags)
@@ -1716,11 +2012,10 @@ func Start() {
 // assume-transferred default rather than fire.
 func TestFieldCapture_MethodEscapingReceiverOrFieldFallsBack(t *testing.T) {
 	cases := map[string]string{
-		"receiver passed on": `func (w *Worker) Stop() { register(w) }`,
-		"receiver returned":  `func (w *Worker) Stop() *Worker { return w }`,
-		"field passed on":    `func (w *Worker) Stop() { register2(w.cancel) }`,
-		"field stored":       `func (w *Worker) Stop() { global = w.cancel }`,
-		"method value":       `func (w *Worker) Stop() { f := w.inner; f() }` + "\nfunc (w *Worker) inner() {}",
+		"receiver returned": `func (w *Worker) Stop() *Worker { return w }`,
+		"field passed on":   `func (w *Worker) Stop() { register2(w.cancel) }`,
+		"field stored":      `func (w *Worker) Stop() { global = w.cancel }`,
+		"method value":      `func (w *Worker) Stop() { f := w.inner; f() }` + "\nfunc (w *Worker) inner() {}",
 	}
 	for name, method := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1728,7 +2023,6 @@ func TestFieldCapture_MethodEscapingReceiverOrFieldFallsBack(t *testing.T) {
 import "context"
 type Worker struct{ cancel context.CancelFunc }
 var global context.CancelFunc
-func register(w *Worker) {}
 func register2(c context.CancelFunc) {}
 `+method+`
 func Start() {
@@ -1742,6 +2036,53 @@ func Start() {
 				t.Fatalf("diagnostics = %#v", diags)
 			}
 		})
+	}
+}
+
+// A method forwarding its receiver to a same-package function that
+// actually drops it is a resolvable case now, not an automatic escape:
+// followHandleMethod's own summary of Stop merges in register's, via
+// classifyReceiverUse's CallExpr case, and register plainly never calls
+// cancel -- this used to be lumped in with the genuinely-unresolvable
+// escape cases above (as "receiver passed on") and silently fell back;
+// now it correctly fires, the receiver-forwarding analog of
+// TestFieldCapture_PassedToDroppingFunctionFires.
+func TestFieldCapture_MethodForwardsReceiverToDroppingFunctionFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop() { register(w) }
+func register(w *Worker) { _ = w }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Stop()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// A method forwarding its receiver to a callee this check genuinely
+// cannot resolve (a func-typed parameter, mirroring
+// TestFieldCapture_PassedToUnresolvedFunctionFallsBack) must still fall
+// back conservatively.
+func TestFieldCapture_MethodForwardsReceiverToUnresolvedFunctionFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func (w *Worker) Stop(register func(*Worker)) { register(w) }
+func Start(register func(*Worker)) {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &Worker{cancel: cancel}
+	w.Stop(register)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
 	}
 }
 
@@ -1900,6 +2241,60 @@ func Start() {
 `)
 	if len(late) != 1 || late[0].RuleID != "LL1005" {
 		t.Fatalf("a deferred method Stop that only runs after Wait must be LL1005 like a deferred cancel(), got %#v", late)
+	}
+}
+
+// The constructor-returned shape shares walkFieldCaptureUses with the
+// local stored-struct shape, so a caller passing the constructed handle
+// on to a same-package function is verified the same way followHandleArgument
+// verifies a local one -- including this exact real-world shape
+// (constructor_opaque_escape): a dropping callee with a blank `_`
+// parameter name still has a real parameter object to follow (a blank
+// identifier is still defined, just never referenceable again), so its
+// empty body correctly yields "consumes nothing", not "unresolvable".
+// Before followHandleArgument existed, any call receiving the handle
+// fell to the conservative fallback regardless, silently hiding this.
+func TestFieldOwnership_ConstructorCallerPassedToDroppingFunctionFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func newWorker() worker {
+	_, cancel := context.WithCancel(context.Background())
+	return worker{cancel: cancel}
+}
+func use(_ worker) {}
+func Start() {
+	w := newWorker()
+	use(w)
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// An *unnamed* parameter (constructor_opaque_after_field's own shape) is
+// a genuinely different case from a blank `_` one: there is no
+// identifier at all for paramObjectAtIndex to resolve to an object,
+// hence nothing for handleSummaryOf to search the callee's body for --
+// this must still fall back conservatively, unlike the blank-named case
+// above.
+func TestFieldOwnership_ConstructorCallerPassedToUnnamedParamFunctionFallsBack(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func NewWorker() *Worker {
+	_, cancel := context.WithCancel(context.Background())
+	return &Worker{cancel: cancel}
+}
+func opaque(*Worker) {}
+func Start() {
+	w := NewWorker()
+	opaque(w)
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
 	}
 }
 
@@ -2107,17 +2502,28 @@ func Start() {
 // existing conservative default still wins for every generation of the
 // field, overwritten or not -- this fix narrows the specific overwrite
 // case, it does not disable the broader fallback.
+// When the handle also escapes in some other, genuinely unresolvable way
+// (here, stored into a package-level variable -- not a call argument, so
+// followHandleArgument's newer, more precise handling does not apply),
+// the existing conservative default still wins for every generation of
+// the field, overwritten or not -- this fix narrows the specific
+// overwrite case, it does not disable the broader fallback. (Passing the
+// handle to a same-package function is covered separately by
+// TestFieldCapture_PassedToDroppingFunctionFires and
+// TestFieldCapture_PassedToUnresolvedFunctionFallsBack, since
+// followHandleArgument now actually resolves that shape rather than
+// treating it as an automatic escape.)
 func TestFieldCapture_OverwrittenFieldFallsBackWhenHandleAlsoEscapes(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
 type h struct{ cancel context.CancelFunc }
-func register(x h) {}
+var stored h
 func Start() {
 	_, cancel1 := context.WithCancel(context.Background())
 	_, cancel2 := context.WithCancel(context.Background())
 	x := h{cancel: cancel1}
 	x.cancel = cancel2
-	register(x)
+	stored = x
 }
 `)
 	if len(diags) != 0 {
