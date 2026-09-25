@@ -168,6 +168,44 @@ func TestTutorialExamples(t *testing.T) {
 		{name: "waitgroup_stored_struct_waited", args: []string{"./examples/waitgroup_stored_struct_waited"}, needle: "no lifecycle diagnostics"},
 		{name: "constructor_cancel_handle_dropped", args: []string{"./examples/constructor_cancel_handle_dropped"}, needle: "[LL1001]"},
 		{name: "constructor_waitgroup_handle_dropped", args: []string{"./examples/constructor_waitgroup_handle_dropped"}, needle: "[LL1003]"},
+		// A call to a method on a tracked handle is followed into the
+		// method's own same-package body (followHandleMethod) rather
+		// than being treated as an unrelated, harmless use of the
+		// handle: a Stop-style method that itself calls the captured
+		// cancel func is verified consumption, and a sibling field that
+		// method never touches still reports.
+		{name: "method_field_consume", args: []string{"./examples/method_field_consume"}, needle: "no lifecycle diagnostics"},
+		{name: "method_one_field_one_leak", args: []string{"./examples/method_one_field_one_leak"}, needle: "[LL1001]"},
+		// A field overwritten by a later plain assignment
+		// (captureFieldReassignment) closes off the old generation
+		// instead of the whole handle falling back to assume-transferred:
+		// the old, never-called binding is a genuine, positive-evidence
+		// leak independent of whatever replaces it.
+		{name: "field_overwrite_old_binding", args: []string{"./examples/field_overwrite_old_binding"}, needle: "[LL1001]"},
+		{name: "field_reassigned_unconsumed_old", args: []string{"./examples/field_reassigned_unconsumed_old"}, needle: "[LL1001]"},
+		// A handle passed as a direct argument to a resolvable
+		// same-package function is followed into that function's own
+		// parameter (followHandleArgument) rather than assumed
+		// transferred on sight -- including through a constructor's own
+		// caller, which shares the same walker.
+		{name: "constructor_opaque_escape", args: []string{"./examples/constructor_opaque_escape"}, needle: "[LL1001]"},
+		// computeParameterConsumption's interprocedural fixed point
+		// (Phase 5) verifies a multi-hop chain of direct cancel-argument
+		// passing to the same depth regardless of which function happens
+		// to be declared first in source -- both directions covered here.
+		{name: "cancel_three_hop_consumed", args: []string{"./examples/cancel_three_hop_consumed"}, needle: "no lifecycle diagnostics"},
+		{name: "cancel_three_hop_caller_first", args: []string{"./examples/cancel_three_hop_caller_first"}, needle: "[LL1001]"},
+		// Stop-before-wait CFG ordering (Phase 6, LL1005): a deferred
+		// cancel that only runs after Wait fires, and the same shape with
+		// an earlier, explicit stop call ahead of Wait stays clean.
+		{name: "defer_cancel_before_wait", args: []string{"./examples/defer_cancel_before_wait"}, needle: "[LL1005]"},
+		{name: "defer_cancel_with_explicit_stop", args: []string{"./examples/defer_cancel_with_explicit_stop"}, needle: "no lifecycle diagnostics"},
+		// Reusing one WaitGroup for a second round of work with no
+		// matching second Wait() (computeGroupRoundBalances, Phase 6's
+		// fourth join-analysis upgrade) -- neither the flat "was Wait ever
+		// observed" check nor a whole-function Add/Done tally alone would
+		// catch this.
+		{name: "waitgroup_second_round_unjoined", args: []string{"./examples/waitgroup_second_round_unjoined"}, needle: "[LL1003]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, code := run(t, root, binary, tc.args...)

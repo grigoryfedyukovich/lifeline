@@ -27,7 +27,7 @@ Status meanings:
 | Distinct invalid/internal exit codes | Implemented | Exit 2 and 3 integration behavior |
 | Diagnostics state protocol and missing element | Implemented | Stable rule contract and protocol fields |
 | Declarative unknown wrappers | Implemented | Context/start/join/stop wrapper lists |
-| Versioned cross-package summaries | Implemented | Fact version 2, object-fact import/export, vet integration fixture |
+| Versioned cross-package summaries | Implemented | Fact version 3, object-fact import/export, vet integration fixture |
 | Fixes only when obvious | Implemented | Only blank cancel in short declaration receives an edit |
 | SSA construction | Partial | A deterministic lifecycle-focused SSA-like summary is built and retained; full Go SSA/CFG is intentionally not claimed |
 | Language-neutral internal model | Implemented | Engine has no AST/types dependency; model uses spans and neutral records |
