@@ -194,11 +194,22 @@ type builder struct {
 	// positive evidence at every checked call site, ever produces a
 	// finding. Populated by computeConstructorCallerConsumption.
 	returnFieldConsumption map[types.Object]bool
-	contextInterface       *types.Interface
-	contextFactories       map[string]struct{}
-	startWrappers          map[string]struct{}
-	joinWrappers           map[string]struct{}
-	stopWrappers           map[string]struct{}
+	// returnFieldConsumptionOnAllPaths records, for the same keys as
+	// returnFieldConsumption (meaningful only where that map holds true),
+	// whether at least one checked caller was found to consume the field
+	// on every one of its own paths -- the constructor-caller analog of
+	// CalledOnAllPaths/JoinedOnAllPaths, see setReturnFieldConsumption's
+	// own doc comment for the merge semantics across multiple callers.
+	// False here alongside true in returnFieldConsumption means every
+	// caller that does consume it only does so on some of its own paths,
+	// which recordReturnedField surfaces as a genuine finding rather than
+	// the blanket assume-transferred fallback.
+	returnFieldConsumptionOnAllPaths map[types.Object]bool
+	contextInterface                 *types.Interface
+	contextFactories                 map[string]struct{}
+	startWrappers                    map[string]struct{}
+	joinWrappers                     map[string]struct{}
+	stopWrappers                     map[string]struct{}
 
 	// receiverSummaries memoizes handleSummaryOf's per-local-variable
 	// result (what a same-package function body does with one of its own
@@ -375,21 +386,22 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		return model.Program{}, fmt.Errorf("frontend requires file set, package, and type information")
 	}
 	b := &builder{
-		in:                     in,
-		cfg:                    cfg,
-		funcs:                  map[*types.Func]*ast.FuncDecl{},
-		analyzed:               map[*types.Func]bool{},
-		summaries:              map[*types.Func]model.Goroutine{},
-		paramConsumption:       map[types.Object]bool{},
-		paramDoneCalled:        map[types.Object]bool{},
-		returnFieldInfo:        map[types.Object][]returnFieldSite{},
-		returnFieldConsumption: map[types.Object]bool{},
-		contextInterface:       findContextInterface(in.Pkg),
-		contextFactories:       stringSet(cfg.ContextWrappers),
-		startWrappers:          stringSet(cfg.StartWrappers),
-		joinWrappers:           stringSet(cfg.JoinWrappers),
-		stopWrappers:           stringSet(cfg.StopWrappers),
-		receiverSummaries:      map[types.Object]*receiverSummary{},
+		in:                               in,
+		cfg:                              cfg,
+		funcs:                            map[*types.Func]*ast.FuncDecl{},
+		analyzed:                         map[*types.Func]bool{},
+		summaries:                        map[*types.Func]model.Goroutine{},
+		paramConsumption:                 map[types.Object]bool{},
+		paramDoneCalled:                  map[types.Object]bool{},
+		returnFieldInfo:                  map[types.Object][]returnFieldSite{},
+		returnFieldConsumption:           map[types.Object]bool{},
+		returnFieldConsumptionOnAllPaths: map[types.Object]bool{},
+		contextInterface:                 findContextInterface(in.Pkg),
+		contextFactories:                 stringSet(cfg.ContextWrappers),
+		startWrappers:                    stringSet(cfg.StartWrappers),
+		joinWrappers:                     stringSet(cfg.JoinWrappers),
+		stopWrappers:                     stringSet(cfg.StopWrappers),
+		receiverSummaries:                map[types.Object]*receiverSummary{},
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
@@ -505,7 +517,7 @@ type cancelState struct {
 	cancelObj types.Object
 	// callSites records every direct call to cancelObj itself (the "cancel-
 	// call" evidence case in observeCall), in AST-node identity form rather
-	// than just the span already on Evidence. computeGroupOrdering
+	// than just the span already on Evidence. computeOrdering
 	// (docs/cfg-migration-plan.md, Phase 3 completion) uses this to find
 	// which CFG block a candidate "stop signal" call landed in, via
 	// Build's call-site map -- a lookup that needs the exact node, not a
@@ -554,7 +566,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	resolveAliasEscapes(states, groups)
 	b.computeGroupBalances(groups, fd.Body, b.in.Info)
 	b.computeGroupRoundBalances(groups, fd.Body, b.in.Info)
-	// computeGroupOrdering needs real control-flow reachability, not
+	// computeOrdering needs real control-flow reachability, not
 	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
 	// receiving a tracked context is trusted to eventually terminate",
 	// calibrated for LL1002's loop-escape question, where treating such a
@@ -567,7 +579,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	// predicate) rather than reusing fn.BodyLifecycle.CFG, at the cost of
 	// building the CFG twice per function.
 	orderingCFG, orderingCallBlocks := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
-	b.computeGroupOrdering(groups, states, fd.Body, orderingCFG, orderingCallBlocks)
+	b.computeOrdering(groups, states, fd.Body, orderingCFG, orderingCallBlocks)
 	if source.obj != nil {
 		b.summaries[source.obj] = cloneGoroutine(fn.BodyLifecycle)
 	}
@@ -1647,7 +1659,7 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 			// verified. A group has several more questions Escapes was
 			// silently answering wrong for: count-interval accounting
 			// (CountMismatch, computeGroupBalances) and the ordering
-			// checks (computeGroupOrdering) are each independently
+			// checks (computeOrdering) are each independently
 			// verified from the group's own recorded Add/Done/Wait call
 			// sites and do not depend on *who* calls Wait -- but engine.go
 			// skips a group's diagnostics entirely whenever Escapes is
@@ -2953,14 +2965,14 @@ func (b *builder) classifyReceiverFieldUse(stack []ast.Node, sel *ast.SelectorEx
 // markCancelFieldConsumed records verified consumption of a cancel
 // binding through a struct field: the same Called flag and call-site
 // bookkeeping a direct `cancel()` call gets from observeCall, so every
-// downstream consumer (LL1001's own check, computeGroupOrdering's stop-
+// downstream consumer (LL1001's own check, computeOrdering's stop-
 // signal detection) treats the two identically.
 //
 // via is empty for a call made directly through the field (`h.cancel()`),
 // and otherwise names the same-package method (`h.Stop()`) whose own body
 // makes that call on the handle's behalf -- in which case call is still
 // the *caller's* call expression (`h.Stop()`), never a node inside the
-// method's body: computeGroupOrdering and the LL1005 stop-signal check
+// method's body: computeOrdering and the LL1005 stop-signal check
 // look call sites up in the CFG of the function being analyzed, which
 // only contains the caller's own nodes.
 func (b *builder) markCancelFieldConsumed(fc *fieldCapture, consumed map[*fieldCapture]bool, call *ast.CallExpr, via string) {
@@ -2980,7 +2992,7 @@ func (b *builder) markCancelFieldConsumed(fc *fieldCapture, consumed map[*fieldC
 // consumption of a group binding through a struct field, mirroring
 // observeCall's direct-receiver handling for the same three methods:
 // Add/Go increment Starts, Wait sets Joined and records a call site
-// (for computeGroupOrdering's own CFG-based ordering checks) the same
+// (for computeOrdering's own CFG-based ordering checks) the same
 // way a direct `wg.Wait()` does. Only Wait marks the capture itself
 // resolved (consumed): an Add/Go-only capture still needs a
 // consumption/return/other-use verdict for its own sake, since seeing a
@@ -3072,6 +3084,30 @@ func (b *builder) recordReturnedField(fnObj *types.Func, fc *fieldCapture, resul
 		b.appendReturnFieldSite(bindingObj, returnFieldSite{fieldName: fc.fieldName, resultIndex: resultIndex, fn: fnObj, kind: kind})
 	}
 	consumedByCaller, verified := b.returnFieldConsumption[bindingObj]
+	if verified && consumedByCaller && !b.returnFieldConsumptionOnAllPaths[bindingObj] {
+		// At least one caller does call the field back, but every caller
+		// found to do so only does it on some of its own paths, never
+		// verifiably every one -- a genuine, positive finding (the
+		// constructor-caller analog of a same-function "stored struct"
+		// field only consumed under `if flag`), not the blanket
+		// assume-transferred fallback this used to collapse into. Set
+		// Called/Joined true (a caller does call it back) and
+		// CalledOnAllPaths/JoinedOnAllPaths explicitly false, so the
+		// ordinary engine.go message logic for that combination applies
+		// unchanged.
+		onAllPathsFalse := false
+		if fc.cancel != nil {
+			fc.cancel.binding.Called = true
+			fc.cancel.binding.CalledOnAllPaths = &onAllPathsFalse
+			fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller calls it back, but not on every one of that caller's own paths", fc.fieldName)})
+		}
+		if fc.group != nil {
+			fc.group.group.Joined = true
+			fc.group.group.JoinedOnAllPaths = &onAllPathsFalse
+			fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller joins it back, but not on every one of that caller's own paths", fc.fieldName)})
+		}
+		return
+	}
 	if !verified || consumedByCaller {
 		markFieldCaptureFallback(fc)
 		if verified && consumedByCaller {
@@ -3218,6 +3254,18 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 	if fd.Body == nil {
 		return false
 	}
+	// Built once per caller (not per matched call site below) and reused
+	// across every verifyConstructorCallerField call this invocation makes:
+	// the "on all paths" question for a consuming call site is about this
+	// caller's own control flow, never the constructor's, so it needs a
+	// fresh, purely structural CFG for callerBody itself, the same kind
+	// computeOrdering already builds separately from BodyLifecycle.CFG for
+	// the identical reason (see that call site's own comment).
+	name := fd.Name.Name
+	if source.obj != nil {
+		name = source.obj.FullName()
+	}
+	callerCFG, callerCallSites := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
 	funcDepth := 0
 	var nodeIsFuncLit []bool
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -3310,7 +3358,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 					// comment) -- skip rather than guess.
 					continue
 				}
-				if b.verifyConstructorCallerField(fd.Body, bindingObj, kind, varObj, site, source.obj) {
+				if b.verifyConstructorCallerField(fd.Body, bindingObj, kind, varObj, site, source.obj, callerCFG, callerCallSites) {
 					reportChanged = true
 				}
 			}
@@ -3334,7 +3382,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 					if varObj == nil {
 						continue
 					}
-					if b.verifyConstructorCallerField(fd.Body, calleeObj, fs.Kind, varObj, returnFieldSite{fieldName: fs.FieldName, resultIndex: fs.ResultIndex, fn: calleeObj, kind: fs.Kind}, source.obj) {
+					if b.verifyConstructorCallerField(fd.Body, calleeObj, fs.Kind, varObj, returnFieldSite{fieldName: fs.FieldName, resultIndex: fs.ResultIndex, fn: calleeObj, kind: fs.Kind}, source.obj, callerCFG, callerCallSites) {
 						reportChanged = true
 					}
 				}
@@ -3371,7 +3419,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 // reportChanged is true iff that registration actually added something
 // new, which is what drives computeConstructorCallerConsumption's own
 // fixed-point sweep.
-func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, kind string, varObj types.Object, site returnFieldSite, callerFn *types.Func) (reportChanged bool) {
+func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, kind string, varObj types.Object, site returnFieldSite, callerFn *types.Func, callerCFG *model.CFG, callerCallSites map[*ast.CallExpr]flowgraph.CallSite) (reportChanged bool) {
 	fc := &fieldCapture{varObj: varObj, fieldName: site.fieldName, returnIndex: -1}
 	switch kind {
 	case "cancel":
@@ -3389,7 +3437,32 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 	idx, passedOnward := returnedAt[varObj]
 	switch {
 	case consumed[fc]:
-		b.setReturnFieldConsumption(bindingObj, true)
+		// onAllPaths asks whether every path through *this caller's* own
+		// body (callerCFG, freshly built for exactly this question --
+		// never the constructor's own body, which has no view of what its
+		// caller does) passes through at least one of the call sites that
+		// credited this consumption -- the same ReachableAvoiding
+		// primitive computeOrdering uses for a same-function "stored
+		// struct" capture, applied here across a function boundary. A
+		// call site with no CFG-block entry (callerCFG == nil, or the
+		// crediting node isn't one callerCallSites recognizes) is treated
+		// as the safe default, matching CalledOnAllPaths'/
+		// JoinedOnAllPaths' own nil-means-"not established" convention:
+		// never a new false positive from an inability to check.
+		onAllPaths := true
+		if callerCFG != nil {
+			var callNodes []*ast.CallExpr
+			switch {
+			case fc.cancel != nil:
+				callNodes = fc.cancel.callSites
+			case fc.group != nil:
+				callNodes = fc.group.waitCallSites
+			}
+			if callBlocks := blockSetOf(callSitesOf(callNodes, callerCallSites)); len(callBlocks) > 0 {
+				onAllPaths = !callerCFG.ReachableAvoiding(callerCFG.Entry, callBlocks)[callerCFG.Exit]
+			}
+		}
+		b.setReturnFieldConsumption(bindingObj, true, onAllPaths)
 	case otherUse[varObj]:
 		// Can't verify at this call site either way (e.g. the caller
 		// passes the handle on somewhere this check does not follow) --
@@ -3406,7 +3479,7 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 			reportChanged = b.appendReturnFieldSite(bindingObj, returnFieldSite{fieldName: site.fieldName, resultIndex: idx, fn: callerFn, kind: site.kind})
 		}
 	default:
-		b.setReturnFieldConsumption(bindingObj, false)
+		b.setReturnFieldConsumption(bindingObj, false, false)
 	}
 	return reportChanged
 }
@@ -3419,9 +3492,24 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 // consuming caller is always enough to clear a binding even if another,
 // earlier-checked caller drops it -- consistent with this file's general
 // preference for avoiding a false positive over catching every leak.
-func (b *builder) setReturnFieldConsumption(obj types.Object, consumed bool) {
+//
+// onAllPaths (meaningful only when consumed is true) is merged into
+// b.returnFieldConsumptionOnAllPaths the same way: true wins permanently
+// over an earlier false, so that any one caller found to consume the
+// binding unconditionally is always enough to settle it as genuinely
+// safe, even if a different, earlier-checked caller only consumes it on
+// some of its own paths. recordReturnedField reads both maps together:
+// consumed-and-on-all-paths is the existing, fully safe verdict;
+// consumed-but-never-found-on-all-paths is new -- a caller does call it
+// back, just not verifiably on every path, which recordReturnedField
+// surfaces as a genuine finding (Called true, CalledOnAllPaths false, or
+// the group equivalent) rather than the blanket assume-transferred
+// fallback a plain "consumed" used to get regardless of how partial the
+// evidence was.
+func (b *builder) setReturnFieldConsumption(obj types.Object, consumed, onAllPaths bool) {
 	if consumed {
 		b.returnFieldConsumption[obj] = true
+		b.returnFieldConsumptionOnAllPaths[obj] = b.returnFieldConsumptionOnAllPaths[obj] || onAllPaths
 		return
 	}
 	if _, already := b.returnFieldConsumption[obj]; !already {
@@ -4169,7 +4257,7 @@ func bodyCallsMethodOn(body ast.Node, obj types.Object, method string, info *typ
 // deferredCallSet returns the set of call expressions in body (not
 // descending into a nested FuncLit, consistent with
 // collectStopWrapperCalls) that are the direct target of a defer
-// statement. computeGroupOrdering uses this to recognize a cancel
+// statement. computeOrdering uses this to recognize a cancel
 // binding whose stop signal is only ever sent via defer: internal/cfg
 // records a defer at the defer statement's own lexical position, not at
 // the function's actual return time (see cfg.go's handling of
@@ -4177,7 +4265,7 @@ func bodyCallsMethodOn(body ast.Node, obj types.Object, method string, info *typ
 // stop-before-wait -- a deferred call always actually runs when the
 // enclosing function is about to return, which is unconditionally after
 // any statement, including a Wait() call, that already ran earlier in
-// the same invocation. See allCallsDeferred and computeGroupOrdering's
+// the same invocation. See allCallsDeferred and computeOrdering's
 // own doc comment for how this is used.
 func deferredCallSet(body *ast.BlockStmt) map[*ast.CallExpr]bool {
 	set := map[*ast.CallExpr]bool{}
@@ -4201,7 +4289,7 @@ func deferredCallSet(body *ast.BlockStmt) map[*ast.CallExpr]bool {
 // so the signal never actually fires until the enclosing function is
 // already on its way out. A binding with no call sites at all is not
 // "all deferred" (there is nothing to have proven anything about); see
-// computeGroupOrdering.
+// computeOrdering.
 func allCallsDeferred(calls []*ast.CallExpr, deferred map[*ast.CallExpr]bool) bool {
 	if len(calls) == 0 {
 		return false
@@ -4217,7 +4305,7 @@ func allCallsDeferred(calls []*ast.CallExpr, deferred map[*ast.CallExpr]bool) bo
 // collectStopWrapperCalls finds every call in body (not descending into a
 // nested FuncLit) that resolves to a configured stop_wrapper -- the same
 // recognition internal/cfg's trusted-stop edges use (b.trustedTerminator),
-// exposed here as plain call sites for computeGroupOrdering's ordering
+// exposed here as plain call sites for computeOrdering's ordering
 // check (Phase 3 completion, "stop-before-wait",
 // docs/cfg-migration-plan.md). A cancel-function call is a separate kind
 // of stop signal and is collected on cancelState.callSites directly by
@@ -4285,14 +4373,28 @@ func stopProvenAfterWait(g *model.CFG, waitSites []flowgraph.CallSite, waitBlock
 	return !reachableAvoidingWaits[stop.Block]
 }
 
-// computeGroupOrdering fills in JoinedOnAllPaths and StopAfterWait for
-// every local group in groups, using the owner function's own CFG and the
-// call-site map internal/cfg.Build produced alongside it (Phase 3
-// completion, "join-before-owner-return" and "stop-before-wait",
-// docs/cfg-migration-plan.md). g may be nil (a function with no body to
-// build a CFG from); every group's fields are then left untouched at
-// their safe defaults (JoinedOnAllPaths nil, StopAfterWait at its zero
-// value of false).
+// computeOrdering fills in JoinedOnAllPaths and StopAfterWait for
+// every local group in groups, and CalledOnAllPaths for every local cancel
+// binding in cancels, using the owner function's own CFG and the call-site
+// map internal/cfg.Build produced alongside it (Phase 3 completion,
+// "join-before-owner-return" and "stop-before-wait",
+// docs/cfg-migration-plan.md, later extended to the analogous cancel-call
+// question). g may be nil (a function with no body to build a CFG from);
+// every field is then left untouched at its safe default (JoinedOnAllPaths
+// and CalledOnAllPaths nil, StopAfterWait at its zero value of false).
+//
+// CalledOnAllPaths reuses the exact same ReachableAvoiding primitive
+// JoinedOnAllPaths already established, applied to a cancel binding's own
+// callSites instead of a group's waitCallSites: it is computed only for a
+// binding whose Called is already true (the flat "was it called anywhere"
+// check LL1001 has always made, unchanged), and only refines that verdict
+// downward on positive evidence of a bypassing path, exactly like
+// JoinedOnAllPaths does for Joined -- never upward, and never from an
+// inability to verify. This applies uniformly regardless of how a call site
+// was credited (a direct call, one credited through a tracked struct field,
+// or one credited through a same-package method call or function argument
+// via followHandleMethod/followHandleArgument), since all of them record
+// the crediting call's own node in this function's own body.
 //
 // A candidate "stop signal" is any call to a configured stop_wrapper
 // (unconditionally trusted, the same way internal/cfg's own trusted-stop
@@ -4340,8 +4442,8 @@ func stopProvenAfterWait(g *model.CFG, waitSites []flowgraph.CallSite, waitBlock
 // of a function, with no other call to it, deadlocks exactly like the
 // equivalent `defer cancel()` case, for the identical reason, but was
 // not caught until this was specifically checked for.
-func (b *builder) computeGroupOrdering(groups []*groupState, cancels []*cancelState, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite) {
-	if g == nil || len(groups) == 0 {
+func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite) {
+	if g == nil || (len(groups) == 0 && len(cancels) == 0) {
 		return
 	}
 	deferredCalls := deferredCallSet(body)
@@ -4361,6 +4463,22 @@ func (b *builder) computeGroupOrdering(groups []*groupState, cancels []*cancelSt
 		deferOnlyStopSeen = true
 	}
 	stopSites := callSitesOf(stopSignals, callSites)
+
+	for _, c := range cancels {
+		if !c.binding.Called {
+			continue // LL1001 already fires on this; nothing further to establish
+		}
+		callBlocks := blockSetOf(callSitesOf(c.callSites, callSites))
+		if len(callBlocks) == 0 {
+			continue // Called came from a shape with no call-site node recorded here (e.g. a variadic-spread element call)
+		}
+		reachableAvoidingCalls := g.ReachableAvoiding(g.Entry, callBlocks)
+		onAllPaths := !reachableAvoidingCalls[g.Exit]
+		c.binding.CalledOnAllPaths = &onAllPaths
+		if !onAllPaths {
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "call-not-on-all-paths", Message: "some path from the function's entry to its return bypasses every call to this cancel function"})
+		}
+	}
 
 	for _, gr := range groups {
 		if !gr.group.Joined {

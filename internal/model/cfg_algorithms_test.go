@@ -220,7 +220,7 @@ func TestReachableAvoiding_StartInAvoidSetIsEmpty(t *testing.T) {
 
 // TestReachableAvoiding_DiamondBypassViaOtherBranch is the CFG-level
 // primitive behind LL1003/LL1004's join-before-owner-return check
-// (internal/frontend.computeGroupOrdering, docs/cfg-migration-plan.md):
+// (internal/frontend.computeOrdering, docs/cfg-migration-plan.md):
 // a Wait() call covering only one of two branches does not guarantee
 // Exit is unreachable without it, since the other branch bypasses it
 // entirely.

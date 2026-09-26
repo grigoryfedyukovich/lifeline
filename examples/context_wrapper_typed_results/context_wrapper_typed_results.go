@@ -8,10 +8,7 @@ func Make(parent context.Context) (context.CancelFunc, context.Context, error) {
 }
 
 func Start(parent context.Context) {
-	cancel, ctx, err := Make(parent)
-	if err != nil {
-		return
-	}
+	cancel, ctx, _ := Make(parent)
 	defer cancel()
 	go func() {
 		for {

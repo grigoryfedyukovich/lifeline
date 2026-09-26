@@ -174,6 +174,65 @@ func TestGroupJoinedOnAllPathsNilTreatedAsFine(t *testing.T) {
 	}
 }
 
+// The following tests are CalledOnAllPaths' own direct analog of the
+// JoinedOnAllPaths tests just above, exercised the same way (hand-built
+// model.CancelBinding fixtures, pinning down engine.go's own verdict logic
+// in isolation from the frontend that populates these fields).
+
+func TestCancelCalledButNotOnAllPathsFires(t *testing.T) {
+	program := model.Program{Functions: []model.Function{{
+		Name:    "Start",
+		Cancels: []model.CancelBinding{{Factory: "context.WithCancel", CancelName: "cancel", Called: true, CalledOnAllPaths: boolPtr(false)}},
+	}}}
+	diags := Analyze(program, config.Default())
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("a cancel func called on some but not every path should fire LL1001, got %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, "some but not every path") {
+		t.Fatalf("message should describe the partial-path finding, got %q", diags[0].Message)
+	}
+}
+
+func TestCancelCalledOnAllPathsSuppressesLL1001(t *testing.T) {
+	program := model.Program{Functions: []model.Function{{
+		Name:    "Start",
+		Cancels: []model.CancelBinding{{Factory: "context.WithCancel", CancelName: "cancel", Called: true, CalledOnAllPaths: boolPtr(true)}},
+	}}}
+	if got := Analyze(program, config.Default()); len(got) != 0 {
+		t.Fatalf("a cancel func called on every path should not fire, got %#v", got)
+	}
+}
+
+func TestCancelCalledOnAllPathsNilTreatedAsFine(t *testing.T) {
+	// CalledOnAllPaths == nil means "not established" (e.g. Called came
+	// from a shape with no call-site node to check reachability against,
+	// or there was no CFG at all), which must be treated the same as
+	// Called's own pre-existing meaning -- never as a disproof.
+	program := model.Program{Functions: []model.Function{{
+		Name:    "Start",
+		Cancels: []model.CancelBinding{{Factory: "context.WithCancel", CancelName: "cancel", Called: true}},
+	}}}
+	if got := Analyze(program, config.Default()); len(got) != 0 {
+		t.Fatalf("nil CalledOnAllPaths should be treated as no evidence of a problem, got %#v", got)
+	}
+}
+
+func TestCancelEscapesOverridesCalledOnAllPaths(t *testing.T) {
+	// Escapes suppresses LL1001 unconditionally, the same way it always
+	// has, regardless of what CalledOnAllPaths says -- this combination
+	// is not expected to arise from the frontend today (a binding that
+	// both escapes and has a verified call-site reachability answer), but
+	// engine.go's own short-circuit order should not accidentally start
+	// firing on it if it ever does.
+	program := model.Program{Functions: []model.Function{{
+		Name:    "Start",
+		Cancels: []model.CancelBinding{{Factory: "context.WithCancel", CancelName: "cancel", Called: true, CalledOnAllPaths: boolPtr(false), Escapes: true}},
+	}}}
+	if got := Analyze(program, config.Default()); len(got) != 0 {
+		t.Fatalf("Escapes should suppress regardless of CalledOnAllPaths, got %#v", got)
+	}
+}
+
 func TestGroupStopAfterWaitFiresLL1005EvenWhenOtherwiseClean(t *testing.T) {
 	program := model.Program{Functions: []model.Function{{
 		Name:   "Start",

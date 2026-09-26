@@ -509,7 +509,7 @@ func run(g *sync.WaitGroup) {
 
 func TestParameterPassing_GroupHelperConditionalWaitUnverifiedGap(t *testing.T) {
 	// Known, accepted limitation (docs/limitations.md): computeParameterConsumption's
-	// scratch pass over the callee's body does not run computeGroupOrdering
+	// scratch pass over the callee's body does not run computeOrdering
 	// or computeGroupBalances against it, so it has no way to tell a
 	// Wait() call that is actually reached from one buried inside a
 	// condition that happens to never be true for this particular call
@@ -1727,7 +1727,7 @@ func Start() {
 
 // TestFieldCapture_GroupAddAndWaitBothThroughFieldBalance exercises
 // markGroupFieldConsumed's Add branch end to end -- including
-// computeGroupOrdering's own CFG-based join-before-return check, which
+// computeOrdering's own CFG-based join-before-return check, which
 // depends on the Wait call site recorded through the field being findable
 // in the flowgraph the same way a direct Wait() call's site is -- by
 // routing both Add and Wait through the same field, with no direct
@@ -2563,6 +2563,137 @@ func Start() {
 	}
 }
 
+// The following tests cover the constructor-caller half of CalledOnAllPaths
+// (audit item #4's other named example, constructor_conditional_consume):
+// a caller that only calls the constructor's returned field back under
+// `if flag` used to be verified the exact same way as one that calls it
+// back unconditionally, since consumed[fc] was itself a flat "found
+// somewhere in the caller" boolean with no notion of the caller's own
+// control flow. verifyConstructorCallerField now also checks, when
+// consumed[fc] is true, whether every path through *the caller's own body*
+// (a fresh CFG built once per caller in computeConstructorCallerConsumption,
+// never the constructor's own CFG, which has no view of what its caller
+// does) passes through at least one of the credited call sites -- merged
+// across every checked caller via setReturnFieldConsumption
+// (returnFieldConsumptionOnAllPaths), and surfaced through the exact same
+// Called/CalledOnAllPaths (or Joined/JoinedOnAllPaths) fields and engine.go
+// message logic a same-function "stored struct" capture already uses.
+
+func TestFieldOwnership_ConstructorCallerConsumesOnSomeButNotAllPathsFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func New() *Worker {
+	_, cancel := context.WithCancel(context.Background())
+	return &Worker{cancel: cancel}
+}
+func cond() bool { return true }
+func Start() {
+	w := New()
+	if cond() {
+		return
+	}
+	w.cancel()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("a caller consuming the constructor's field only on some of its own paths should fire LL1001, got %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, "some but not every path") {
+		t.Fatalf("message should describe the partial-path finding, got %q", diags[0].Message)
+	}
+}
+
+func TestFieldOwnership_ConstructorCallerConsumesOnAllPathsFromBothBranchesDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func New() *Worker {
+	_, cancel := context.WithCancel(context.Background())
+	return &Worker{cancel: cancel}
+}
+func cond() bool { return true }
+func Start() {
+	w := New()
+	if cond() {
+		w.cancel()
+		return
+	}
+	w.cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a caller calling the field back on every branch's own return path should not fire, got %#v", diags)
+	}
+}
+
+// The group analog of the same constructor-caller path-sensitivity,
+// exercising JoinedOnAllPaths/Joined through the same
+// returnFieldConsumptionOnAllPaths plumbing rather than
+// Called/CalledOnAllPaths.
+func TestFieldOwnership_ConstructorCallerJoinsGroupOnSomeButNotAllPathsFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Pool struct{ wg *sync.WaitGroup }
+func New() *Pool {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done() }()
+	return &Pool{wg: &wg}
+}
+func cond() bool { return true }
+func Start() {
+	p := New()
+	if cond() {
+		return
+	}
+	p.wg.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a caller joining the constructor's group only on some of its own paths should fire LL1003, got %#v", diags)
+	}
+}
+
+// A second, independent caller that DOES consume the field on every one of
+// its own paths must settle the verdict as genuinely safe, even though a
+// different, earlier-checked caller only consumes it conditionally --
+// setReturnFieldConsumption's own "true wins permanently" merge, extended
+// to the on-all-paths dimension (returnFieldConsumptionOnAllPaths).
+func TestFieldOwnership_ConstructorOneCallerOnAllPathsOutweighsAnotherPartialCaller(t *testing.T) {
+	// StartFull (fully verified) is declared, and so processed, before
+	// StartPartial (only conditionally verified): this ordering, not the
+	// reverse, is what actually exercises "true wins permanently"
+	// regardless of processing order -- a merge that simply let the most
+	// recently processed caller's answer overwrite the last would still
+	// coincidentally land on the correct verdict if the fully-verified
+	// caller happened to be processed last, the same failure mode a
+	// naive last-write-wins bug could hide behind.
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func New() *Worker {
+	_, cancel := context.WithCancel(context.Background())
+	return &Worker{cancel: cancel}
+}
+func cond() bool { return true }
+func StartFull() {
+	w := New()
+	w.cancel()
+}
+func StartPartial() {
+	w := New()
+	if cond() {
+		return
+	}
+	w.cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("StartFull's own unconditional call should settle the constructor's own binding as safe regardless of processing order, got %#v", diags)
+	}
+}
+
 func TestFieldOwnership_ConstructorCancelDroppedByCallerFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
@@ -3341,7 +3472,7 @@ func TestWaitGroupDeferOnlyCancelStillFiresStopAfterWait(t *testing.T) {
 	// same-block index comparison would (wrongly) conclude the stop
 	// signal is proven to arrive before Wait() and never fire LL1005 at
 	// all, missing a deterministic deadlock. See allCallsDeferred and
-	// computeGroupOrdering's own doc comment.
+	// computeOrdering's own doc comment.
 	diags := analyzeSource(t, `package p
 import (
 	"context"
@@ -3372,7 +3503,7 @@ func TestWaitGroupDeferCancelAlongsideExplicitStopBeforeWaitDoesNotFire(t *testi
 	// examples/stop_before_wait's own shape: the explicit call already
 	// proves the signal is sent before Wait() regardless of the
 	// deferred call's own (misleadingly early) recorded position, so the
-	// all-deferred short-circuit in computeGroupOrdering must not apply
+	// all-deferred short-circuit in computeOrdering must not apply
 	// merely because *a* call site for this binding happens to be a
 	// defer -- only when *every* call site is.
 	diags := analyzeSource(t, `package p
@@ -4096,6 +4227,117 @@ func Start(){
 	}
 }
 
+// The following tests cover CalledOnAllPaths -- the cancel-call analog of
+// JoinedOnAllPaths just above, closing audit item #4 ("field/constructor
+// consume is not path-sensitive"): a cancel func called under `if flag`
+// with no other call anywhere else used to be indistinguishable from one
+// called unconditionally, since Called was a flat "was it called
+// anywhere" boolean. computeOrdering now also computes, for every cancel
+// binding whose Called is already true, whether every path from the
+// owner's own entry to its exit passes through at least one of its
+// recorded call sites -- exactly mirroring the same ReachableAvoiding
+// check JoinedOnAllPaths already established for a WaitGroup's own Wait()
+// call, and inheriting the same, already-accepted block-granularity
+// limitations (see TestOrderingSemantics_DeferredCancelAtTopIsNotFlagged
+// below and docs/limitations.md).
+
+func TestCancelCalledOnSomeButNotAllPathsFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func cond() bool { return true }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-ctx.Done() }()
+	if cond() {
+		return
+	}
+	cancel()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("a cancel() bypassed by an early return should fire LL1001, got diagnostics = %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, "some but not every path") {
+		t.Fatalf("message should describe the partial-path finding, got %q", diags[0].Message)
+	}
+}
+
+func TestCancelCalledOnAllPathsFromBothBranchesDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func cond() bool { return true }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-ctx.Done() }()
+	if cond() {
+		cancel()
+		return
+	}
+	cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a cancel() call present on every branch's own return path should not fire, got diagnostics = %#v", diags)
+	}
+}
+
+// This is the exact same, already-accepted block-granularity behavior
+// TestOrderingSemantics_DeferredWaitAtTopIsNotFlagged documents for
+// WaitGroup, applied to cancel: a `defer cancel()` placed immediately
+// after WithCancel puts the call site in the entry block, so
+// ReachableAvoiding(entry, {entry-block}) returns the empty set and
+// CalledOnAllPaths comes out true regardless of what follows -- correct
+// for this extremely common idiom, but for a block-granularity reason
+// rather than real defer-semantics understanding. See docs/limitations.md.
+func TestOrderingSemantics_DeferredCancelAtTopIsNotFlagged(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func cond() bool { return true }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { <-ctx.Done() }()
+	if cond() {
+		return
+	}
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a deferred cancel() declared immediately after WithCancel, with everything else following it lexically, should not be flagged, got %#v", diags)
+	}
+}
+
+// The known, already-accepted flip side of the same limitation (matching
+// the pre-existing WaitGroup behavior exactly, not a new risk this
+// introduces): a defer placed *after* an early-return check -- the
+// ubiquitous "construct, check error, return; else defer cleanup" Go
+// idiom -- puts the call site in a block the early-return path never
+// reaches, so this fires even though the pattern is completely standard
+// and safe. This is documented, not fixed, here: fixing it soundly would
+// need value-flow reasoning connecting the error result to the returned
+// cancel func's own validity, which is out of scope for a purely
+// structural CFG check. See docs/limitations.md.
+func TestCancelDeferAfterErrorCheckFiresLikeWaitGroupDoes(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import (
+	"context"
+	"errors"
+)
+func setup() error { return errors.New("boom") }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := setup(); err != nil {
+		return
+	}
+	defer cancel()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
 func TestOrderingSemantics_DeferredWaitAtTopIsNotFlagged(t *testing.T) {
 	// A `defer wg.Wait()` placed immediately after the WaitGroup is
 	// declared -- the canonical way to guarantee a join on every return
@@ -4104,7 +4346,7 @@ func TestOrderingSemantics_DeferredWaitAtTopIsNotFlagged(t *testing.T) {
 	// statement's own lexical position rather than at the function's
 	// actual exit (see internal/cfg/cfg.go's handling of *ast.DeferStmt).
 	// That positioning puts this Wait call site in the entry block,
-	// lexically before the later Add()/go; computeGroupOrdering's
+	// lexically before the later Add()/go; computeOrdering's
 	// ReachableAvoiding(entry, {entry-block}) then returns the empty set
 	// (ReachableAvoiding treats a start block that is itself in the
 	// avoid set as unable to reach anything, per
@@ -4114,7 +4356,7 @@ func TestOrderingSemantics_DeferredWaitAtTopIsNotFlagged(t *testing.T) {
 	// for a block-granularity reason that has nothing to do with actually
 	// understanding defer's run-at-return semantics. This test exists so
 	// that a future change to defer's CFG placement, or to
-	// computeGroupOrdering's block-granularity reachability check, can't
+	// computeOrdering's block-granularity reachability check, can't
 	// silently start flagging this extremely common, correct idiom as a
 	// join-ordering violation. See docs/limitations.md.
 	diags := analyzeSource(t, `package p

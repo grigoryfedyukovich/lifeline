@@ -51,6 +51,24 @@ type CancelBinding struct {
 	UsedByChild  bool          `json:"used_by_child"`
 	Evidence     []Evidence    `json:"evidence,omitempty"`
 	SuggestedFix *SuggestedFix `json:"suggested_fix,omitempty"`
+	// CalledOnAllPaths, when non-nil, is the owner function's own CFG-
+	// verified answer (model.CFG.ReachableAvoiding) to whether every path
+	// from entry to exit passes through at least one of this binding's own
+	// recorded call sites -- the cancel-call analog of JoinGroup's own
+	// JoinedOnAllPaths (see its doc comment for the shared design this
+	// mirrors, including the nil-means-"not established" convention: Called
+	// is false to begin with, or there was no CFG to check against). A call
+	// reachable on some path is not the same guarantee as one reachable on
+	// every path, and a flat bool alone can't tell those apart from "never
+	// checked" -- exactly the gap JoinedOnAllPaths already closed for a
+	// WaitGroup's own Wait() call. Populated for every recorded call site
+	// regardless of how it was found -- a direct call, a call credited
+	// through a tracked struct field, or one credited through a same-
+	// package method call or function argument (followHandleMethod/
+	// followHandleArgument) -- since all of them record the crediting
+	// call's own node in the owner function's body, the only thing this
+	// check needs.
+	CalledOnAllPaths *bool `json:"called_on_all_paths,omitempty"`
 }
 
 type Goroutine struct {

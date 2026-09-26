@@ -71,12 +71,24 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 	var out []Diagnostic
 	for _, fn := range program.Functions {
 		for _, c := range fn.Cancels {
-			if c.Called || c.Escapes || (!c.Discarded && c.CancelName == "") {
+			// calledOnAllPaths mirrors JoinGroup.JoinedOnAllPaths' own
+			// nil-means-"not established" convention (see its doc comment):
+			// this only ever downgrades a verdict on positive evidence of a
+			// bypassing path, never upward, and never from an inability to
+			// check -- Called's own flat "was it called anywhere" meaning is
+			// unchanged when this is nil.
+			calledOnAllPaths := c.CalledOnAllPaths == nil || *c.CalledOnAllPaths
+			if (c.Called && calledOnAllPaths) || c.Escapes || (!c.Discarded && c.CancelName == "") {
 				continue
 			}
-			msg := fmt.Sprintf("cancel function returned by %s is discarded", c.Factory)
-			if !c.Discarded {
+			var msg string
+			switch {
+			case !c.Called && !c.Discarded:
 				msg = fmt.Sprintf("cancel function %q returned by %s has no observed call or ownership transfer", c.CancelName, c.Factory)
+			case !c.Called:
+				msg = fmt.Sprintf("cancel function returned by %s is discarded", c.Factory)
+			default: // c.Called && !calledOnAllPaths
+				msg = fmt.Sprintf("cancel function %q returned by %s is called on some but not every path back to the owner's return", c.CancelName, c.Factory)
 			}
 			suggestion := "call the cancellation function on every path, usually with defer immediately after construction"
 			if c.UsedByChild {

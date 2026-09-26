@@ -206,6 +206,12 @@ func TestTutorialExamples(t *testing.T) {
 		// observed" check nor a whole-function Add/Done tally alone would
 		// catch this.
 		{name: "waitgroup_second_round_unjoined", args: []string{"./examples/waitgroup_second_round_unjoined"}, needle: "[LL1003]"},
+		// CalledOnAllPaths (audit item #4, "field/constructor consume is
+		// not path-sensitive"): a cancel func only called under `if flag`
+		// is a genuine finding now, whether the field is local to the
+		// function or reached back through a constructor's own caller.
+		{name: "field_conditional_consume", args: []string{"./examples/field_conditional_consume"}, needle: "[LL1001]"},
+		{name: "constructor_conditional_consume", args: []string{"./examples/constructor_conditional_consume"}, needle: "[LL1001]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, code := run(t, root, binary, tc.args...)
