@@ -212,6 +212,13 @@ func TestTutorialExamples(t *testing.T) {
 		// function or reached back through a constructor's own caller.
 		{name: "field_conditional_consume", args: []string{"./examples/field_conditional_consume"}, needle: "[LL1001]"},
 		{name: "constructor_conditional_consume", args: []string{"./examples/constructor_conditional_consume"}, needle: "[LL1001]"},
+		// Alias/copy verification (audit item #5, "alias/copy consume is
+		// fallback, not verification"): a call through a value or pointer
+		// alias is genuine, attributed consumption (collectFieldAliases),
+		// and an alias that never calls the field back is a real leak, not
+		// a coincidental silence.
+		{name: "field_alias_consumed", args: []string{"./examples/field_alias_consumed"}, needle: "no lifecycle diagnostics"},
+		{name: "field_alias_never_consumed", args: []string{"./examples/field_alias_never_consumed"}, needle: "[LL1001]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, code := run(t, root, binary, tc.args...)

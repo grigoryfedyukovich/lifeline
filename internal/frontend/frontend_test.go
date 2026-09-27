@@ -1810,6 +1810,204 @@ func Start() {
 
 // Only the field the method actually consumes is credited: the sibling
 // field the method never touches is still a genuine, confirmed leak.
+// The following tests cover audit item #5 ("alias/copy consume is
+// fallback, not verification"): `x := w` (a whole-variable value copy) or
+// `p := &w` (a pointer alias), where w already holds a tracked field
+// capture, used to be indistinguishable from any other generic use of w --
+// classifyFieldCaptureUse's own fallback marked w otherUse on sight, which
+// happened to also suppress LL1001/LL1003 regardless of whether the alias
+// (or anything else) ever actually consumed the field. collectFieldAliases
+// now recognizes this shape and registers the new variable as resolving to
+// the same canonical capture, so a call through the alias is genuine,
+// attributed consumption -- and, symmetrically, an alias that never calls
+// it back is now a genuine, reported leak, not silently masked by the
+// alias-creating assignment itself.
+
+func TestFieldCapture_ValueAliasConsumesFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := worker{cancel: cancel}
+	x := w
+	x.cancel()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// The key proof this mechanism does genuine verification rather than
+// coincidentally suppressing everything: an alias that is created but
+// never calls the field back must still report the leak. Before
+// collectFieldAliases existed, `x := w` alone was enough to mark w
+// otherUse and silently suppress this regardless.
+func TestFieldCapture_ValueAliasNeverConsumesFieldFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := worker{cancel: cancel}
+	x := w
+	_ = x
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("an alias that never calls the field back should still leak, got %#v", diags)
+	}
+}
+
+// The sharpest proof of genuine, per-field attribution (as opposed to a
+// blanket escape that would silently clear every field on w at once): the
+// alias consumes one field but not a sibling, and only the untouched
+// sibling should still fire.
+func TestFieldCapture_ValueAliasConsumesOneFieldOtherStillFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct {
+	cancel context.CancelFunc
+	other  context.CancelFunc
+}
+func Start() {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	w := worker{cancel: cancel1, other: cancel2}
+	x := w
+	x.cancel()
+	go func() { <-ctx2.Done() }()
+	_ = ctx1
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("expected exactly one LL1001 (other/cancel2), got %#v", diags)
+	}
+	msgs := evidenceMessages(diags[0], "field-not-consumed")
+	if len(msgs) != 1 || !strings.Contains(msgs[0], `"other"`) {
+		t.Fatalf("the leak reported should be field %q, got evidence %#v", "other", diags[0].Evidence)
+	}
+}
+
+func TestFieldCapture_PointerAliasConsumesFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := worker{cancel: cancel}
+	p := &w
+	p.cancel()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_PointerAliasNeverConsumesFieldFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := worker{cancel: cancel}
+	p := &w
+	_ = p
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("a pointer alias that never calls the field back should still leak, got %#v", diags)
+	}
+}
+
+// A chained alias (y := x, where x itself already aliases w) resolves
+// through to w directly, thanks to Go's declare-before-use rule
+// guaranteeing x's own aliasing assignment is seen first in the same
+// top-to-bottom walk collectFieldAliases makes.
+func TestFieldCapture_ChainedAliasConsumesFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := worker{cancel: cancel}
+	x := w
+	y := x
+	y.cancel()
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// The group analog of the same value-alias verification.
+func TestFieldCapture_ValueAliasWaitsGroupDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type pool struct{ wg *sync.WaitGroup }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	w := pool{wg: &wg}
+	x := w
+	go func() { defer wg.Done() }()
+	x.wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldCapture_ValueAliasNeverWaitsGroupFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type pool struct{ wg *sync.WaitGroup }
+func Start() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	w := pool{wg: &wg}
+	x := w
+	_ = x
+	go func() { defer wg.Done() }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Aliasing w does not stop w's own, separate later uses from being
+// classified normally: here w itself (not the alias) escapes into an
+// unresolvable sink, and that must still fall back conservatively exactly
+// as it would with no alias in the picture at all.
+func TestFieldCapture_OriginalStillEscapesAfterBeingAliased(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+var kept worker
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := worker{cancel: cancel}
+	x := w
+	_ = x
+	kept = w
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("w's own later escape should still fall back conservatively, got %#v", diags)
+	}
+}
+
 func TestFieldCapture_MethodConsumesOneFieldOtherStillFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
@@ -2301,6 +2499,72 @@ func Start() {
 // The constructor-returned shape shares walkFieldCaptureUses with the
 // local stored-struct shape, so a caller consuming through a method is
 // verified the same way.
+// The constructor-caller half of audit item #5: verifyConstructorCallerField
+// calls collectFieldAliases against the caller's own body too, so a
+// caller that copies the constructor's returned handle into a second
+// local variable before consuming it through that copy is verified the
+// same way a same-function "stored struct" alias is above.
+
+func TestFieldOwnership_ConstructorCallerValueAliasConsumesFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func newWorker() worker {
+	_, cancel := context.WithCancel(context.Background())
+	return worker{cancel: cancel}
+}
+func Start() {
+	w := newWorker()
+	x := w
+	x.cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// The key proof for the constructor-caller path too: an alias of the
+// constructor's own returned handle that never calls the field back must
+// still report the leak, not be silently masked by the copy itself.
+func TestFieldOwnership_ConstructorCallerValueAliasNeverConsumesFieldFires(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type worker struct{ cancel context.CancelFunc }
+func newWorker() worker {
+	_, cancel := context.WithCancel(context.Background())
+	return worker{cancel: cancel}
+}
+func Start() {
+	w := newWorker()
+	x := w
+	_ = x
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("an alias of the constructor's own handle that never calls it back should still leak, got %#v", diags)
+	}
+}
+
+func TestFieldOwnership_ConstructorCallerCopyOfPointerConsumesFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func NewWorker() *Worker {
+	_, cancel := context.WithCancel(context.Background())
+	return &Worker{cancel: cancel}
+}
+func Start() {
+	w1 := NewWorker()
+	w2 := w1
+	w2.cancel()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
 func TestFieldOwnership_ConstructorCallerConsumesThroughMethodDoesNotFire(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"

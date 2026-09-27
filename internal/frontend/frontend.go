@@ -2245,6 +2245,100 @@ func ancestor(stack []ast.Node, n int) ast.Node {
 // the same way, independently of each other, with walkFieldCaptureUses
 // crediting a given read only to whichever generation was live at that
 // read's position.
+// collectFieldAliases scans body for a whole-variable copy (`x := w` or
+// `x = w`) or pointer alias (`p := &w` or `p = &w`) of a variable already
+// known to hold a field capture -- tracked, keyed by canonical variable
+// object, true for every var this build already has captures for --
+// registering the new variable (x or p) as an alias resolving to the same
+// canonical object w itself resolves to (aliasOf[x] = w). This is the
+// mechanism behind audit item #5 ("alias/copy consume is fallback, not
+// verification"): without it, `x := w; x.cancel()` had no way to credit
+// x's own call back to w's capture, since x is a wholly different
+// types.Object with no fieldCapture of its own -- the assignment itself
+// fell to classifyFieldCaptureUse's generic otherUse fallback for w, which
+// happened to also suppress LL1001/LL1003 regardless of whether x (or
+// anything else) ever actually consumed the field.
+//
+// A chained alias (`y := x` where x already aliases w) resolves through
+// to w directly, never to x: aliasOf already holds aliasOf[x] = w by the
+// time this same top-to-bottom ast.Inspect walk reaches `y := x`, Go's own
+// declare-before-use rule guaranteeing x's own aliasing assignment was
+// seen first.
+//
+// Only a bare `ident := ident` or `ident := &ident` is recognized -- a
+// struct literal, a function call's result, a field access, an index
+// expression, or any other shape is deliberately left alone; those are
+// either handled elsewhere (a literal, by collectFieldCaptures itself; a
+// constructor call, by the separate verifyConstructorCallerField path
+// that calls this same helper) or fall to the ordinary, conservative
+// assume-transferred default, as before this capability existed.
+func collectFieldAliases(body ast.Node, info *types.Info, tracked map[types.Object]bool, aliasOf map[types.Object]types.Object) {
+	ast.Inspect(body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || (as.Tok != token.DEFINE && as.Tok != token.ASSIGN) || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		lhs, ok := as.Lhs[0].(*ast.Ident)
+		if !ok || lhs.Name == "_" {
+			return true
+		}
+		lhsObj := info.ObjectOf(lhs)
+		if lhsObj == nil {
+			return true
+		}
+		rhs := as.Rhs[0]
+		if u, ok := rhs.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			rhs = u.X
+		}
+		rid, ok := rhs.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		rhsObj := info.Uses[rid]
+		if rhsObj == nil {
+			return true
+		}
+		canonical := rhsObj
+		if c, isAlias := aliasOf[rhsObj]; isAlias {
+			canonical = c
+		}
+		if tracked[canonical] {
+			aliasOf[lhsObj] = canonical
+		}
+		return true
+	})
+}
+
+// isAliasCreatingAssignment reports whether id (an occurrence of a
+// canonical, tracked variable or one of its own aliases) is exactly the
+// right-hand side -- or, wrapped in `&id`, the operand -- of the single
+// assignment statement that collectFieldAliases already recognized as
+// creating a new alias for it. walkFieldCaptureUses uses this to treat
+// that occurrence as inert (creating the alias, not a read/use of it) the
+// same way classifyFieldCaptureUse already treats a tracked field's own
+// `h.field = value` write as a documented no-op rather than a generic,
+// disqualifying use -- without this, `x := w` would itself mark w
+// otherUse on sight, permanently masking any genuine leak neither w nor
+// x ever actually consumes.
+func isAliasCreatingAssignment(stack []ast.Node, id *ast.Ident, aliasOf map[types.Object]types.Object, info *types.Info) bool {
+	rhsExpr := ast.Expr(id)
+	parent := ancestor(stack, 1)
+	if u, ok := parent.(*ast.UnaryExpr); ok && u.Op == token.AND {
+		rhsExpr = ast.Expr(u)
+		parent = ancestor(stack, 2)
+	}
+	as, ok := parent.(*ast.AssignStmt)
+	if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 || as.Rhs[0] != rhsExpr {
+		return false
+	}
+	lhs, ok := as.Lhs[0].(*ast.Ident)
+	if !ok {
+		return false
+	}
+	_, isKnownAlias := aliasOf[info.ObjectOf(lhs)]
+	return isKnownAlias
+}
+
 func (b *builder) resolveFieldCaptures(fnObj *types.Func, body *ast.BlockStmt, captures []*fieldCapture) {
 	if len(captures) == 0 {
 		return
@@ -2262,10 +2356,16 @@ func (b *builder) resolveFieldCaptures(fnObj *types.Func, body *ast.BlockStmt, c
 	if len(byVar) == 0 {
 		return
 	}
+	tracked := make(map[types.Object]bool, len(byVar))
+	for varObj := range byVar {
+		tracked[varObj] = true
+	}
+	aliasOf := map[types.Object]types.Object{}
+	collectFieldAliases(body, b.in.Info, tracked, aliasOf)
 	consumed := map[*fieldCapture]bool{}
 	returnedAt := map[types.Object]int{}
 	otherUse := map[types.Object]bool{}
-	b.walkFieldCaptureUses(body, byVar, consumed, returnedAt, otherUse)
+	b.walkFieldCaptureUses(body, byVar, aliasOf, consumed, returnedAt, otherUse)
 
 	for varObj, fcs := range byVar {
 		idx, wasReturned := returnedAt[varObj]
@@ -2296,7 +2396,7 @@ func (b *builder) resolveFieldCaptures(fnObj *types.Func, body *ast.BlockStmt, c
 // funcDepth tracking already uses) so classifyFieldCaptureUse can look at
 // an identifier's immediate call/selector context without go/ast's own
 // Inspect providing parent links directly.
-func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*fieldCapture, consumed map[*fieldCapture]bool, returnedAt map[types.Object]int, otherUse map[types.Object]bool) {
+func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*fieldCapture, aliasOf map[types.Object]types.Object, consumed map[*fieldCapture]bool, returnedAt map[types.Object]int, otherUse map[types.Object]bool) {
 	if body == nil || len(byVar) == 0 {
 		return
 	}
@@ -2308,8 +2408,12 @@ func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*
 		}
 		if id, ok := n.(*ast.Ident); ok && id.Name != "_" {
 			if obj := b.in.Info.Uses[id]; obj != nil {
-				if fcs, tracked := byVar[obj]; tracked {
-					b.classifyFieldCaptureUse(stack, id, obj, fcs, consumed, returnedAt, otherUse)
+				canonical := obj
+				if c, isAlias := aliasOf[obj]; isAlias {
+					canonical = c
+				}
+				if fcs, tracked := byVar[canonical]; tracked && !isAliasCreatingAssignment(stack, id, aliasOf, b.in.Info) {
+					b.classifyFieldCaptureUse(stack, id, canonical, fcs, consumed, returnedAt, otherUse)
 				}
 			}
 		}
@@ -3433,7 +3537,9 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 	returnedAt := map[types.Object]int{}
 	otherUse := map[types.Object]bool{}
 	byVar := map[types.Object][]*fieldCapture{varObj: {fc}}
-	b.walkFieldCaptureUses(callerBody, byVar, consumed, returnedAt, otherUse)
+	aliasOf := map[types.Object]types.Object{}
+	collectFieldAliases(callerBody, b.in.Info, map[types.Object]bool{varObj: true}, aliasOf)
+	b.walkFieldCaptureUses(callerBody, byVar, aliasOf, consumed, returnedAt, otherUse)
 	idx, passedOnward := returnedAt[varObj]
 	switch {
 	case consumed[fc]:
