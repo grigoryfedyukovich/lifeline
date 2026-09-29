@@ -1810,6 +1810,244 @@ func Start() {
 
 // Only the field the method actually consumes is credited: the sibling
 // field the method never touches is still a genuine, confirmed leak.
+// The following tests cover audit item #6 ("in-struct WaitGroup fields are
+// never tracked"): a `sync.WaitGroup` *value* field of a local struct
+// variable (`var w struct{ a, b sync.WaitGroup }`) has no declaring
+// identifier of its own anywhere in the source -- it exists only as part
+// of w's zero value -- so collectBindings, which only recognized a group
+// from its own declaring identifier, never saw it at all (0 groups, always
+// clean). collectBindings now mints one synthetic identity per owned group
+// field (fieldGroupObject), resolveGroupReceiver correlates `w.a.Add(...)`
+// / `w.a.Wait()` back to it, and markFieldGroupEscapes is the conservative
+// safety net that keeps any other use of w from becoming a false finding.
+
+func TestFieldGroup_UnwaitedFieldFiresWaitedSiblingDoesNot(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Workers struct{ a, b sync.WaitGroup }
+func Start() {
+	var w Workers
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	w.b.Add(1)
+	go func() { defer w.b.Done() }()
+	w.a.Wait()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("expected exactly one LL1003 (for w.b), got %#v", diags)
+	}
+	if !strings.Contains(diags[0].Message, `"w.b"`) {
+		t.Fatalf("the leak reported should be w.b, got %q", diags[0].Message)
+	}
+}
+
+func TestFieldGroup_WaitedFieldDoesNotFire(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type W struct{ a sync.WaitGroup }
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	w.a.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Two variables of the same struct type must never share an identity: the
+// struct's own field *types.Var is shared per type, so the key must
+// include the owning variable.
+func TestFieldGroup_TwoVariablesOfSameTypeAreIndependent(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type W struct{ a sync.WaitGroup }
+func Start() {
+	var w1, w2 W
+	w1.a.Add(1)
+	go func() { defer w1.a.Done() }()
+	w2.a.Add(1)
+	go func() { defer w2.a.Done() }()
+	w1.a.Wait()
+}
+`)
+	if len(diags) != 1 || !strings.Contains(diags[0].Message, `"w2.a"`) {
+		t.Fatalf("only w2.a should be reported, got %#v", diags)
+	}
+}
+
+// The regression this capability's own first draft had, caught by
+// probing before shipping: `waitFor(&w.a)`, `keep = &w.a`, and
+// `run(&w)` each hand the group off somewhere the field-group check
+// cannot follow. Before synthetic groups existed the field was invisible
+// and silent; without markFieldGroupEscapes each of these fired a false
+// LL1003, since every other ownership-transfer mechanism in this file
+// resolves an expression to a real types.Object and a synthetic identity
+// never is one for `&w.a`.
+func TestFieldGroup_OwnershipTransferIsNotAFalsePositive(t *testing.T) {
+	cases := map[string]string{
+		"address of field passed": `func waitFor(wg *sync.WaitGroup) { wg.Wait() }
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	waitFor(&w.a)
+}`,
+		"address of field stored": `var keep *sync.WaitGroup
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	keep = &w.a
+}`,
+		"struct address passed": `func run(w *W) { w.a.Wait() }
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	run(&w)
+}`,
+		"struct copied": `func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	x := w
+	_ = x
+}`,
+		"method on struct": `func (w *W) Close() { w.a.Wait() }
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	w.Close()
+}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			diags := analyzeSource(t, `package p
+import "sync"
+type W struct{ a sync.WaitGroup }
+`+body+"\n")
+			if len(diags) != 0 {
+				t.Fatalf("handing the group off must fall back conservatively, got %#v", diags)
+			}
+		})
+	}
+}
+
+// Blank-discarding the struct is inert, matching how the rest of this
+// file treats `_ = h`: it must not by itself be read as an escape that
+// silences a genuine leak.
+func TestFieldGroup_BlankDiscardOfStructIsInert(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type W struct{ a sync.WaitGroup }
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	_ = w
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// A *pointer* group field does not own its group -- it can alias one this
+// same function already tracks under its own real identity, so claiming a
+// synthetic identity for it double-counted the group and reported the
+// copy as never joined whenever the real one was (a false LL1003 this
+// capability's own first draft had, caught by probing before shipping).
+func TestFieldGroup_PointerFieldAliasingTrackedGroupDoesNotDoubleCount(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type Handle struct{ wg *sync.WaitGroup }
+func Start() {
+	var wg sync.WaitGroup
+	h := &Handle{wg: &wg}
+	h.wg.Add(1)
+	go func() { defer h.wg.Done() }()
+	wg.Wait()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("a pointer field aliasing an already-tracked group must not be tracked separately, got %#v", diags)
+	}
+}
+
+// Path-sensitivity comes along for free, since JoinedOnAllPaths keys on
+// the recorded Wait call site's own AST node rather than on receiver
+// resolution: a Wait reachable on only some paths is a real finding for a
+// field group too.
+func TestFieldGroup_ConditionalWaitFiresPathSensitively(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type W struct{ a sync.WaitGroup }
+func cond() bool { return true }
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	if cond() {
+		return
+	}
+	w.a.Wait()
+}
+`)
+	if len(diags) != 1 || !strings.Contains(diags[0].Message, "some but not every path") {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldGroup_DeferredWaitAtTopIsNotFlagged(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type W struct{ a sync.WaitGroup }
+func cond() bool { return true }
+func Start() {
+	var w W
+	defer w.a.Wait()
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	if cond() {
+		return
+	}
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+// Documents the deliberate scope boundary rather than hiding it: a field
+// group gets Starts/Joined, LL1003, and the call-site-keyed ordering
+// check, but not the later Phase 6 refinements that resolve a receiver
+// through selectorReceiverObject (CountMismatch, UnjoinedRound), so a
+// second round of work after the last Wait is not caught for a field
+// group the way it is for a plain local. If that ever gets extended,
+// this test should flip to expecting the finding.
+func TestFieldGroup_SecondRoundReuseIsNotDetectedYet(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "sync"
+type W struct{ a sync.WaitGroup }
+func Start() {
+	var w W
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+	w.a.Wait()
+	w.a.Add(1)
+	go func() { defer w.a.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("documented gap: UnjoinedRound is not extended to field groups; if this now fires, update this test and docs/limitations.md, got %#v", diags)
+	}
+}
+
 // The following tests cover audit item #5 ("alias/copy consume is
 // fallback, not verification"): `x := w` (a whole-variable value copy) or
 // `p := &w` (a pointer alias), where w already holds a tracked field

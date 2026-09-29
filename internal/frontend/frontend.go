@@ -97,6 +97,24 @@ type builder struct {
 	funcs     map[*types.Func]*ast.FuncDecl
 	analyzed  map[*types.Func]bool
 	summaries map[*types.Func]model.Goroutine
+	// fieldGroupObjects memoizes a synthetic *types.Var identity for each
+	// (base local variable, group-typed field name) pair this build has
+	// seen -- e.g. w.a and w.b for `var w struct{ a, b sync.WaitGroup }`
+	// (audit item #6, "in-struct WaitGroup fields never tracked"). A
+	// group-typed field has no declaring identifier of its own anywhere in
+	// the source (it exists only as part of its struct's own zero value),
+	// unlike every other binding this file tracks, so there is no real
+	// types.Object to key a groupState on; this map's whole purpose is
+	// minting one and guaranteeing every later lookup for the same pair
+	// returns the identical pointer, since types.Object equality (needed
+	// throughout this file to correlate an Add/Wait/Done call back to its
+	// own group) is pointer identity. See fieldGroupObject.
+	fieldGroupObjects map[fieldGroupKey]*types.Var
+	// fieldGroupOwners is fieldGroupObjects' reverse index: from a
+	// synthetic identity back to the (base variable, field name) pair it
+	// stands for, so markFieldGroupEscapes can tell which of a function's
+	// groups are synthetic field groups and what they belong to.
+	fieldGroupOwners map[*types.Var]fieldGroupKey
 	// paramConsumption records, for a cancel-like or group-like function
 	// parameter's own *types.Var object, whether that function's own body
 	// consumes it (calls it, or further transfers it) -- Phase 5 of the
@@ -391,6 +409,8 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		funcs:                            map[*types.Func]*ast.FuncDecl{},
 		analyzed:                         map[*types.Func]bool{},
 		summaries:                        map[*types.Func]model.Goroutine{},
+		fieldGroupObjects:                map[fieldGroupKey]*types.Var{},
+		fieldGroupOwners:                 map[*types.Var]fieldGroupKey{},
 		paramConsumption:                 map[types.Object]bool{},
 		paramDoneCalled:                  map[types.Object]bool{},
 		returnFieldInfo:                  map[types.Object][]returnFieldSite{},
@@ -563,6 +583,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
 	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn, source.obj)
+	b.markFieldGroupEscapes(fd.Body, groups)
 	resolveAliasEscapes(states, groups)
 	b.computeGroupBalances(groups, fd.Body, b.in.Info)
 	b.computeGroupRoundBalances(groups, fd.Body, b.in.Info)
@@ -762,6 +783,26 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 			}
 			kind := groupKind(obj.Type())
 			if kind == "" {
+				// Not itself a group -- but a local struct variable
+				// whose own direct fields include group-typed ones
+				// (`var w struct{ a, b sync.WaitGroup }`) is, for each
+				// such field, its own independent group with no
+				// declaring identifier anywhere in the source (audit
+				// item #6). Mint one synthetic identity per field
+				// (fieldGroupObject) so resolveGroupReceiver can later
+				// correlate `w.a.Add(...)`/`w.a.Wait()` back to it.
+				// Limited to a *local variable* with a struct or
+				// struct-pointer type: a function parameter's own
+				// declaring identifier lives in fd.Type.Params, outside
+				// the body this walk covers.
+				if _, isVar := obj.(*types.Var); isVar {
+					seenGroups[obj] = true
+					for _, f := range structGroupFields(obj.Type()) {
+						fieldKind := groupKind(f.Type())
+						synth := b.fieldGroupObject(obj, f.Name(), f.Type())
+						groups = append(groups, &groupState{obj: synth, group: model.JoinGroup{Kind: fieldKind, Name: x.Name + "." + f.Name(), Span: b.span(x)}})
+					}
+				}
 				break
 			}
 			seenGroups[obj] = true
@@ -1633,7 +1674,7 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 		}
 	}
 	for _, g := range groups {
-		receiver := selectorReceiverObject(call.Fun, b.in.Info)
+		receiver := b.resolveGroupReceiver(call.Fun)
 		if receiver == g.obj {
 			switch selectorMethod(call.Fun) {
 			case "Add", "Go":
@@ -5007,6 +5048,224 @@ func isContextType(t types.Type, contextInterface *types.Interface) bool {
 		return false
 	}
 	return types.Implements(t, contextInterface) || (base != t && types.Implements(base, contextInterface))
+}
+
+// fieldGroupKey identifies one group-typed field of one specific local
+// variable -- e.g. (w, "a") for `w.a` where w is `var w struct{ a, b
+// sync.WaitGroup }` -- the key fieldGroupObject memoizes a synthetic
+// identity under. base is the field's own owning variable's types.Object,
+// never the field's own (shared-per-type, not per-variable) *types.Var
+// from the struct's own definition -- two different Workers-typed
+// variables must never collide on the same identity.
+type fieldGroupKey struct {
+	base  types.Object
+	field string
+}
+
+// fieldGroupObject returns the synthetic identity for base's own field
+// named fieldName, of type fieldType, creating and memoizing one on first
+// use so every later call for the same (base, field) pair -- whether from
+// collectBindings' own eager scan or a later Add/Wait/Done call site --
+// returns the identical pointer (see builder.fieldGroupObjects' own doc
+// comment for why that identity, not just a value, is what's needed).
+func (b *builder) fieldGroupObject(base types.Object, fieldName string, fieldType types.Type) *types.Var {
+	key := fieldGroupKey{base: base, field: fieldName}
+	if v, ok := b.fieldGroupObjects[key]; ok {
+		return v
+	}
+	v := types.NewVar(base.Pos(), base.Pkg(), base.Name()+"."+fieldName, fieldType)
+	b.fieldGroupObjects[key] = v
+	b.fieldGroupOwners[v] = key
+	return v
+}
+
+// markFieldGroupEscapes is the conservative safety net that makes
+// synthetic field groups (fieldGroupObject) safe to track at all. Every
+// other ownership-transfer mechanism in this file (observeEscapeAssignment,
+// observeContainerEscape, observeReturn, argument passing, ...) recognizes
+// a group by resolving an expression to a real types.Object, which a
+// synthetic identity can never be for an expression like `&w.a` -- so
+// without this, `waitFor(&w.a)` or `keep = &w.a` would each look like a
+// group that starts workers and is never joined (a false LL1003), where
+// before synthetic groups existed the field was simply invisible and
+// silent. So for a synthetic group the rule is the opposite of every
+// other tracked binding's: any use of the owning struct variable other
+// than a recognized direct call (`w.f.Add/Go/Wait/Done(...)` on that
+// group's own field, or an access to some unrelated field of w) is
+// assumed to hand the group off somewhere this check does not follow,
+// and marks it Escapes -- the same assume-transferred fallback used
+// everywhere else, never a false finding. That covers passing or
+// returning or storing w or &w or &w.f, copying w (`x := w`), calling a
+// method on w (whose body might touch the field), and taking a field
+// through embedding. A blank discard (`_ = w`) is inert, matching
+// classifyFieldCaptureUse's own treatment of it.
+func (b *builder) markFieldGroupEscapes(body ast.Node, groups []*groupState) {
+	byBase := map[types.Object][]*groupState{}
+	for _, g := range groups {
+		v, ok := g.obj.(*types.Var)
+		if !ok {
+			continue
+		}
+		if key, ok := b.fieldGroupOwners[v]; ok {
+			byBase[key.base] = append(byBase[key.base], g)
+		}
+	}
+	if len(byBase) == 0 || body == nil {
+		return
+	}
+	escape := func(g *groupState) {
+		if !g.group.Escapes {
+			g.group.Escapes = true
+			g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "field-group-escape", Message: "the struct holding this group, or the group's own field, is used in a way this check does not follow; assuming ownership is transferred"})
+		}
+	}
+	var stack []ast.Node
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if id, ok := n.(*ast.Ident); ok {
+			if gs, tracked := byBase[b.in.Info.Uses[id]]; tracked && b.in.Info.Uses[id] != nil {
+				b.classifyFieldGroupBaseUse(stack, id, gs, escape)
+			}
+		}
+		stack = append(stack, n)
+		return true
+	})
+}
+
+// classifyFieldGroupBaseUse decides what one occurrence of a synthetic
+// field group's owning variable does to each of that variable's synthetic
+// groups gs -- see markFieldGroupEscapes.
+func (b *builder) classifyFieldGroupBaseUse(stack []ast.Node, id *ast.Ident, gs []*groupState, escape func(*groupState)) {
+	escapeAll := func() {
+		for _, g := range gs {
+			escape(g)
+		}
+	}
+	parent := ancestor(stack, 1)
+	if sel, ok := parent.(*ast.SelectorExpr); ok && sel.X == ast.Expr(id) {
+		selection := b.in.Info.Selections[sel]
+		if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 {
+			escapeAll() // a method on the struct, or a field promoted through embedding
+			return
+		}
+		for _, g := range gs {
+			key := b.fieldGroupOwners[g.obj.(*types.Var)]
+			if key.field != sel.Sel.Name {
+				continue // an access to some other field of the same struct
+			}
+			outer, ok := ancestor(stack, 2).(*ast.SelectorExpr)
+			call, isCall := ancestor(stack, 3).(*ast.CallExpr)
+			if ok && outer.X == ast.Expr(sel) && isCall && call.Fun == ast.Expr(outer) {
+				switch outer.Sel.Name {
+				case "Add", "Go", "Wait", "Done":
+					continue // a recognized direct call on this group's own field
+				}
+			}
+			escape(g)
+		}
+		return
+	}
+	if as, ok := parent.(*ast.AssignStmt); ok {
+		for i, rhs := range as.Rhs {
+			if rhs == ast.Expr(id) && pairedLHSIsBlank(as, i) {
+				return // `_ = w`
+			}
+		}
+	}
+	escapeAll()
+}
+
+// isOwnedGroupField reports whether a struct field of type t is a group
+// the enclosing struct itself owns: a group *value* (`sync.WaitGroup`,
+// `errgroup.Group`) lives inside the struct's own memory and can only be
+// reached through it, whereas a *pointer* to a group can alias any other
+// group at all -- including one this same function already tracks under
+// its own, real identity (`h := &Handle{wg: &wg}` makes h.wg and wg the
+// same group). Claiming a synthetic identity for a pointer field would
+// double-count that group and, worse, report the synthetic copy as
+// never joined whenever the real one is (a false LL1003), so only owned,
+// value-typed fields qualify.
+func isOwnedGroupField(t types.Type) bool {
+	if _, isPtr := t.Underlying().(*types.Pointer); isPtr {
+		return false
+	}
+	return groupKind(t) != ""
+}
+
+// structGroupFields returns every direct field of t (a struct type, or a
+// pointer to one) that isOwnedGroupField -- the fields of `var w
+// struct{ a, b sync.WaitGroup }` collectBindings scans to synthesize one
+// groupState per field. A field promoted from an embedded struct is not
+// visited: NumField/Field only enumerate t's own direct fields, matching
+// how this file treats promoted methods elsewhere (never followed).
+func structGroupFields(t types.Type) []*types.Var {
+	st, ok := deref(t).Underlying().(*types.Struct)
+	if !ok {
+		return nil
+	}
+	var fields []*types.Var
+	for i := 0; i < st.NumFields(); i++ {
+		f := st.Field(i)
+		if isOwnedGroupField(f.Type()) {
+			fields = append(fields, f)
+		}
+	}
+	return fields
+}
+
+// resolveGroupReceiver is selectorReceiverObject's own builder-aware
+// extension, tried only where a group's Starts/Joined accounting itself
+// is established (observeCall's own Add/Go/Wait handling): where the
+// plain, unextended resolution finds nothing, this additionally
+// recognizes `w.a.Method()` -- fun's own receiver (w.a) is itself a
+// selector, on a plain local variable w, naming a direct field whose type
+// looks like a group -- and returns fieldGroupObject's synthetic identity
+// for it, the same one collectBindings already minted when it first saw
+// w's own declaration.
+//
+// This is deliberately not a wholesale replacement of
+// selectorReceiverObject at its other call sites (computeGroupBalances'
+// own count-mismatch tally, computeGroupRoundBalances' own round
+// splitting, and the stop-signal search these feed): those still use the
+// plain, unextended function, so a group-typed struct field gets this
+// file's original, pre-Phase-6 level of support -- Starts/Joined and
+// LL1003 itself -- but not that later work's own further refinements
+// (CountMismatch, UnjoinedRound, JoinedOnAllPaths/StopAfterWait ordering).
+// This is a deliberate, narrower scope for this capability, not an
+// oversight; see docs/limitations.md for why extending every one of those
+// consistently was judged separately from getting the core gap (a
+// group-typed struct field being invisible at all) closed.
+func (b *builder) resolveGroupReceiver(fun ast.Expr) types.Object {
+	if recv := selectorReceiverObject(fun, b.in.Info); recv != nil {
+		return recv
+	}
+	outer, ok := fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil
+	}
+	inner, ok := outer.X.(*ast.SelectorExpr)
+	if !ok {
+		return nil
+	}
+	baseID, ok := inner.X.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	baseObj := b.in.Info.Uses[baseID]
+	if baseObj == nil {
+		return nil
+	}
+	selection := b.in.Info.Selections[inner]
+	if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 {
+		return nil // not a direct field of base's own type, or not a field at all
+	}
+	if !isOwnedGroupField(selection.Type()) {
+		return nil
+	}
+	return b.fieldGroupObject(baseObj, inner.Sel.Name, selection.Type())
 }
 
 func groupKind(t types.Type) string {

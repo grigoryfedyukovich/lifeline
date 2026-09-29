@@ -219,6 +219,11 @@ func TestTutorialExamples(t *testing.T) {
 		// a coincidental silence.
 		{name: "field_alias_consumed", args: []string{"./examples/field_alias_consumed"}, needle: "no lifecycle diagnostics"},
 		{name: "field_alias_never_consumed", args: []string{"./examples/field_alias_never_consumed"}, needle: "[LL1001]"},
+		// A sync.WaitGroup value field of a local struct variable has no
+		// declaring identifier of its own, so it used to be invisible
+		// ("0 groups", always clean): w.b is started and never waited, w.a
+		// is joined (audit item #6, synthetic field-group identities).
+		{name: "shared_waitgroup_fields", args: []string{"./examples/shared_waitgroup_fields"}, needle: "[LL1003]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, code := run(t, root, binary, tc.args...)
