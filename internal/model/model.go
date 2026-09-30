@@ -189,7 +189,7 @@ const (
 	EdgeGoto        EdgeKind = "goto"         // an explicit goto to a labeled statement
 	EdgeReturn      EdgeKind = "return"       // return, to the function's Exit block
 	EdgePanic       EdgeKind = "panic"        // panic(...), to the function's Exit block
-	EdgeTrustedStop EdgeKind = "trusted-stop" // a recognized stop-wrapper call or context delegation, trusted to terminate even though it is not itself a return, panic, or CFG-visible branch
+	EdgeTrustedStop EdgeKind = "trusted-stop" // from a recognized stop-wrapper call or context delegation straight to Exit: the callee is trusted to be ABLE to end the worker; the block also keeps its ordinary edge to the code after the call, since the call may return normally
 )
 
 // Edge is a directed control-flow edge between two blocks of the same CFG.

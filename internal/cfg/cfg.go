@@ -31,16 +31,24 @@ import (
 //
 // isTrustedTerminator, if non-nil, is consulted for every call expression
 // encountered as a statement (or as the right-hand side of an assignment or
-// send): if it reports true, that call is treated as terminating control
-// flow, with an edge straight to Exit (EdgeTrustedStop), the same way a
-// panic is. This exists for signals that are not visible in pure control
-// flow at all -- a configured stop-wrapper call, or a tracked context
-// passed to a called operation -- where the caller (internal/frontend,
-// which knows the relevant config and which objects are tracked contexts)
-// has already decided the call should be trusted to terminate. internal/cfg
-// itself has no notion of config or tracked contexts; it only acts on what
-// this predicate tells it. Pass nil for a purely structural CFG, e.g. for
-// -dump cfg, which has no such trust decision to apply.
+// send): if it reports true, that call may end the worker, and the block
+// holding it gets an extra edge straight to Exit (EdgeTrustedStop) IN
+// ADDITION to its ordinary edge to whatever follows -- the call is a
+// branch, not a terminator, because it may just as well return normally
+// (`context.WithCancel(ctx)`, or any helper that merely receives a
+// context). A loop containing such a call is therefore still credited with
+// an escape (the trusted-stop edge leaves its SCC), while code after the
+// call, including a later loop, stays reachable and is judged on its own.
+// Modeling the call as a terminator instead (this package's original
+// behavior) turned everything after it into dead code. This exists for
+// signals that are not visible in pure control flow at all -- a configured
+// stop-wrapper call, or a tracked context passed to a called operation --
+// where the caller (internal/frontend, which knows the relevant config and
+// which objects are tracked contexts) has already decided the call should
+// be trusted to honor cancellation. internal/cfg itself has no notion of
+// config or tracked contexts; it only acts on what this predicate tells it.
+// Pass nil for a purely structural CFG, e.g. for -dump cfg, which has no
+// such trust decision to apply.
 //
 // Nested function literals are not descended into, matching the rest of
 // Lifeline's architecture: each function literal has its own independent
@@ -75,8 +83,9 @@ import (
 // same block apart, since neither is doing anything to structurally
 // escape the other. Execution within a single block is always strictly
 // sequential, though (nothing internal/cfg builds ever leaves a block
-// early and then resumes it -- a panic, trusted-stop, or return always
-// ends the block outright), so comparing Index directly resolves the
+// early and then resumes it -- a panic or return always ends the block
+// outright, and a trusted call ends it with a fresh block for whatever
+// follows), so comparing Index directly resolves the
 // same-block case completely; a caller only needs ReachableAvoiding for
 // the cross-block case. See Build's own doc comment for exactly which
 // calls get a CallSite recorded at all.
@@ -131,8 +140,8 @@ type builder struct {
 // position (see Build's doc comment) and is being processed while
 // b.current is the active block. Called before that statement's own
 // control-flow effects run and before the corresponding instruction is
-// emitted (a trusted-stop or panic call reassigns b.current to
-// invalidBlock right after, and either way exactly one instruction gets
+// emitted (a trusted-call reassigns b.current to a fresh block, a panic
+// call to invalidBlock, right after, and either way exactly one instruction gets
 // emitted per processed statement), so the recorded block is always the
 // one execution was actually in when the call happened, and the recorded
 // index always matches the position that instruction will occupy.
@@ -334,9 +343,23 @@ func (b *builder) simpleStmt(s ast.Stmt) {
 	}
 	if b.isTrustedTerminator != nil {
 		if call, ok := b.findCall(s, b.isTrustedTerminator); ok {
-			b.emit("trusted-stop", s, calleeName(b.info, call), nil, nil)
-			b.addEdge(b.ensureCurrent(), b.exit, model.EdgeTrustedStop, "", b.spanOf(s))
-			b.current = invalidBlock
+			// A trusted call is an assumption about what the callee does
+			// with cancellation, not a fact about control flow: the call
+			// may just as well return normally, and the code after it then
+			// runs. So it is modeled as a branch, not a terminator: an
+			// ordinary edge to the code that follows, plus a trusted-stop
+			// edge to Exit ("the callee may end this worker"). A loop that
+			// contains the call is still credited with an escape (the
+			// trusted-stop edge leaves its SCC); code after the call --
+			// including a later loop -- stays reachable and is judged on
+			// its own. Treating the call as a terminator (the previous
+			// behavior) turned everything after it into dead code.
+			b.emit("trusted-call", s, calleeName(b.info, call), nil, nil)
+			cur := b.ensureCurrent()
+			next := b.newBlock("after-trusted-call")
+			b.addEdge(cur, next, model.EdgeNormal, "", b.spanOf(s))
+			b.addEdge(cur, b.exit, model.EdgeTrustedStop, "", b.spanOf(s))
+			b.current = next
 			return
 		}
 	}
@@ -358,7 +381,7 @@ func (b *builder) simpleStmt(s ast.Stmt) {
 // own direct effect position: a bare call statement's call, or each
 // right-hand side of an assignment that is itself a call (covering both
 // `wg.Add(1)` and `err := g.Wait()` alike). This runs unconditionally,
-// before the panic/trusted-stop check below: which of those a statement
+// before the panic/trusted-call check below: which of those a statement
 // turns out to be doesn't change which block it executed in, and a caller
 // asking Build's call-site map about a specific call doesn't care whether
 // internal/cfg separately decided to treat it as a trusted terminator.

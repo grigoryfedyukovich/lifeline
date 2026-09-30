@@ -121,7 +121,8 @@ type constraints interface {
 // model.Solve, from real CFG structure alone: a block "provably consumes"
 // stop capability if it has an outgoing edge that itself leads straight to
 // the function's exit -- a trusted-stop edge (a configured stop-wrapper
-// call or delegated context, see internal/cfg's EdgeTrustedStop), a
+// call or delegated context, see internal/cfg's EdgeTrustedStop; that
+// block also keeps its ordinary continuation edge), a
 // return, or a panic. This is a local check on the block's own edges, not
 // a global "can this function reach exit at all" question (model.CanReach
 // would be too permissive here: in a select loop, the branch that merely

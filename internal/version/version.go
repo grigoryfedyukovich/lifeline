@@ -12,6 +12,13 @@ const (
 	// Version does not match exactly, so an older fact is simply
 	// unavailable rather than reinterpreted with the new field defaulted
 	// to a possibly-wrong value.
-	FactVersion = 3
+	//
+	// FactVersion 4 changes what LoopUnresolved means without changing its
+	// shape: a call that receives a tracked context (or a configured stop
+	// wrapper) no longer models the rest of the function as unreachable,
+	// so a version-3 fact may claim a loop was resolved only because an
+	// earlier delegation deleted it from the graph (audit finding F1).
+	// Rejecting version-3 facts is safer than reinterpreting them.
+	FactVersion = 4
 	Backend     = "local-ast-types-ssa-summary/v2"
 )

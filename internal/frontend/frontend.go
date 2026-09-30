@@ -589,14 +589,17 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	b.computeGroupRoundBalances(groups, fd.Body, b.in.Info)
 	// computeOrdering needs real control-flow reachability, not
 	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
-	// receiving a tracked context is trusted to eventually terminate",
-	// calibrated for LL1002's loop-escape question, where treating such a
-	// call as if it reached the function's exit is a reasonable
-	// abstraction. It is not a reasonable one here -- context.WithCancel
-	// obviously returns normally, and the extremely common `ctx, cancel :=
-	// context.WithCancel(parent)` idiom would otherwise make everything
-	// after it look unreachable from entry, which is never actually true.
-	// So this builds its own, separate, purely structural CFG (nil trust
+	// receiving a tracked context is trusted to be able to end the
+	// worker", calibrated for LL1002's loop-escape question, where an
+	// assumed extra edge to the function's exit is a reasonable
+	// abstraction. It is not a reasonable one here -- ReachableAvoiding
+	// asks "is there a path from entry to exit that skips this call", and
+	// the assumed edge out of the extremely common `ctx, cancel :=
+	// context.WithCancel(parent)` idiom would be exactly such a path,
+	// making every cleanup look skippable. (The trusted call itself no
+	// longer hides the code after it -- see internal/cfg's Build -- but
+	// the extra exit edge still would distort this question.) So this
+	// builds its own, separate, purely structural CFG (nil trust
 	// predicate) rather than reusing fn.BodyLifecycle.CFG, at the cost of
 	// building the CFG twice per function.
 	orderingCFG, orderingCallBlocks := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
@@ -4790,7 +4793,10 @@ func labeledLoops(body ast.Node) map[*ast.ForStmt]string {
 // trustedTerminator returns a predicate recognizing a call as a "trusted
 // terminator" for CFG construction: a configured stop-wrapper call, or a
 // call receiving one of contexts' tracked objects as an argument (context
-// delegation). This is exactly the call-recognition loopExitEvidence
+// delegation). "Terminator" is shorthand for "trusted to be able to end
+// the worker": internal/cfg models such a call as a branch (an extra edge
+// to Exit alongside the ordinary continuation), never as the end of
+// control flow, because the call may return normally. This is exactly the call-recognition loopExitEvidence
 // already applies when collecting loop-scoped evidence, extracted into a
 // form internal/cfg can consult without needing to know about config or
 // tracked contexts itself -- internal/cfg only ever sees this predicate,
