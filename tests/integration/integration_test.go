@@ -286,6 +286,43 @@ func TestVetCrossPackageFactCatchesMixedResolutionLoop(t *testing.T) {
 	}
 }
 
+// TestVetCrossPackageFactDelegationBeforeLoopStaysUnresolved covers audit
+// finding F1 through the exported fact: a worker that delegates its context
+// to a call that returns normally and only then enters an unconditional
+// loop must export LoopUnresolved, so a consumer in another package is
+// still warned.
+func TestVetCrossPackageFactDelegationBeforeLoopStaysUnresolved(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	cmd := exec.Command("go", "vet", "-vettool="+binary, "./tests/testdata/facts/delegated_consumer")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("go vet unexpectedly succeeded: the worker's loop is not resolved by an earlier delegation and should be flagged\n%s", out)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("go vet: %v\n%s", err, out)
+	}
+	text := string(out)
+	if !strings.Contains(text, "[LL1002]") || !strings.Contains(text, "versioned lifecycle fact") {
+		t.Fatalf("cross-package fact diagnostic missing for delegation-before-loop\n%s", text)
+	}
+}
+
+// TestVetCrossPackageFactDelegationInsideLoopStaysResolved is the other
+// half: delegating the context from inside the loop keeps crediting that
+// loop, so the consumer stays clean.
+func TestVetCrossPackageFactDelegationInsideLoopStaysResolved(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	cmd := exec.Command("go", "vet", "-vettool="+binary, "./tests/testdata/facts/delegated_loop_consumer")
+	cmd.Dir = root
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go vet reported a diagnostic for delegation inside the loop, which should stay resolved: %v\n%s", err, out)
+	}
+}
+
 // TestVetCrossPackageFactCatchesMixedResolutionLoopExample is the
 // examples/-hosted counterpart to TestVetCrossPackageFactCatchesMixedResolutionLoop
 // above: same pattern, but as a runnable example under examples/ (see
