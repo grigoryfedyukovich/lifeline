@@ -63,11 +63,11 @@ type Input struct {
 	// found among this package's own b.returnFieldInfo.
 	//
 	// Unlike the other two Lookup* hooks, a positive result here cannot
-	// ever change the constructor's own diagnostic the way a same-package
-	// verification does: that verdict is recorded into
-	// b.returnFieldConsumption, keyed by the constructor's own local
-	// binding object -- which exists only within the same build as the
-	// constructor's own source, i.e. only for a same-package constructor.
+	// ever produce a finding the way a same-package verification does:
+	// the per-call-site verdict is recorded into b.callerVerdicts, but
+	// only turned into a caller-attributed finding (recordReturnedField)
+	// for a constructor whose own binding exists in this same build,
+	// i.e. only for a same-package constructor.
 	// A cross-package constructor's package has already been analyzed and
 	// its diagnostics already finalized by the time this package (a
 	// dependent) is analyzed; go/analysis facts flow from a dependency to
@@ -195,39 +195,41 @@ type builder struct {
 	// functions happen to be declared in) -- consumed by
 	// computeConstructorCallerConsumption itself to know which functions
 	// are "constructors" worth checking callers of, and by
-	// recordReturnedField's own lookup into returnFieldConsumption below
+	// recordReturnedField's own lookup into callerVerdicts below
 	// once every function's callers have been checked.
 	returnFieldInfo map[types.Object][]returnFieldSite
-	// returnFieldConsumption records, for the same binding-object keys as
-	// returnFieldInfo, whether a resolvable direct (same-package,
-	// statically-called) caller of the owning constructor was found to
-	// read the returned struct's field back and consume it --
-	// true: at least one such caller does; false: at least one such
-	// caller was checked and confidently does not, and none does;
-	// absent: no caller could be checked with confidence either way, or
-	// the constructor is never called within this package's analyzed
-	// bound. Absent is treated exactly like true (the conservative
-	// assume-transferred default used throughout this file whenever a
-	// value's fate can't be verified) -- only an explicit false, from
-	// positive evidence at every checked call site, ever produces a
-	// finding. Populated by computeConstructorCallerConsumption.
-	returnFieldConsumption map[types.Object]bool
-	// returnFieldConsumptionOnAllPaths records, for the same keys as
-	// returnFieldConsumption (meaningful only where that map holds true),
-	// whether at least one checked caller was found to consume the field
-	// on every one of its own paths -- the constructor-caller analog of
-	// CalledOnAllPaths/JoinedOnAllPaths, see setReturnFieldConsumption's
-	// own doc comment for the merge semantics across multiple callers.
-	// False here alongside true in returnFieldConsumption means every
-	// caller that does consume it only does so on some of its own paths,
-	// which recordReturnedField surfaces as a genuine finding rather than
-	// the blanket assume-transferred fallback.
-	returnFieldConsumptionOnAllPaths map[types.Object]bool
-	contextInterface                 *types.Interface
-	contextFactories                 map[string]struct{}
-	startWrappers                    map[string]struct{}
-	joinWrappers                     map[string]struct{}
-	stopWrappers                     map[string]struct{}
+	// callerVerdicts records, for the same binding-object keys as
+	// returnFieldInfo, one verified verdict PER CONSTRUCTOR CALL SITE (and
+	// per result/field site, for a binding reachable through several):
+	// whether that specific call's returned handle is consumed by the
+	// function containing the call, and if so whether on every path of
+	// that function. Verdicts are deliberately not merged across call
+	// sites. Each call creates a distinct runtime handle, so one caller
+	// consuming its own handle says nothing about another caller's
+	// (audit finding F2: a merged "true wins" flag let one good caller
+	// hide every bad one). A site whose fate cannot be verified (the
+	// handle is passed somewhere this check does not follow, or forwarded
+	// onward by a pass-through wrapper) is recorded as unverified, so it
+	// yields no finding either way. Populated by
+	// computeConstructorCallerConsumption; consumed by recordReturnedField,
+	// which turns the unconsumed/partially consumed sites into
+	// caller-attributed findings (see callerFinding).
+	callerVerdicts map[types.Object]map[callerSiteKey]callerVerdict
+	// collectObligations is true only while buildFunction's real pass
+	// runs, so recordReturnedField registers pendingObligations exactly
+	// once per function and not from the scratch pre-passes that also
+	// reach it. pendingObligations are resolved at the end of
+	// buildFunction (once the constructor's own Called/Joined-on-all-paths
+	// facts are final) into callerFindings, which Build attaches to the
+	// callers' own functions after every function has been built.
+	collectObligations bool
+	pendingObligations []pendingObligation
+	callerFindings     []callerFinding
+	contextInterface   *types.Interface
+	contextFactories   map[string]struct{}
+	startWrappers      map[string]struct{}
+	joinWrappers       map[string]struct{}
+	stopWrappers       map[string]struct{}
 
 	// receiverSummaries memoizes handleSummaryOf's per-local-variable
 	// result (what a same-package function body does with one of its own
@@ -404,24 +406,23 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		return model.Program{}, fmt.Errorf("frontend requires file set, package, and type information")
 	}
 	b := &builder{
-		in:                               in,
-		cfg:                              cfg,
-		funcs:                            map[*types.Func]*ast.FuncDecl{},
-		analyzed:                         map[*types.Func]bool{},
-		summaries:                        map[*types.Func]model.Goroutine{},
-		fieldGroupObjects:                map[fieldGroupKey]*types.Var{},
-		fieldGroupOwners:                 map[*types.Var]fieldGroupKey{},
-		paramConsumption:                 map[types.Object]bool{},
-		paramDoneCalled:                  map[types.Object]bool{},
-		returnFieldInfo:                  map[types.Object][]returnFieldSite{},
-		returnFieldConsumption:           map[types.Object]bool{},
-		returnFieldConsumptionOnAllPaths: map[types.Object]bool{},
-		contextInterface:                 findContextInterface(in.Pkg),
-		contextFactories:                 stringSet(cfg.ContextWrappers),
-		startWrappers:                    stringSet(cfg.StartWrappers),
-		joinWrappers:                     stringSet(cfg.JoinWrappers),
-		stopWrappers:                     stringSet(cfg.StopWrappers),
-		receiverSummaries:                map[types.Object]*receiverSummary{},
+		in:                in,
+		cfg:               cfg,
+		funcs:             map[*types.Func]*ast.FuncDecl{},
+		analyzed:          map[*types.Func]bool{},
+		summaries:         map[*types.Func]model.Goroutine{},
+		fieldGroupObjects: map[fieldGroupKey]*types.Var{},
+		fieldGroupOwners:  map[*types.Var]fieldGroupKey{},
+		paramConsumption:  map[types.Object]bool{},
+		paramDoneCalled:   map[types.Object]bool{},
+		returnFieldInfo:   map[types.Object][]returnFieldSite{},
+		callerVerdicts:    map[types.Object]map[callerSiteKey]callerVerdict{},
+		contextInterface:  findContextInterface(in.Pkg),
+		contextFactories:  stringSet(cfg.ContextWrappers),
+		startWrappers:     stringSet(cfg.StartWrappers),
+		joinWrappers:      stringSet(cfg.JoinWrappers),
+		stopWrappers:      stringSet(cfg.StopWrappers),
+		receiverSummaries: map[types.Object]*receiverSummary{},
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
@@ -528,6 +529,7 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	for _, source := range sources[:limit] {
 		program.Functions = append(program.Functions, b.buildFunction(source))
 	}
+	b.attachCallerFindings(&program)
 	return program, nil
 }
 
@@ -582,7 +584,9 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
 	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
+	b.collectObligations = true
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn, source.obj)
+	b.collectObligations = false
 	b.markFieldGroupEscapes(fd.Body, groups)
 	resolveAliasEscapes(states, groups)
 	b.computeGroupBalances(groups, fd.Body, b.in.Info)
@@ -604,6 +608,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	// building the CFG twice per function.
 	orderingCFG, orderingCallBlocks := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
 	b.computeOrdering(groups, states, fd.Body, orderingCFG, orderingCallBlocks)
+	b.resolveObligations()
 	if source.obj != nil {
 		b.summaries[source.obj] = cloneGoroutine(fn.BodyLifecycle)
 	}
@@ -3196,20 +3201,25 @@ func markFieldCaptureUnconsumed(fc *fieldCapture) {
 // recordReturnedField is the shared landing point for both a capture
 // known outright to be returned (an inline literal in a return
 // statement) and one resolveFieldCaptures determined is returned via a
-// local variable: it registers the constructor shape into
+// local variable. It registers the constructor shape into
 // b.returnFieldInfo (for computeConstructorCallerConsumption to find, on
-// the pre-pass call from computeFieldOwnership) and, using whatever
-// b.returnFieldConsumption already holds for this binding (populated by
-// computeConstructorCallerConsumption before buildFunction's real pass
-// runs -- empty on the pre-pass's own call, which is fine, since that
-// call's only purpose is populating returnFieldInfo in the first place),
-// settles the binding's own Escapes/evidence: verified-consumed-by-a-
-// caller and not-yet-verified both apply the same conservative
-// assume-transferred fallback (recordReturnedField cannot itself tell
-// them apart from any evidence beyond the flag, so both get the same
-// safe treatment other than which evidence message is recorded);
-// verified as NOT consumed by every checked caller leaves Escapes false,
-// so the ordinary LL1001/LL1003 checks fire.
+// the pre-pass call from computeFieldOwnership) and settles the
+// constructor's own binding.
+//
+// A returned handle is an ownership transfer: the constructor no longer
+// holds the obligation, each direct caller does, one distinct obligation
+// per call site. So once any caller has been verified, the constructor's
+// own binding is settled as transferred (Escapes) and never reports on
+// the callers' behalf; each caller whose own handle is not consumed (or
+// only on some paths) is reported at its own call site instead, via
+// pendingObligations/callerFindings. With no verified caller (the
+// constructor is never called in this package, or every caller does
+// something this check cannot follow) the ordinary conservative
+// assume-transferred fallback applies, exactly as before.
+//
+// Merging the callers' verdicts into one flag on the constructor, as this
+// used to, let a single good caller silence every bad one (audit
+// finding F2).
 func (b *builder) recordReturnedField(fnObj *types.Func, fc *fieldCapture, resultIndex int) {
 	var bindingObj types.Object
 	switch {
@@ -3231,64 +3241,245 @@ func (b *builder) recordReturnedField(fnObj *types.Func, fc *fieldCapture, resul
 		}
 		b.appendReturnFieldSite(bindingObj, returnFieldSite{fieldName: fc.fieldName, resultIndex: resultIndex, fn: fnObj, kind: kind})
 	}
-	consumedByCaller, verified := b.returnFieldConsumption[bindingObj]
-	if verified && consumedByCaller && !b.returnFieldConsumptionOnAllPaths[bindingObj] {
-		// At least one caller does call the field back, but every caller
-		// found to do so only does it on some of its own paths, never
-		// verifiably every one -- a genuine, positive finding (the
-		// constructor-caller analog of a same-function "stored struct"
-		// field only consumed under `if flag`), not the blanket
-		// assume-transferred fallback this used to collapse into. Set
-		// Called/Joined true (a caller does call it back) and
-		// CalledOnAllPaths/JoinedOnAllPaths explicitly false, so the
-		// ordinary engine.go message logic for that combination applies
-		// unchanged.
-		onAllPathsFalse := false
-		if fc.cancel != nil {
-			fc.cancel.binding.Called = true
-			fc.cancel.binding.CalledOnAllPaths = &onAllPathsFalse
-			fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller calls it back, but not on every one of that caller's own paths", fc.fieldName)})
-		}
-		if fc.group != nil {
-			fc.group.group.Joined = true
-			fc.group.group.JoinedOnAllPaths = &onAllPathsFalse
-			fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller joins it back, but not on every one of that caller's own paths", fc.fieldName)})
-		}
-		return
-	}
-	if !verified || consumedByCaller {
+	sites := b.callerSitesFor(bindingObj)
+	if len(sites) == 0 {
 		markFieldCaptureFallback(fc)
-		if verified && consumedByCaller {
-			if fc.cancel != nil {
-				fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller consumes it", fc.fieldName)})
-			}
-			if fc.group != nil {
-				fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("returned via field %q; a direct caller consumes it", fc.fieldName)})
-			}
-		}
 		return
 	}
-	// verified, and no checked caller consumes it: a genuine, confirmed
-	// leak -- leave Escapes/Called/Joined exactly as constructed (false)
-	// and record why.
+	msg := fmt.Sprintf("returned via field %q; ownership passes to each direct caller, which is checked at its own call site", fc.fieldName)
+	preEscapes := false
 	if fc.cancel != nil {
-		fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("returned via field %q; no direct caller is verified to consume it", fc.fieldName)})
+		preEscapes = fc.cancel.binding.Escapes
+		fc.cancel.binding.Escapes = true
+		fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "ownership-transfer", Message: msg})
 	}
 	if fc.group != nil {
-		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("returned via field %q; no direct caller is verified to consume it", fc.fieldName)})
+		preEscapes = fc.group.group.Escapes
+		fc.group.group.Escapes = true
+		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "ownership-transfer", Message: msg})
+	}
+	if b.collectObligations && !preEscapes {
+		b.pendingObligations = append(b.pendingObligations, pendingObligation{cancel: fc.cancel, group: fc.group, fieldName: fc.fieldName, sites: sites})
 	}
 }
 
+// callerSiteKey identifies one verified constructor call site's
+// contribution: the call expression itself (each call creates a distinct
+// runtime handle) plus which result/field of it was checked.
+type callerSiteKey struct {
+	call        *ast.CallExpr
+	resultIndex int
+	fieldName   string
+}
+
+// callerVerdict is one call site's own verified verdict; see
+// builder.callerVerdicts.
+type callerVerdict struct {
+	callerName  string
+	constructor *types.Func
+	kind        string
+	unverified  bool
+	consumed    bool
+	onAllPaths  bool
+}
+
+// callerSite is the per-call-site view callerSitesFor folds
+// callerVerdicts into: one entry per constructor call, regardless of how
+// many result/field sites of the same binding it was checked against.
+type callerSite struct {
+	call        *ast.CallExpr
+	callerName  string
+	constructor *types.Func
+	kind        string
+	consumed    bool
+	onAllPaths  bool
+}
+
+// callerSitesFor folds b.callerVerdicts[bindingObj] into one verdict per
+// constructor call, in source order. A binding stored in more than one
+// field or result is still one runtime obligation, so consuming any of
+// them discharges it (consumed is an OR, and so is onAllPaths); a call
+// with any unverifiable site is left out entirely, never guessed at.
+func (b *builder) callerSitesFor(bindingObj types.Object) []callerSite {
+	verdicts := b.callerVerdicts[bindingObj]
+	if len(verdicts) == 0 {
+		return nil
+	}
+	by := map[*ast.CallExpr]*callerSite{}
+	bad := map[*ast.CallExpr]bool{}
+	var order []*ast.CallExpr
+	for key, v := range verdicts {
+		if v.unverified {
+			bad[key.call] = true
+			continue
+		}
+		cs := by[key.call]
+		if cs == nil {
+			cs = &callerSite{call: key.call, callerName: v.callerName, constructor: v.constructor, kind: v.kind}
+			by[key.call] = cs
+			order = append(order, key.call)
+		}
+		if v.consumed {
+			cs.consumed = true
+			if v.onAllPaths {
+				cs.onAllPaths = true
+			}
+		}
+	}
+	var out []callerSite
+	for _, call := range order {
+		if bad[call] {
+			continue
+		}
+		out = append(out, *by[call])
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].call.Pos() < out[j].call.Pos() })
+	return out
+}
+
+// pendingObligation is a constructor's returned-handle binding waiting
+// for buildFunction to finish computing the constructor's own
+// Called/Joined facts before deciding whether the handle is really owed
+// to its callers.
+type pendingObligation struct {
+	cancel    *cancelState
+	group     *groupState
+	fieldName string
+	sites     []callerSite
+}
+
+// callerFinding is a caller-attributed binding to append to the named
+// function: the leak of one specific constructor call's handle, reported
+// at that call.
+type callerFinding struct {
+	key        string
+	callerName string
+	cancel     *model.CancelBinding
+	group      *model.JoinGroup
+}
+
+// resolveObligations turns the constructor's pending obligations into
+// callerFindings. Nothing is owed if the constructor itself already
+// discharges the binding (cancel called on every path, group joined on
+// every path, or a group that never started any work): the returned
+// handle is then redundant with what the constructor did, and a caller
+// that ignores it leaks nothing.
+func (b *builder) resolveObligations() {
+	for _, p := range b.pendingObligations {
+		switch {
+		case p.cancel != nil:
+			bd := p.cancel.binding
+			if bd.Called && (bd.CalledOnAllPaths == nil || *bd.CalledOnAllPaths) {
+				continue
+			}
+			for _, cs := range p.sites {
+				if cs.consumed && cs.onAllPaths {
+					continue
+				}
+				span := b.span(cs.call)
+				cb := model.CancelBinding{Factory: constructorName(cs.constructor), CancelName: p.fieldName, Span: span, Called: cs.consumed}
+				if cs.consumed {
+					no := false
+					cb.CalledOnAllPaths = &no
+					cb.Evidence = append(cb.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("%s returns a cancellation function in field %q; this caller calls it, but not on every one of its own paths", constructorName(cs.constructor), p.fieldName), Span: ptrSpan(span)})
+				} else {
+					cb.Evidence = append(cb.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("%s returns a cancellation function in field %q; this caller never calls it", constructorName(cs.constructor), p.fieldName), Span: ptrSpan(span)})
+				}
+				b.callerFindings = append(b.callerFindings, callerFinding{key: fmt.Sprintf("cancel|%s|%d|%s", cs.callerName, span.StartOffset, p.fieldName), callerName: cs.callerName, cancel: &cb})
+			}
+		case p.group != nil:
+			g := p.group.group
+			if g.Starts == 0 || (g.Joined && (g.JoinedOnAllPaths == nil || *g.JoinedOnAllPaths)) {
+				continue
+			}
+			for _, cs := range p.sites {
+				if cs.consumed && cs.onAllPaths {
+					continue
+				}
+				span := b.span(cs.call)
+				jg := model.JoinGroup{Kind: g.Kind, Name: p.fieldName, Span: span, Starts: g.Starts, Joined: cs.consumed}
+				// The worker starts live in the constructor: keep pointing at
+				// them, since the message's start count is about that code.
+				for _, ev := range g.Evidence {
+					if ev.Kind == "worker-start" {
+						jg.Evidence = append(jg.Evidence, ev)
+					}
+				}
+				if cs.consumed {
+					no := false
+					jg.JoinedOnAllPaths = &no
+					jg.Evidence = append(jg.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("%s returns a %s in field %q; this caller joins it, but not on every one of its own paths", constructorName(cs.constructor), g.Kind, p.fieldName), Span: ptrSpan(span)})
+				} else {
+					jg.Evidence = append(jg.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("%s returns a %s in field %q; this caller never joins it", constructorName(cs.constructor), g.Kind, p.fieldName), Span: ptrSpan(span)})
+				}
+				b.callerFindings = append(b.callerFindings, callerFinding{key: fmt.Sprintf("group|%s|%d|%s", cs.callerName, span.StartOffset, p.fieldName), callerName: cs.callerName, group: &jg})
+			}
+		}
+	}
+	b.pendingObligations = nil
+}
+
+func constructorName(fn *types.Func) string {
+	if fn == nil {
+		return "constructor"
+	}
+	return fn.FullName()
+}
+
+// attachCallerFindings appends every callerFinding to the function it
+// belongs to, once all functions have been built (a caller may be built
+// before or after its constructor, so this cannot happen earlier).
+// Duplicate findings, from a constructor with several return statements
+// registering the same obligation, are dropped by key.
+func (b *builder) attachCallerFindings(program *model.Program) {
+	if len(b.callerFindings) == 0 {
+		return
+	}
+	index := map[string]int{}
+	for i, fn := range program.Functions {
+		index[fn.Name] = i
+	}
+	seen := map[string]bool{}
+	touched := map[int]bool{}
+	for _, f := range b.callerFindings {
+		if seen[f.key] {
+			continue
+		}
+		seen[f.key] = true
+		i, ok := index[f.callerName]
+		if !ok {
+			continue
+		}
+		fn := &program.Functions[i]
+		if f.cancel != nil {
+			fn.Cancels = append(fn.Cancels, *f.cancel)
+		}
+		if f.group != nil {
+			fn.Groups = append(fn.Groups, *f.group)
+		}
+		touched[i] = true
+	}
+	for i := range touched {
+		fn := &program.Functions[i]
+		sort.SliceStable(fn.Cancels, func(a, c int) bool { return fn.Cancels[a].Span.StartOffset < fn.Cancels[c].Span.StartOffset })
+		sort.SliceStable(fn.Groups, func(a, c int) bool { return fn.Groups[a].Span.StartOffset < fn.Groups[c].Span.StartOffset })
+	}
+	b.callerFindings = nil
+}
+
 // appendReturnFieldSite adds newSite to b.returnFieldInfo[bindingObj] if
-// no existing entry for the same fn is already there, and reports
-// whether it actually added one -- what drives
+// no existing entry for the same (fn, result index, field) is already
+// there, and reports whether it actually added one -- what drives
 // computeConstructorCallerConsumption's own fixed-point sweep (see its
-// own doc comment): re-discovering the same (bindingObj, fn) pair on a
-// later sweep is not new information, and must not be reported as such,
-// or the sweep would never converge.
+// own doc comment): re-discovering the same site on a later sweep is not
+// new information, and must not be reported as such, or the sweep would
+// never converge. The identity includes the result index and field name
+// because one function can return the same binding through more than one
+// result or field, and each is a separate place a caller may consume it
+// (audit finding F2's review of this function).
 func (b *builder) appendReturnFieldSite(bindingObj types.Object, newSite returnFieldSite) bool {
 	for _, existing := range b.returnFieldInfo[bindingObj] {
-		if existing.fn == newSite.fn {
+		if existing.fn == newSite.fn && existing.resultIndex == newSite.resultIndex && existing.fieldName == newSite.fieldName {
 			return false
 		}
 	}
@@ -3387,13 +3578,13 @@ func (b *builder) computeFieldOwnership(source funcSource) {
 // every pass) regardless of which order the functions happen to be
 // declared in. reportChanged is true iff this call registered at least
 // one new site, which is what tells Build's sweep loop whether another
-// pass is needed. An unresolved caller for a different reason (an
-// interface method, a different package with no fact available, or a
-// caller that does something this check does not follow at all) still
-// leaves b.returnFieldConsumption without an entry for that binding,
-// which recordReturnedField's own lookup treats as "not verified" and
-// falls back to the conservative assume-transferred default, never a
-// leak.
+// pass is needed. A call this check cannot resolve at all (an interface
+// method, or a different package with no fact available) records
+// nothing; a call whose handle is used somewhere this check does not
+// follow is recorded as unverified in b.callerVerdicts. Neither yields a
+// finding, and neither affects any other call site's own verdict; a
+// constructor with no verified caller at all gets the conservative
+// assume-transferred default from recordReturnedField, never a leak.
 func (b *builder) computeConstructorCallerConsumption(source funcSource) (reportChanged bool) {
 	if len(b.returnFieldInfo) == 0 && b.in.LookupReturnFieldSites == nil {
 		return false
@@ -3506,7 +3697,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 					// comment) -- skip rather than guess.
 					continue
 				}
-				if b.verifyConstructorCallerField(fd.Body, bindingObj, kind, varObj, site, source.obj, callerCFG, callerCallSites) {
+				if b.verifyConstructorCallerField(fd.Body, bindingObj, kind, varObj, site, source.obj, callerCFG, callerCallSites, call, name) {
 					reportChanged = true
 				}
 			}
@@ -3530,7 +3721,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 					if varObj == nil {
 						continue
 					}
-					if b.verifyConstructorCallerField(fd.Body, calleeObj, fs.Kind, varObj, returnFieldSite{fieldName: fs.FieldName, resultIndex: fs.ResultIndex, fn: calleeObj, kind: fs.Kind}, source.obj, callerCFG, callerCallSites) {
+					if b.verifyConstructorCallerField(fd.Body, calleeObj, fs.Kind, varObj, returnFieldSite{fieldName: fs.FieldName, resultIndex: fs.ResultIndex, fn: calleeObj, kind: fs.Kind}, source.obj, callerCFG, callerCallSites, call, name) {
 						reportChanged = true
 					}
 				}
@@ -3554,7 +3745,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 // plain kind string rather than deriving it here: a cross-package
 // binding has no real types.Object in this build to derive it from.
 // bindingObj itself remains an opaque identity used only as this
-// function's own map key (see setReturnFieldConsumption) and as the
+// function's own map key (see setCallerVerdict) and as the
 // synthetic cancelState/groupState's own field -- neither
 // classifyFieldCaptureUse nor walkFieldCaptureUses ever reads its
 // identity for anything beyond that, only fc.cancel/fc.group's presence
@@ -3563,11 +3754,16 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 // callerFn is the function whose body callerBody is -- needed only for
 // the passedOnward case below, to register callerFn itself as a further
 // site for bindingObj when this caller turns out to be a pass-through
-// wrapper (via an intermediate variable) rather than a consumer.
+// wrapper (via an intermediate variable) rather than a consumer. call is
+// the constructor call expression being verified and callerName the
+// function containing it: together they key this call site's own
+// verdict (setCallerVerdict), which is never merged with another call
+// site's.
 // reportChanged is true iff that registration actually added something
 // new, which is what drives computeConstructorCallerConsumption's own
 // fixed-point sweep.
-func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, kind string, varObj types.Object, site returnFieldSite, callerFn *types.Func, callerCFG *model.CFG, callerCallSites map[*ast.CallExpr]flowgraph.CallSite) (reportChanged bool) {
+func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, kind string, varObj types.Object, site returnFieldSite, callerFn *types.Func, callerCFG *model.CFG, callerCallSites map[*ast.CallExpr]flowgraph.CallSite, call *ast.CallExpr, callerName string) (reportChanged bool) {
+	key := callerSiteKey{call: call, resultIndex: site.resultIndex, fieldName: site.fieldName}
 	fc := &fieldCapture{varObj: varObj, fieldName: site.fieldName, returnIndex: -1}
 	switch kind {
 	case "cancel":
@@ -3612,13 +3808,15 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 				onAllPaths = !callerCFG.ReachableAvoiding(callerCFG.Entry, callBlocks)[callerCFG.Exit]
 			}
 		}
-		b.setReturnFieldConsumption(bindingObj, true, onAllPaths)
+		b.setCallerVerdict(bindingObj, key, callerVerdict{callerName: callerName, constructor: site.fn, kind: kind, consumed: true, onAllPaths: onAllPaths})
 	case otherUse[varObj]:
 		// Can't verify at this call site either way (e.g. the caller
 		// passes the handle on somewhere this check does not follow) --
-		// leave it unresolved unless a different call site already
-		// resolved it.
+		// this call site yields no finding, and says nothing about any
+		// other call site.
+		b.setCallerVerdict(bindingObj, key, callerVerdict{callerName: callerName, constructor: site.fn, kind: kind, unverified: true})
 	case passedOnward:
+		b.setCallerVerdict(bindingObj, key, callerVerdict{callerName: callerName, constructor: site.fn, kind: kind, unverified: true})
 		// The caller itself just returns the handle onward: not a
 		// verdict on bindingObj at all (whoever eventually calls *this*
 		// function decides that), but callerFn is now just as valid a
@@ -3629,42 +3827,25 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 			reportChanged = b.appendReturnFieldSite(bindingObj, returnFieldSite{fieldName: site.fieldName, resultIndex: idx, fn: callerFn, kind: site.kind})
 		}
 	default:
-		b.setReturnFieldConsumption(bindingObj, false, false)
+		b.setCallerVerdict(bindingObj, key, callerVerdict{callerName: callerName, constructor: site.fn, kind: kind})
 	}
 	return reportChanged
 }
 
-// setReturnFieldConsumption merges one call site's verdict into
-// b.returnFieldConsumption for bindingObj: a verified consumption is
-// permanent and wins over any other call site's verdict (recorded
-// unconditionally, even overwriting an earlier false), while a verified
-// non-consumption only takes effect if no entry exists yet, so that one
-// consuming caller is always enough to clear a binding even if another,
-// earlier-checked caller drops it -- consistent with this file's general
-// preference for avoiding a false positive over catching every leak.
-//
-// onAllPaths (meaningful only when consumed is true) is merged into
-// b.returnFieldConsumptionOnAllPaths the same way: true wins permanently
-// over an earlier false, so that any one caller found to consume the
-// binding unconditionally is always enough to settle it as genuinely
-// safe, even if a different, earlier-checked caller only consumes it on
-// some of its own paths. recordReturnedField reads both maps together:
-// consumed-and-on-all-paths is the existing, fully safe verdict;
-// consumed-but-never-found-on-all-paths is new -- a caller does call it
-// back, just not verifiably on every path, which recordReturnedField
-// surfaces as a genuine finding (Called true, CalledOnAllPaths false, or
-// the group equivalent) rather than the blanket assume-transferred
-// fallback a plain "consumed" used to get regardless of how partial the
-// evidence was.
-func (b *builder) setReturnFieldConsumption(obj types.Object, consumed, onAllPaths bool) {
-	if consumed {
-		b.returnFieldConsumption[obj] = true
-		b.returnFieldConsumptionOnAllPaths[obj] = b.returnFieldConsumptionOnAllPaths[obj] || onAllPaths
-		return
+// setCallerVerdict records one call site's own verdict for bindingObj,
+// replacing any earlier verdict for the same call site (the fixed-point
+// sweep re-verifies every site each time round, always reaching the same
+// answer for the same caller body). Verdicts for different call sites
+// are independent by construction: this is a map keyed by call
+// expression, with no merge across sites, so a caller that consumes its
+// handle can never clear another caller's leak (audit finding F2). How
+// the per-site verdicts become findings is recordReturnedField's and
+// resolveObligations' business.
+func (b *builder) setCallerVerdict(obj types.Object, key callerSiteKey, v callerVerdict) {
+	if b.callerVerdicts[obj] == nil {
+		b.callerVerdicts[obj] = map[callerSiteKey]callerVerdict{}
 	}
-	if _, already := b.returnFieldConsumption[obj]; !already {
-		b.returnFieldConsumption[obj] = false
-	}
+	b.callerVerdicts[obj][key] = v
 }
 
 func (b *builder) markChildUses(call *ast.CallExpr, cancels []*cancelState) {

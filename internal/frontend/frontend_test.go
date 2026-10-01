@@ -3076,10 +3076,10 @@ func Start() {
 // (a fresh CFG built once per caller in computeConstructorCallerConsumption,
 // never the constructor's own CFG, which has no view of what its caller
 // does) passes through at least one of the credited call sites -- merged
-// across every checked caller via setReturnFieldConsumption
-// (returnFieldConsumptionOnAllPaths), and surfaced through the exact same
-// Called/CalledOnAllPaths (or Joined/JoinedOnAllPaths) fields and engine.go
-// message logic a same-function "stored struct" capture already uses.
+// per checked caller call site (callerVerdicts) and surfaced, at that
+// caller's own call, through the exact same Called/CalledOnAllPaths (or
+// Joined/JoinedOnAllPaths) fields and engine.go message logic a
+// same-function "stored struct" capture already uses.
 
 func TestFieldOwnership_ConstructorCallerConsumesOnSomeButNotAllPathsFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
@@ -3131,7 +3131,7 @@ func Start() {
 
 // The group analog of the same constructor-caller path-sensitivity,
 // exercising JoinedOnAllPaths/Joined through the same
-// returnFieldConsumptionOnAllPaths plumbing rather than
+// per-call-site verdict plumbing rather than
 // Called/CalledOnAllPaths.
 func TestFieldOwnership_ConstructorCallerJoinsGroupOnSomeButNotAllPathsFires(t *testing.T) {
 	diags := analyzeSource(t, `package p
@@ -3157,32 +3157,16 @@ func Start() {
 	}
 }
 
-// A second, independent caller that DOES consume the field on every one of
-// its own paths must settle the verdict as genuinely safe, even though a
-// different, earlier-checked caller only consumes it conditionally --
-// setReturnFieldConsumption's own "true wins permanently" merge, extended
-// to the on-all-paths dimension (returnFieldConsumptionOnAllPaths).
-func TestFieldOwnership_ConstructorOneCallerOnAllPathsOutweighsAnotherPartialCaller(t *testing.T) {
-	// StartFull (fully verified) is declared, and so processed, before
-	// StartPartial (only conditionally verified): this ordering, not the
-	// reverse, is what actually exercises "true wins permanently"
-	// regardless of processing order -- a merge that simply let the most
-	// recently processed caller's answer overwrite the last would still
-	// coincidentally land on the correct verdict if the fully-verified
-	// caller happened to be processed last, the same failure mode a
-	// naive last-write-wins bug could hide behind.
-	diags := analyzeSource(t, `package p
-import "context"
-type Worker struct{ cancel context.CancelFunc }
-func New() *Worker {
-	_, cancel := context.WithCancel(context.Background())
-	return &Worker{cancel: cancel}
-}
-func cond() bool { return true }
-func StartFull() {
-	w := New()
-	w.cancel()
-}
+// Audit finding F2: a second caller that consumes ITS OWN handle on every
+// path says nothing about a different caller that drops or only
+// conditionally consumes its own, distinct handle. This test used to
+// assert the opposite ("true wins permanently": the constructor's single
+// merged verdict was settled safe by any one good caller), which hid every
+// other caller's leak. The partial caller is now reported, at its own
+// call, and the good caller and the constructor stay clean, in both
+// declaration orders.
+func TestFieldOwnership_OneCallersFullConsumptionDoesNotClearAnotherPartialCaller(t *testing.T) {
+	const partial = `func cond() bool { return true }
 func StartPartial() {
 	w := New()
 	if cond() {
@@ -3190,9 +3174,25 @@ func StartPartial() {
 	}
 	w.cancel()
 }
-`)
-	if len(diags) != 0 {
-		t.Fatalf("StartFull's own unconditional call should settle the constructor's own binding as safe regardless of processing order, got %#v", diags)
+`
+	const full = `func StartFull() {
+	w := New()
+	w.cancel()
+}
+`
+	const ctor = `package p
+import "context"
+type Worker struct{ cancel context.CancelFunc }
+func New() *Worker {
+	_, cancel := context.WithCancel(context.Background())
+	return &Worker{cancel: cancel}
+}
+`
+	for name, src := range map[string]string{"full first": ctor + full + partial, "partial first": ctor + partial + full} {
+		diags := analyzeSource(t, src)
+		if len(diags) != 1 || diags[0].RuleID != "LL1001" || diags[0].Function != "example.test/input.StartPartial" {
+			t.Errorf("%s: want exactly one LL1001 in StartPartial, got %#v", name, diags)
+		}
 	}
 }
 
@@ -3324,10 +3324,9 @@ func NewHandle(parent context.Context) (*Handle, context.Context) {
 // TestFieldOwnership_ConstructorNeverCalledFallsBack documents that an
 // unused (or, in real code, exported-for-another-package) constructor
 // never produces a finding purely from the absence of a caller to check:
-// b.returnFieldConsumption has no entry for its binding, which
-// recordReturnedField treats exactly like a verified-consumed caller --
-// the same conservative assume-transferred default used everywhere else
-// whenever a value's fate can't be verified.
+// b.callerVerdicts has no entry for its binding, so recordReturnedField
+// applies the conservative assume-transferred default used everywhere
+// else whenever a value's fate can't be verified.
 func TestFieldOwnership_ConstructorNeverCalledFallsBack(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "context"
