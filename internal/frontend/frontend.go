@@ -537,6 +537,14 @@ type cancelState struct {
 	binding   model.CancelBinding
 	ctxObj    types.Object
 	cancelObj types.Object
+	// acquireCall is the factory call (`context.WithCancel(...)`) that
+	// created this cancel function: the point where the obligation to call
+	// it begins. computeOrdering asks "does every path reach a call
+	// AFTER this point", never "does every path from function entry",
+	// since a path that never acquired the resource owes nothing (audit
+	// finding F3). Nil for bindings with no local acquisition (parameters,
+	// constructor-result stand-ins), which are never ordering-checked.
+	acquireCall *ast.CallExpr
 	// callSites records every direct call to cancelObj itself (the "cancel-
 	// call" evidence case in observeCall), in AST-node identity form rather
 	// than just the span already on Evidence. computeOrdering
@@ -558,6 +566,12 @@ type cancelState struct {
 type groupState struct {
 	group model.JoinGroup
 	obj   types.Object
+	// startCalls records every Add/Go call that starts worker accounting
+	// for this group, in AST-node form. A group's join obligation begins
+	// at such an event, not where the variable is declared or where the
+	// function is entered; computeOrdering checks for a Wait() on every
+	// path from each of these (audit finding F3).
+	startCalls []*ast.CallExpr
 	// waitCallSites is the same kind of AST-node record as
 	// cancelState.callSites above, for the same reason: finding each
 	// Wait() call's CFG block by identity, not by span.
@@ -748,7 +762,7 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 			if !ctxOK || !cancelOK {
 				break // field/container ownership is explicit and not guessed
 			}
-			state := &cancelState{binding: model.CancelBinding{Factory: factory, Span: b.span(x)}}
+			state := &cancelState{binding: model.CancelBinding{Factory: factory, Span: b.span(x)}, acquireCall: call}
 			if ctxID.Name != "_" {
 				state.ctxObj = b.in.Info.ObjectOf(ctxID)
 				state.binding.ContextName = ctxID.Name
@@ -1687,6 +1701,7 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 			switch selectorMethod(call.Fun) {
 			case "Add", "Go":
 				g.group.Starts++
+				g.startCalls = append(g.startCalls, call)
 				g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "worker-start", Message: "worker accounting starts here", Span: ptrSpan(b.span(call))})
 			case "Wait":
 				g.group.Joined = true
@@ -3158,6 +3173,7 @@ func (b *builder) markGroupFieldConsumed(fc *fieldCapture, method string, consum
 	switch method {
 	case "Add", "Go":
 		fc.group.group.Starts++
+		fc.group.startCalls = append(fc.group.startCalls, call)
 		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "worker-start", Message: fmt.Sprintf("worker accounting starts here (through field %q)", fc.fieldName), Span: ptrSpan(b.span(call))})
 	case "Wait":
 		fc.group.group.Joined = true
@@ -3398,10 +3414,15 @@ func (b *builder) resolveObligations() {
 				}
 				span := b.span(cs.call)
 				jg := model.JoinGroup{Kind: g.Kind, Name: p.fieldName, Span: span, Starts: g.Starts, Joined: cs.consumed}
-				// The worker starts live in the constructor: keep pointing at
-				// them, since the message's start count is about that code.
+				// The worker starts, and any Add/Done imbalance, live in the
+				// constructor: keep pointing at them, since the message's
+				// start count and mismatch note are about that code. The
+				// constructor's own binding is settled as transferred, so
+				// without this the mismatch would no longer be reported
+				// anywhere when a caller drops the handle.
+				jg.CountMismatch = g.CountMismatch
 				for _, ev := range g.Evidence {
-					if ev.Kind == "worker-start" {
+					if ev.Kind == "worker-start" || ev.Kind == "count-mismatch" {
 						jg.Evidence = append(jg.Evidence, ev)
 					}
 				}
@@ -3804,8 +3825,14 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 			case fc.group != nil:
 				callNodes = fc.group.waitCallSites
 			}
-			if callBlocks := blockSetOf(callSitesOf(callNodes, callerCallSites)); len(callBlocks) > 0 {
-				onAllPaths = !callerCFG.ReachableAvoiding(callerCFG.Entry, callBlocks)[callerCFG.Exit]
+			// From the constructor call, not the caller's entry: a path
+			// that never made the call never received a handle to
+			// consume (audit finding F3).
+			plain, deferred := splitDeferred(callNodes, deferredCallSet(callerBody), callerCallSites)
+			if len(plain)+len(deferred) > 0 {
+				if bypassed, known := liveExitReachable(callerCFG, callSitesOf([]*ast.CallExpr{call}, callerCallSites), plain, deferred); known {
+					onAllPaths = !bypassed
+				}
 			}
 		}
 		b.setCallerVerdict(bindingObj, key, callerVerdict{callerName: callerName, constructor: site.fn, kind: kind, consumed: true, onAllPaths: onAllPaths})
@@ -4673,6 +4700,90 @@ func callSitesOf(calls []*ast.CallExpr, callSites map[*ast.CallExpr]flowgraph.Ca
 	return sites
 }
 
+// liveExitReachable answers the obligation question behind "is this
+// cleanup on every path": starting from each origin event (where the
+// obligation is created), is there a path to the function's exit that
+// never reaches a discharge? Only paths that actually began the
+// obligation count, so a branch that never acquired the resource owes
+// nothing (audit finding F3), while a path that acquired it and then
+// returned early still does.
+//
+// Discharges come in two kinds, which is why there are two parameters.
+// after discharges must come after the origin on the path: a cancel call
+// that ran before the function-scoped cancel function existed does not
+// release it. anywhere discharges count wherever they sit on the path,
+// before or after the origin. That is exactly right for a deferred call,
+// which runs at function exit on every path that registered it
+// (`defer wg.Wait()` written above the `wg.Add(1)` is the ordinary idiom),
+// and it is the deliberate choice for a group's Wait() calls: a path that
+// already waited before starting more work is the second-round-reuse
+// case, which UnjoinedRound reports with its own, correct message;
+// counting it here too would give the misleading "add a defer" advice.
+//
+// known is false when no origin could be placed in g (for example a start
+// event inside a closure, whose body is not part of g): the caller must
+// then leave its verdict unestablished rather than fall back to asking the
+// question from function entry, which is exactly the false-positive this
+// exists to remove.
+//
+// Within the origin's own block (straight-line code), an after discharge at
+// a later instruction index, or any anywhere discharge, settles that origin
+// outright. Otherwise the search starts from the origin block's successors,
+// and every block holding any discharge blocks it, including the origin's
+// own block when an after discharge sits before the origin in it:
+// re-entering that block (a loop) runs that discharge on the previous
+// acquisition's handle before re-acquiring.
+func liveExitReachable(g *model.CFG, origins, after, anywhere []flowgraph.CallSite) (reachable, known bool) {
+	anywhereBlocks := blockSetOf(anywhere)
+	avoid := blockSetOf(after)
+	for id := range anywhereBlocks {
+		avoid[id] = true
+	}
+	for _, o := range origins {
+		known = true
+		discharged := anywhereBlocks[o.Block]
+		for _, d := range after {
+			if d.Block == o.Block && d.Index > o.Index {
+				discharged = true
+				break
+			}
+		}
+		if discharged {
+			continue
+		}
+		// An anywhere discharge only helps if it was reached before the
+		// function exits. If some path gets from entry to the origin
+		// without passing one, this origin can still be left undischarged;
+		// if every path passes one first, it is covered.
+		if len(anywhere) > 0 && !g.ReachableAvoiding(g.Entry, anywhereBlocks)[o.Block] {
+			continue
+		}
+		for _, e := range g.Blocks[o.Block].Successors {
+			if g.ReachableAvoiding(e.To, avoid)[g.Exit] {
+				return true, true
+			}
+		}
+	}
+	return false, known
+}
+
+// splitDeferred partitions call sites into plain and deferred by whether
+// the call expression is the call of a defer statement.
+func splitDeferred(calls []*ast.CallExpr, deferredCalls map[*ast.CallExpr]bool, sites map[*ast.CallExpr]flowgraph.CallSite) (plain, deferred []flowgraph.CallSite) {
+	for _, call := range calls {
+		site, ok := sites[call]
+		if !ok {
+			continue
+		}
+		if deferredCalls[call] {
+			deferred = append(deferred, site)
+		} else {
+			plain = append(plain, site)
+		}
+	}
+	return plain, deferred
+}
+
 func blockSetOf(sites []flowgraph.CallSite) map[model.BlockID]bool {
 	set := map[model.BlockID]bool{}
 	for _, site := range sites {
@@ -4799,15 +4910,21 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		if !c.binding.Called {
 			continue // LL1001 already fires on this; nothing further to establish
 		}
-		callBlocks := blockSetOf(callSitesOf(c.callSites, callSites))
-		if len(callBlocks) == 0 {
+		plainCalls, deferredCallSites := splitDeferred(c.callSites, deferredCalls, callSites)
+		if len(plainCalls)+len(deferredCallSites) == 0 {
 			continue // Called came from a shape with no call-site node recorded here (e.g. a variadic-spread element call)
 		}
-		reachableAvoidingCalls := g.ReachableAvoiding(g.Entry, callBlocks)
-		onAllPaths := !reachableAvoidingCalls[g.Exit]
+		// Checked from the acquisition, not from function entry: a path
+		// that never created this cancel function owes no call (audit
+		// finding F3).
+		bypassed, known := liveExitReachable(g, callSitesOf([]*ast.CallExpr{c.acquireCall}, callSites), plainCalls, deferredCallSites)
+		if !known {
+			continue // acquisition not placeable in this CFG: leave unestablished, never guess
+		}
+		onAllPaths := !bypassed
 		c.binding.CalledOnAllPaths = &onAllPaths
 		if !onAllPaths {
-			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "call-not-on-all-paths", Message: "some path from the function's entry to its return bypasses every call to this cancel function"})
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "call-not-on-all-paths", Message: "some path from this cancel function's creation to the function's return bypasses every call to it"})
 		}
 	}
 
@@ -4820,12 +4937,19 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 			continue // Joined came from a join_wrapper call, not a direct Wait(); no call site here to find a block for
 		}
 		waitBlocks := blockSetOf(waitSites)
-		reachableAvoidingWaits := g.ReachableAvoiding(g.Entry, waitBlocks)
-		onAllPaths := !reachableAvoidingWaits[g.Exit]
-		gr.group.JoinedOnAllPaths = &onAllPaths
-		if !onAllPaths {
-			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the function's entry to its return bypasses every Wait() call for this group"})
+		// The join obligation begins when worker accounting starts
+		// (Add/Go), not at function entry: a path that never started a
+		// worker has nothing to join (audit finding F3). Stop-before-wait
+		// below still reasons from entry, which is a separate question.
+		bypassed, known := liveExitReachable(g, callSitesOf(gr.startCalls, callSites), nil, waitSites)
+		if known {
+			onAllPaths := !bypassed
+			gr.group.JoinedOnAllPaths = &onAllPaths
+			if !onAllPaths {
+				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the point a worker is started to the function's return bypasses every Wait() call for this group"})
+			}
 		}
+		reachableAvoidingWaits := g.ReachableAvoiding(g.Entry, waitBlocks)
 		if deferOnlyStopSeen {
 			gr.group.StopAfterWait = true
 			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "the worker stop signal is only ever sent via a deferred call, which does not run until the function is already returning -- after this Wait() call"})

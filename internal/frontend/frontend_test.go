@@ -4808,16 +4808,15 @@ func Start() {
 	}
 }
 
-// The known, already-accepted flip side of the same limitation (matching
-// the pre-existing WaitGroup behavior exactly, not a new risk this
-// introduces): a defer placed *after* an early-return check -- the
-// ubiquitous "construct, check error, return; else defer cleanup" Go
-// idiom -- puts the call site in a block the early-return path never
-// reaches, so this fires even though the pattern is completely standard
-// and safe. This is documented, not fixed, here: fixing it soundly would
-// need value-flow reasoning connecting the error result to the returned
-// cancel func's own validity, which is out of scope for a purely
-// structural CFG check. See docs/limitations.md.
+// A defer placed *after* an early-return check does not cover the path
+// that returned first. Here that is a true positive: the cancel function
+// already exists when the unrelated error check returns, so the context
+// leaks on that path. (An earlier version of this comment called the shape
+// a safe idiom; it is only safe when the check comes BEFORE the
+// acquisition, which audit finding F3 fixed -- see TestAcquisition_Cancel.)
+// The genuinely unresolved false positive is a wrapper returning
+// (ctx, cancel, err), which needs a guarded summary. See
+// docs/limitations.md.
 func TestCancelDeferAfterErrorCheckFiresLikeWaitGroupDoes(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import (
