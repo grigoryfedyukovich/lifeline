@@ -545,6 +545,12 @@ type cancelState struct {
 	// finding F3). Nil for bindings with no local acquisition (parameters,
 	// constructor-result stand-ins), which are never ordering-checked.
 	acquireCall *ast.CallExpr
+	// errObj is the error variable assigned by the same statement as the
+	// cancel function, when the factory also returns an error (a
+	// configured context wrapper returning `(ctx, cancel, err)`). On the
+	// branch where it is non-nil the factory is assumed to have created
+	// nothing to cancel; see errorBranchSkipper.
+	errObj types.Object
 	// callSites records every direct call to cancelObj itself (the "cancel-
 	// call" evidence case in observeCall), in AST-node identity form rather
 	// than just the span already on Evidence. computeOrdering
@@ -762,7 +768,7 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 			if !ctxOK || !cancelOK {
 				break // field/container ownership is explicit and not guessed
 			}
-			state := &cancelState{binding: model.CancelBinding{Factory: factory, Span: b.span(x)}, acquireCall: call}
+			state := &cancelState{binding: model.CancelBinding{Factory: factory, Span: b.span(x)}, acquireCall: call, errObj: b.errorLHSObject(x.Lhs)}
 			if ctxID.Name != "_" {
 				state.ctxObj = b.in.Info.ObjectOf(ctxID)
 				state.binding.ContextName = ctxID.Name
@@ -3830,7 +3836,12 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 			// consume (audit finding F3).
 			plain, deferred := splitDeferred(callNodes, deferredCallSet(callerBody), callerCallSites)
 			if len(plain)+len(deferred) > 0 {
-				if bypassed, known := liveExitReachable(callerCFG, callSitesOf([]*ast.CallExpr{call}, callerCallSites), plain, deferred); known {
+				// An error-returning constructor (`h, err := New(...)`) is
+				// checked with the error branch ruled out: on it the
+				// constructor is assumed to have handed back nothing to
+				// consume.
+				skip := b.errorBranchSkipper(callerBody, b.errorLHSObject(assignLHSOfCall(callerBody, call)), call)
+				if bypassed, known := liveExitReachable(callerCFG, callSitesOf([]*ast.CallExpr{call}, callerCallSites), plain, deferred, skip); known {
 					onAllPaths = !bypassed
 				}
 			}
@@ -4720,6 +4731,11 @@ func callSitesOf(calls []*ast.CallExpr, callSites map[*ast.CallExpr]flowgraph.Ca
 // case, which UnjoinedRound reports with its own, correct message;
 // counting it here too would give the misleading "add a defer" advice.
 //
+// skipEdge, when non-nil, rules out edges the obligation cannot travel: the
+// error branch of a check on an error-returning factory's own error result
+// (see errorBranchSkipper), where the factory failed and so created nothing
+// to clean up.
+//
 // known is false when no origin could be placed in g (for example a start
 // event inside a closure, whose body is not part of g): the caller must
 // then leave its verdict unestablished rather than fall back to asking the
@@ -4733,7 +4749,7 @@ func callSitesOf(calls []*ast.CallExpr, callSites map[*ast.CallExpr]flowgraph.Ca
 // own block when an after discharge sits before the origin in it:
 // re-entering that block (a loop) runs that discharge on the previous
 // acquisition's handle before re-acquiring.
-func liveExitReachable(g *model.CFG, origins, after, anywhere []flowgraph.CallSite) (reachable, known bool) {
+func liveExitReachable(g *model.CFG, origins, after, anywhere []flowgraph.CallSite, skipEdge func(model.Edge) bool) (reachable, known bool) {
 	anywhereBlocks := blockSetOf(anywhere)
 	avoid := blockSetOf(after)
 	for id := range anywhereBlocks {
@@ -4759,12 +4775,237 @@ func liveExitReachable(g *model.CFG, origins, after, anywhere []flowgraph.CallSi
 			continue
 		}
 		for _, e := range g.Blocks[o.Block].Successors {
-			if g.ReachableAvoiding(e.To, avoid)[g.Exit] {
+			if skipEdge != nil && skipEdge(e) {
+				continue
+			}
+			if g.ReachableAvoidingEdges(e.To, avoid, skipEdge)[g.Exit] {
 				return true, true
 			}
 		}
 	}
 	return false, known
+}
+
+// errorLHSObject returns the error variable among an assignment's
+// left-hand side, or nil when there is none, it is the blank identifier, or
+// there is more than one (ambiguous).
+func (b *builder) errorLHSObject(lhs []ast.Expr) types.Object {
+	errType := types.Universe.Lookup("error").Type()
+	var found types.Object
+	for _, e := range lhs {
+		id, ok := e.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			continue
+		}
+		v, ok := b.in.Info.ObjectOf(id).(*types.Var)
+		if !ok || !types.Identical(v.Type(), errType) {
+			continue
+		}
+		if found != nil {
+			return nil
+		}
+		found = v
+	}
+	return found
+}
+
+// assignLHSOfCall returns the left-hand side of the assignment whose single
+// right-hand side is call, or nil if call is not assigned that way.
+func assignLHSOfCall(body *ast.BlockStmt, call *ast.CallExpr) []ast.Expr {
+	var lhs []ast.Expr
+	ast.Inspect(body, func(n ast.Node) bool {
+		if as, ok := n.(*ast.AssignStmt); ok && len(as.Rhs) == 1 && as.Rhs[0] == call {
+			lhs = as.Lhs
+			return false
+		}
+		return lhs == nil
+	})
+	return lhs
+}
+
+// errorBranchSkipper returns a predicate that recognizes the CFG edges
+// leading into the error branch of a check on errObj, the error result
+// assigned by the same statement as the resource (the statement whose
+// right-hand side is originCall). It is nil when there is nothing safe to
+// skip.
+//
+// This is the "guarded summary" for error-returning factories: on the
+// branch where the factory reported an error it created nothing, so a
+// path that returns there owes no cleanup. `ctx, cancel, err := f();
+// if err != nil { return err }; defer cancel()` is then clean, while an
+// unrelated early return after the check still warns. The factory's
+// contract (a failed call leaves no cancel function or handle to consume)
+// is assumed, not verified; computeOrdering records an evidence line when
+// the guard is what changes a verdict.
+//
+// An if statement only counts when its condition is one of the simple
+// forms for which a branch implies a non-nil error: `err != nil` (the
+// then branch), `err == nil` (the else branch), negation, and && / ||
+// combinations where the implication still holds for the whole condition.
+// It is deliberately conservative about whether errObj still holds the
+// factory's result at the check:
+//   - no other assignment to errObj may sit between the factory call and
+//     the check in source order;
+//   - a check inside a loop that does not contain the factory call is
+//     dropped if the loop assigns errObj anywhere (a later iteration may
+//     test a different value);
+//   - if a closure assigns errObj, or its address is taken, nothing is
+//     skipped at all.
+//
+// Not modeled (so such a check is treated as an ordinary branch, the
+// status quo): `switch` on the error, a check through a helper such as
+// `if !ok(err)`, `errors.Is`, goto back-edges, and a check on an alias of
+// the error.
+func (b *builder) errorBranchSkipper(body *ast.BlockStmt, errObj types.Object, originCall *ast.CallExpr) func(model.Edge) bool {
+	if body == nil || errObj == nil || originCall == nil {
+		return nil
+	}
+	info := b.in.Info
+	isErr := func(e ast.Expr) bool {
+		id, ok := ast.Unparen(e).(*ast.Ident)
+		return ok && info.ObjectOf(id) == errObj
+	}
+	isNil := func(e ast.Expr) bool {
+		id, ok := ast.Unparen(e).(*ast.Ident)
+		if !ok {
+			return false
+		}
+		_, nilObj := info.ObjectOf(id).(*types.Nil)
+		return nilObj
+	}
+	assignsErr := func(n ast.Node) (token.Pos, bool) {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || (len(as.Rhs) == 1 && as.Rhs[0] == originCall) {
+			return 0, false
+		}
+		for _, l := range as.Lhs {
+			if id, ok := l.(*ast.Ident); ok && info.ObjectOf(id) == errObj {
+				return as.Pos(), true
+			}
+		}
+		return 0, false
+	}
+
+	// Pass 1: every other assignment to errObj, and anything that makes
+	// the value untrackable.
+	var reassigns []token.Pos
+	unsafe := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.FuncLit); ok {
+			ast.Inspect(lit.Body, func(m ast.Node) bool {
+				if _, ok := assignsErr(m); ok {
+					unsafe = true
+				}
+				if u, ok := m.(*ast.UnaryExpr); ok && u.Op == token.AND && isErr(u.X) {
+					unsafe = true
+				}
+				return true
+			})
+			return false
+		}
+		if pos, ok := assignsErr(n); ok {
+			reassigns = append(reassigns, pos)
+		}
+		if u, ok := n.(*ast.UnaryExpr); ok && u.Op == token.AND && isErr(u.X) {
+			unsafe = true
+		}
+		return true
+	})
+	if unsafe {
+		return nil
+	}
+	assignedIn := func(from, to token.Pos) bool {
+		for _, r := range reassigns {
+			if r >= from && r < to {
+				return true
+			}
+		}
+		return false
+	}
+
+	// implies reports whether entering the then branch, and whether
+	// entering the else branch, of `if cond` implies errObj != nil.
+	var implies func(cond ast.Expr) (thenErr, elseErr bool)
+	implies = func(cond ast.Expr) (bool, bool) {
+		switch x := ast.Unparen(cond).(type) {
+		case *ast.BinaryExpr:
+			switch x.Op {
+			case token.NEQ, token.EQL:
+				if (isErr(x.X) && isNil(x.Y)) || (isNil(x.X) && isErr(x.Y)) {
+					return x.Op == token.NEQ, x.Op == token.EQL
+				}
+			case token.LAND:
+				at, ae := implies(x.X)
+				bt, be := implies(x.Y)
+				return at || bt, ae && be
+			case token.LOR:
+				at, ae := implies(x.X)
+				bt, be := implies(x.Y)
+				return at && bt, ae || be
+			}
+		case *ast.UnaryExpr:
+			if x.Op == token.NOT {
+				t, e := implies(x.X)
+				return e, t
+			}
+		}
+		return false, false
+	}
+
+	type edgeKey struct {
+		kind       model.EdgeKind
+		start, end int
+	}
+	keys := map[edgeKey]bool{}
+	var stack []ast.Node
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		stack = append(stack, n)
+		ifs, ok := n.(*ast.IfStmt)
+		if !ok || ifs.Cond.Pos() < originCall.End() {
+			return true
+		}
+		if assignedIn(originCall.End(), ifs.Cond.Pos()) {
+			return true // errObj was overwritten before this check
+		}
+		for _, anc := range stack {
+			var loopPos, loopEnd token.Pos
+			switch anc.(type) {
+			case *ast.ForStmt, *ast.RangeStmt:
+				loopPos, loopEnd = anc.Pos(), anc.End()
+			default:
+				continue
+			}
+			if loopPos <= originCall.Pos() && originCall.End() <= loopEnd {
+				continue // the factory call re-runs with the loop
+			}
+			if assignedIn(loopPos, loopEnd) {
+				return true
+			}
+		}
+		thenErr, elseErr := implies(ifs.Cond)
+		start := b.in.Fset.Position(ifs.Cond.Pos()).Offset
+		end := b.in.Fset.Position(ifs.Cond.End()).Offset
+		if thenErr {
+			keys[edgeKey{model.EdgeTrue, start, end}] = true
+		}
+		if elseErr {
+			keys[edgeKey{model.EdgeFalse, start, end}] = true
+		}
+		return true
+	})
+	if len(keys) == 0 {
+		return nil
+	}
+	return func(e model.Edge) bool {
+		return keys[edgeKey{e.Kind, e.Span.StartOffset, e.Span.EndOffset}]
+	}
 }
 
 // splitDeferred partitions call sites into plain and deferred by whether
@@ -4917,9 +5158,19 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		// Checked from the acquisition, not from function entry: a path
 		// that never created this cancel function owes no call (audit
 		// finding F3).
-		bypassed, known := liveExitReachable(g, callSitesOf([]*ast.CallExpr{c.acquireCall}, callSites), plainCalls, deferredCallSites)
+		origins := callSitesOf([]*ast.CallExpr{c.acquireCall}, callSites)
+		skip := b.errorBranchSkipper(body, c.errObj, c.acquireCall)
+		bypassed, known := liveExitReachable(g, origins, plainCalls, deferredCallSites, skip)
 		if !known {
 			continue // acquisition not placeable in this CFG: leave unestablished, never guess
+		}
+		if skip != nil && !bypassed {
+			// Say so when the error guard is what made the difference: it
+			// rests on the factory's contract (no cancel to call when it
+			// reports an error), which is assumed, not verified.
+			if unguarded, _ := liveExitReachable(g, origins, plainCalls, deferredCallSites, nil); unguarded {
+				c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "error-guard", Message: "paths on which the factory's error result is non-nil are not counted: the factory is assumed to create no cancel function to call when it reports an error", Span: ptrSpan(c.binding.Span)})
+			}
 		}
 		onAllPaths := !bypassed
 		c.binding.CalledOnAllPaths = &onAllPaths
@@ -4941,7 +5192,7 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		// (Add/Go), not at function entry: a path that never started a
 		// worker has nothing to join (audit finding F3). Stop-before-wait
 		// below still reasons from entry, which is a separate question.
-		bypassed, known := liveExitReachable(g, callSitesOf(gr.startCalls, callSites), nil, waitSites)
+		bypassed, known := liveExitReachable(g, callSitesOf(gr.startCalls, callSites), nil, waitSites, nil)
 		if known {
 			onAllPaths := !bypassed
 			gr.group.JoinedOnAllPaths = &onAllPaths

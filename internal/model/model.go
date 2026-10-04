@@ -290,6 +290,15 @@ func (g *CFG) CanReach(target BlockID) map[BlockID]bool {
 // direction: if the stop signal is NOT reachable avoiding Wait, Wait
 // necessarily precedes it on every path).
 func (g *CFG) ReachableAvoiding(start BlockID, avoid map[BlockID]bool) map[BlockID]bool {
+	return g.ReachableAvoidingEdges(start, avoid, nil)
+}
+
+// ReachableAvoidingEdges is ReachableAvoiding that also refuses to follow
+// any edge for which skipEdge reports true (nil skips nothing). It lets a
+// caller rule out a whole branch, not just a block: for example the
+// `err != nil` side of an error check, when the question is about paths on
+// which an error-returning factory succeeded.
+func (g *CFG) ReachableAvoidingEdges(start BlockID, avoid map[BlockID]bool, skipEdge func(Edge) bool) map[BlockID]bool {
 	seen := map[BlockID]bool{}
 	if avoid[start] {
 		return seen
@@ -300,7 +309,7 @@ func (g *CFG) ReachableAvoiding(start BlockID, avoid map[BlockID]bool) map[Block
 		id := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		for _, e := range g.Blocks[id].Successors {
-			if avoid[e.To] || seen[e.To] {
+			if avoid[e.To] || seen[e.To] || (skipEdge != nil && skipEdge(e)) {
 				continue
 			}
 			seen[e.To] = true

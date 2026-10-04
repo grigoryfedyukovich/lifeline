@@ -168,6 +168,12 @@ func TestTutorialExamples(t *testing.T) {
 		{name: "waitgroup_stored_struct_waited", args: []string{"./examples/waitgroup_stored_struct_waited"}, needle: "no lifecycle diagnostics"},
 		{name: "constructor_cancel_handle_dropped", args: []string{"./examples/constructor_cancel_handle_dropped"}, needle: "[LL1001]"},
 		{name: "constructor_waitgroup_handle_dropped", args: []string{"./examples/constructor_waitgroup_handle_dropped"}, needle: "[LL1003]"},
+		// An error-returning factory owes nothing on the branch where it
+		// reported an error (internal/frontend's errorBranchSkipper): the
+		// checked-and-deferred idiom is clean, while an unrelated early
+		// return after a successful call still leaks.
+		{name: "context_wrapper_error_checked", args: []string{"-config", "./examples/context_wrapper_error_checked/lifeline.yaml", "./examples/context_wrapper_error_checked"}, needle: "no lifecycle diagnostics"},
+		{name: "context_wrapper_error_early_return", args: []string{"-config", "./examples/context_wrapper_error_early_return/lifeline.yaml", "./examples/context_wrapper_error_early_return"}, needle: "[LL1001]"},
 		// A call to a method on a tracked handle is followed into the
 		// method's own same-package body (followHandleMethod) rather
 		// than being treated as an unrelated, harmless use of the

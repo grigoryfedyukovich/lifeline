@@ -4814,9 +4814,9 @@ func Start() {
 // leaks on that path. (An earlier version of this comment called the shape
 // a safe idiom; it is only safe when the check comes BEFORE the
 // acquisition, which audit finding F3 fixed -- see TestAcquisition_Cancel.)
-// The genuinely unresolved false positive is a wrapper returning
-// (ctx, cancel, err), which needs a guarded summary. See
-// docs/limitations.md.
+// A wrapper returning (ctx, cancel, err) checked with `if err != nil {
+// return }` is a different shape and is excused by the error guard; see
+// error_guard_test.go and docs/limitations.md.
 func TestCancelDeferAfterErrorCheckFiresLikeWaitGroupDoes(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import (
