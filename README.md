@@ -154,7 +154,15 @@ For the exact form:
 ctx, _ := context.WithCancel(parent)
 ```
 
-Lifeline emits a two-edit suggestion that retains the cancel function and immediately defers it. The proposed name is checked against identifiers in the function. No edit is emitted for field assignments, nonlocal ownership, or structurally ambiguous cases.
+Lifeline emits a two-edit suggestion that retains the cancel function and immediately defers it. The proposed name is checked against every identifier in the function, and a second fix in the same function gets a different name. The diagnostic is always reported; the edit is offered only where it is valid Go that keeps the resource's scope and lifetime, so it is **withheld** when the assignment is:
+
+- the initializer of an `if`, `for`, `switch` or type switch (there is no statement boundary to put `; defer ...` after);
+- inside a `for` or `range` body, including through nested blocks, `switch` and `select` (a `defer` runs at function return, so it would hold every iteration's context instead of releasing each one);
+- under a label, or anywhere in a function that uses `goto` (control flow can re-enter the statement);
+- a factory whose cancel function takes an argument, such as `context.WithCancelCause` (`defer cancel()` would not compile);
+- not a short declaration, a field assignment, or nonlocal ownership.
+
+Every emitted fix is applied to source and type-checked in the test suite (`internal/frontend/fix_validity_test.go`).
 
 ## Development
 

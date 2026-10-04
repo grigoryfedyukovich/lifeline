@@ -736,11 +736,90 @@ func contextFactoryRoles(callType types.Type, contextInterface *types.Interface)
 	return
 }
 
+// cancelCallableWithoutArguments reports whether the cancel function at
+// index idx of a factory call's result tuple can be invoked as `f()`: the
+// suggested fix defers exactly that. A context.CancelCauseFunc takes the
+// cause as an argument, so the same edit would not compile.
+func cancelCallableWithoutArguments(t types.Type, idx int) bool {
+	tuple, ok := t.(*types.Tuple)
+	if !ok || idx < 0 || idx >= tuple.Len() {
+		return false
+	}
+	sig, ok := tuple.At(idx).Type().Underlying().(*types.Signature)
+	return ok && sig.Params().Len() == 0
+}
+
+// fixableAssignments returns the short assignments in fd where rewriting
+// `ctx, _ := factory(...)` into `ctx, name := factory(...); defer name()`
+// is valid Go that preserves the resource's scope and lifetime. An
+// assignment qualifies only when it is a standalone statement in a
+// statement list (a block, `case` or `select` clause body), which excludes
+// the init statements of `if`, `for`, `switch` and `type switch`, where
+// inserting `; defer ...` would not even parse, and it qualifies only when
+// nothing around it can run it more than once per call: not inside a `for`
+// or `range` body, not under a label, and not in a function that uses
+// `goto` at all. A `defer` runs when the function returns, so in a loop it
+// would retain every iteration's context until then instead of releasing
+// each one, which is the very leak the diagnostic is about. Function
+// literals are not entered (their bodies are not analyzed here).
+func (b *builder) fixableAssignments(fd *ast.FuncDecl) map[*ast.AssignStmt]bool {
+	out := map[*ast.AssignStmt]bool{}
+	if fd.Body == nil {
+		return out
+	}
+	usesGoto := false
+	var stack []ast.Node
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if n == nil {
+			stack = stack[:len(stack)-1]
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		if br, ok := n.(*ast.BranchStmt); ok && br.Tok == token.GOTO {
+			usesGoto = true
+		}
+		stack = append(stack, n)
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(stack) < 2 {
+			return true
+		}
+		switch stack[len(stack)-2].(type) {
+		case *ast.BlockStmt, *ast.CaseClause, *ast.CommClause:
+		default:
+			return true // if/for/switch init, labeled statement, etc.
+		}
+		for _, anc := range stack[:len(stack)-1] {
+			switch anc.(type) {
+			case *ast.ForStmt, *ast.RangeStmt, *ast.LabeledStmt:
+				return true
+			}
+		}
+		out[as] = true
+		return true
+	})
+	if usesGoto {
+		return map[*ast.AssignStmt]bool{}
+	}
+	return out
+}
+
+// fixable computes fixableAssignments at most once per function, on the
+// first blank-cancel assignment that needs it.
+func (b *builder) fixable(fd *ast.FuncDecl, cache *map[*ast.AssignStmt]bool) map[*ast.AssignStmt]bool {
+	if *cache == nil {
+		*cache = b.fixableAssignments(fd)
+	}
+	return *cache
+}
+
 func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]string) ([]*cancelState, []*groupState) {
 	var states []*cancelState
 	var groups []*groupState
 	seenGroups := map[types.Object]bool{}
-	var allNames map[string]bool // computed only for the rare blank-cancel fix
+	var allNames map[string]bool         // computed only for the rare blank-cancel fix
+	var fixable map[*ast.AssignStmt]bool // computed only for the rare blank-cancel fix
 
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
@@ -778,11 +857,17 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 			}
 			if cancelID.Name == "_" {
 				state.binding.Discarded = true
-				if x.Tok == token.DEFINE {
+				// The automatic edit is emitted only where the exact
+				// transformation is known to be valid Go that keeps the
+				// resource's scope and lifetime: see fixableAssignments
+				// and cancelCallableWithoutArguments (audit finding F4).
+				// Everywhere else the diagnostic stands without a fix.
+				if x.Tok == token.DEFINE && cancelCallableWithoutArguments(b.in.Info.TypeOf(call), cancelIdx) && b.fixable(fd, &fixable)[x] {
 					if allNames == nil {
 						allNames = identifierNames(fd)
 					}
 					name := uniqueName("lifelineCancel", allNames)
+					allNames[name] = true // a second fix in this function must not reuse (or shadow) it
 					state.binding.SuggestedFix = &model.SuggestedFix{
 						Message: "retain and defer the cancellation function",
 						Edits: []model.FixEdit{
