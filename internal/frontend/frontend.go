@@ -42,17 +42,34 @@ type Input struct {
 	// by trying again). Standalone mode leaves this nil, same as
 	// LookupFunctionSummary, and argumentConsumed falls back to "assume
 	// transferred" exactly as it does for any other unresolvable callee.
+	//
+	// LookupParamConsumption is the coarse, legacy form of
+	// LookupParamEffects below: a bare "consumed somehow". It is consulted
+	// only when LookupParamEffects is nil or has no answer, and reads
+	// "consumed" as an opaque hand-off (the pre-effects meaning) and "not
+	// consumed" as a checked absence of any effect.
 	LookupParamConsumption func(fn *types.Func, paramIndex int) (consumed, ok bool)
 
-	// LookupParamDoneCalled is calleeDoneParamMatches's cross-package
+	// LookupParamEffects is LookupParamConsumption with the distinctions
+	// the engine needs (audit finding F6): what fn's body does with the
+	// cancel-like or group-like parameter at this position, as a
+	// model.ParamEffect set (may / must / returns / opaque), backed the
+	// same way by a versioned object fact (FunctionFact.ParamEffects). A
+	// same-package callee never uses this: b.paramEffects answers it
+	// directly with the same semantics. Standalone mode leaves it nil.
+	LookupParamEffects func(fn *types.Func, paramIndex int) (effect model.ParamEffect, ok bool)
+
+	// LookupParamDoneEffects is calleeDoneEffect's cross-package
 	// counterpart, backed the same way by a versioned fact
-	// (FunctionFact.ParamDoneCalled): does fn's own body eventually call
-	// Done() on the sync.WaitGroup parameter at this position, to any
-	// depth. Standalone mode leaves this nil, same as the other two
-	// Lookup* hooks, and calleeDoneParamMatches simply reports false for
-	// a cross-package callee then, same as it always did before this
-	// existed.
-	LookupParamDoneCalled func(fn *types.Func, paramIndex int) (called, ok bool)
+	// (FunctionFact.ParamDoneEffects): does fn's own body call Done() on the
+	// sync.WaitGroup parameter at this position on some paths
+	// (model.EffectMay) or on every path (model.EffectMust), to any depth.
+	// An observed Done somewhere is not a guarantee that it happens, let
+	// alone exactly once (audit finding F6); only Must counts a spawned
+	// worker's Done as matched. Standalone mode leaves this nil, same as the
+	// other Lookup* hooks, and calleeDoneEffect then reports no effect for a
+	// cross-package callee.
+	LookupParamDoneEffects func(fn *types.Func, paramIndex int) (effect model.ParamEffect, ok bool)
 
 	// LookupReturnFieldSites is the constructor/field-ownership
 	// counterpart of LookupParamConsumption and LookupParamDoneCalled:
@@ -139,20 +156,17 @@ type builder struct {
 	// callee. Once Build's fixed-point loop finishes, every lookup here is
 	// a pure, stable map read; argumentConsumed itself never triggers a
 	// fresh computation, which is what keeps it non-recursive.
-	paramConsumption map[types.Object]bool
-	// paramDoneCalled records, for a sync.WaitGroup-typed parameter,
-	// whether calleeDoneParamMatches's own fixed point (computeParamDoneCalled)
-	// has established that Done() is eventually called on it -- directly,
-	// or via any number of further resolvable same-package functions it
-	// gets passed on to as a direct argument. Unlike paramConsumption,
-	// this needs no "pending" signal alongside it: a not-yet-true entry
-	// mid-sweep is exactly the same safe default ("no evidence yet") this
-	// analysis already treats it as everywhere else, and simply gets
-	// corrected upward on a later sweep if warranted -- there is no
-	// action taken on a false reading here that a later true reading
-	// would need to retroactively undo, the way "assume transferred"
-	// would for paramConsumption.
-	paramDoneCalled map[types.Object]bool
+	paramEffects map[types.Object]model.ParamEffect
+	// paramDoneEffects records, for a sync.WaitGroup-typed parameter, what
+	// computeParamDoneEffects' own fixed point has established about Done():
+	// model.EffectMay if it is called on some paths, model.EffectMust if on
+	// every path, directly or via any number of further resolvable
+	// same-package functions the group gets passed on to. Unlike
+	// paramEffects, this needs no "pending" signal alongside it: a
+	// not-yet-grown entry mid-sweep is the same safe default ("no evidence
+	// yet") this analysis treats it as everywhere else, and is simply
+	// corrected upward on a later sweep if warranted.
+	paramDoneEffects map[types.Object]model.ParamEffect
 	// inParamPrepass is true only while computeParameterConsumption's own
 	// call into observeFunctionBody is on the stack. It tells observeCall
 	// to treat a "pending" dependency (argumentConsumed's third return
@@ -234,7 +248,12 @@ type builder struct {
 	collectObligations bool
 	// deadLiterals are the ranges of function literals that can never run
 	// (see deadFuncLits) in the function body currently being built.
-	deadLiterals       []posRange
+	deadLiterals []posRange
+	// prepassFunc is the function whose parameters computeParameterEffects
+	// is analyzing right now; staticCalls is the same-package static call
+	// graph, built on first use, for recursion-cycle questions.
+	prepassFunc        *types.Func
+	staticCalls        map[*types.Func][]*types.Func
 	pendingObligations []pendingObligation
 	callerFindings     []callerFinding
 	contextInterface   *types.Interface
@@ -425,8 +444,8 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		summaries:         map[*types.Func]model.Goroutine{},
 		fieldGroupObjects: map[fieldGroupKey]*types.Var{},
 		fieldGroupOwners:  map[*types.Var]fieldGroupKey{},
-		paramConsumption:  map[types.Object]bool{},
-		paramDoneCalled:   map[types.Object]bool{},
+		paramEffects:      map[types.Object]model.ParamEffect{},
+		paramDoneEffects:  map[types.Object]model.ParamEffect{},
 		returnFieldInfo:   map[types.Object][]returnFieldSite{},
 		callerVerdicts:    map[types.Object]map[callerSiteKey]callerVerdict{},
 		contextInterface:  findContextInterface(in.Pkg),
@@ -517,10 +536,10 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	for {
 		changed := false
 		for _, source := range sources[:limit] {
-			if b.computeParameterConsumption(source.decl) {
+			if b.computeParameterEffects(source.decl) {
 				changed = true
 			}
-			if b.computeParamDoneCalled(source.decl) {
+			if b.computeParamDoneEffects(source.decl) {
 				changed = true
 			}
 		}
@@ -575,6 +594,18 @@ type cancelState struct {
 	// finding F3). Nil for bindings with no local acquisition (parameters,
 	// constructor-result stand-ins), which are never ordering-checked.
 	acquireCall *ast.CallExpr
+	// returned is set when the cancel function is returned from the
+	// function (observeReturn). For a parameter this becomes EffectReturns.
+	returned bool
+	// mayCalls are calls to a callee whose own effect on the passed cancel
+	// function is only EffectMay: it cancels on some of its paths. They are
+	// not discharges (the condition inside the callee must not be erased),
+	// and they are what lets computeOrdering say "called on some but not
+	// every path" instead of staying silent (audit finding F6).
+	mayCalls []*ast.CallExpr
+	// recCalls are calls that pass this parameter on to a function in the
+	// same recursion cycle as the one being analyzed; see isRecursivePass.
+	recCalls []*ast.CallExpr
 	// errObj is the error variable assigned by the same statement as the
 	// cancel function, when the factory also returns an error (a
 	// configured context wrapper returning `(ctx, cancel, err)`). On the
@@ -608,6 +639,15 @@ type groupState struct {
 	// function is entered; computeOrdering checks for a Wait() on every
 	// path from each of these (audit finding F3).
 	startCalls []*ast.CallExpr
+	// returned, mayJoinCalls and helperJoinCalls mirror cancelState's
+	// returned, mayCalls and the callee-must call sites: a group passed to
+	// a helper that joins it on every path (helperJoinCalls, a discharge at
+	// that call), on some paths only (mayJoinCalls, never a discharge), or
+	// that returns it.
+	returned        bool
+	mayJoinCalls    []*ast.CallExpr
+	helperJoinCalls []*ast.CallExpr
+	recCalls        []*ast.CallExpr
 	// waitCallSites is the same kind of AST-node record as
 	// cancelState.callSites above, for the same reason: finding each
 	// Wait() call's CFG block by identity, not by span.
@@ -746,8 +786,8 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		name = source.obj.FullName()
 	}
 	fn := model.Function{Name: name, Span: b.span(fd)}
-	fn.ParamConsumption = b.exportedParamConsumption(fd)
-	fn.ParamDoneCalled = b.exportedParamDoneCalled(fd)
+	fn.ParamEffects = b.exportedParamEffects(fd)
+	fn.ParamDoneEffects = b.exportedParamDoneEffects(fd)
 	fn.ReturnFieldSites = b.exportedReturnFieldSites(source.obj)
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
@@ -814,8 +854,8 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		// it, so nothing else is carried (and nothing is reported twice).
 		fn.Goroutines = nil
 		fn.BodyLifecycle = model.Goroutine{}
-		fn.ParamConsumption = nil
-		fn.ParamDoneCalled = nil
+		fn.ParamEffects = nil
+		fn.ParamDoneEffects = nil
 		return fn
 	}
 	ir := localssa.Build(name, fd.Body, b.in.Info)
@@ -1244,7 +1284,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 // fd's own diagnostics (buildFunction does that, separately, for fd's own
 // locally-declared bindings, once the fixed point above has fully
 // converged).
-func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) (reportChanged bool) {
+func (b *builder) computeParameterEffects(fd *ast.FuncDecl) (reportChanged bool) {
 	if fd.Type.Params == nil {
 		return false
 	}
@@ -1294,8 +1334,14 @@ func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) (reportChanged b
 		return false
 	}
 	if variadicCancelParam != nil {
-		next := variadicCancelElementCalled(fd.Body, variadicCancelParam, b.in.Info)
-		if b.recordParamConsumption(variadicCancelParam, next) {
+		// `for _, v := range param { v() }` calls every element: a must
+		// effect on the collection. (Whether the collection is empty is the
+		// caller's business, as it always was.)
+		var next model.ParamEffect
+		if variadicCancelElementCalled(fd.Body, variadicCancelParam, b.in.Info) {
+			next = model.EffectMay | model.EffectMust
+		}
+		if b.recordParamEffects(variadicCancelParam, next) {
 			reportChanged = true
 		}
 	}
@@ -1306,45 +1352,211 @@ func (b *builder) computeParameterConsumption(fd *ast.FuncDecl) (reportChanged b
 	b.collectContextParams(fd.Type, contexts)
 	var scratch model.Function
 	// fnObj is nil here: this scratch run exists only for its side effect
-	// on b.paramConsumption (see the doc comment above), and constructor-
+	// on b.paramEffects (see the doc comment above), and constructor-
 	// field tracking is keyed off a binding's *declaring* function, which
 	// for a parameter-standing-in-for-a-binding like this is meaningless
 	// -- there is no separate function that "returns" this parameter's
 	// own value out of itself. recordReturnedField treats a nil fnObj as
 	// a no-op for exactly this reason.
+	//
+	// A literal that never runs has no effects here either (see
+	// deadFuncLits): a cancel call inside an uncalled closure cannot make
+	// the parameter consumed (audit finding F6).
+	b.deadLiterals = b.deadFuncLits(fd.Body)
+	b.prepassFunc, _ = b.in.Info.Defs[fd.Name].(*types.Func)
 	b.inParamPrepass = true
 	b.observeFunctionBody(fd.Body, contexts, paramCancels, paramGroups, &scratch, nil)
 	b.inParamPrepass = false
+	b.prepassFunc = nil
+	defer func() { b.deadLiterals = nil }() // usedInLiveLiteral below still needs the ranges
+
+	// The effects are decided on the function's own structural CFG, from
+	// its entry (a parameter is already owned when the body starts) to its
+	// exit: a discharge only counts if some normal path actually reaches
+	// it, and is a must effect only if no path avoids every one.
+	name := fd.Name.Name
+	if obj, ok := b.in.Info.Defs[fd.Name].(*types.Func); ok && obj != nil {
+		name = obj.FullName()
+	}
+	cfgraph, sites := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
+	deferred := deferredCallSet(fd.Body)
 	for _, c := range paramCancels {
-		next := c.binding.Called || c.binding.Escapes
-		if b.recordParamConsumption(c.cancelObj, next) {
+		next := b.paramEffectOf(fd.Body, cfgraph, sites, deferred, c.cancelObj, c.callSites, c.mayCalls, c.recCalls, c.binding.Escapes, c.returned)
+		if b.recordParamEffects(c.cancelObj, next) {
 			reportChanged = true
 		}
 	}
 	for _, g := range paramGroups {
-		next := g.group.Joined || g.group.Escapes
-		if b.recordParamConsumption(g.obj, next) {
+		next := b.paramEffectOf(fd.Body, cfgraph, sites, deferred, g.obj, append(append([]*ast.CallExpr(nil), g.waitCallSites...), g.helperJoinCalls...), g.mayJoinCalls, g.recCalls, g.group.Escapes, g.returned)
+		if b.recordParamEffects(g.obj, next) {
 			reportChanged = true
 		}
 	}
 	return reportChanged
 }
 
-// recordParamConsumption merges next into b.paramConsumption[obj] via OR
-// and reports whether the recorded state changed: either the value rose
-// from false to true, or this is the first time obj has been recorded at
-// all (a lookup miss and a recorded "false" are different things --
-// argumentConsumed's pending result depends on telling them apart -- so
-// recording "false" for the first time is still a real change dependents
-// need to see).
-func (b *builder) recordParamConsumption(obj types.Object, next bool) bool {
-	prev, existed := b.paramConsumption[obj]
-	merged := prev || next
-	b.paramConsumption[obj] = merged
+// paramEffectOf turns what observeFunctionBody recorded about one
+// parameter into its ParamEffect.
+//
+// discharges are the calls that consume it (direct calls or Waits, plus
+// calls to callees whose own effect is must); mayCalls are calls to callees
+// that only may consume it. Only a discharge in code some normal path can
+// reach counts: cleanup after an unconditional return is not cleanup. May is
+// "some reachable discharge or may-call"; must is "no path from entry to
+// the exit avoids every reachable discharge" (a deferred discharge covers
+// every path that registered it).
+//
+// Anything else that happens to the value is an opaque hand-off, with two
+// refinements: being returned is its own effect, and a use inside a
+// function literal that may run is opaque, because the literal's own
+// control flow is not part of this function's graph (the closure might be
+// the very thing that cancels, later, so nothing is claimed).
+func (b *builder) paramEffectOf(body *ast.BlockStmt, g *model.CFG, sites map[*ast.CallExpr]flowgraph.CallSite, deferred map[*ast.CallExpr]bool, obj types.Object, discharges, mayCalls, recCalls []*ast.CallExpr, escapes, returned bool) model.ParamEffect {
+	var effect model.ParamEffect
+	reach := g.Reachable(g.Entry)
+	reachable := func(calls []*ast.CallExpr) []*ast.CallExpr {
+		var out []*ast.CallExpr
+		for _, c := range calls {
+			if site, ok := sites[c]; ok && reach[site.Block] {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	live := reachable(discharges)
+	if len(live) > 0 || len(reachable(mayCalls)) > 0 {
+		effect |= model.EffectMay
+	}
+	if len(live) > 0 {
+		// A call that hands the parameter on to a function in the same
+		// recursion cycle counts as a discharge for the must question, but
+		// only in a function that has a real discharge of its own: the
+		// recursion either bottoms out in one, or never returns. Without
+		// that, `countdown(c, n-1)` on the recursive branch would make
+		// every self-recursive consumer look conditional. A cycle with no
+		// real discharge anywhere stays a leak (it has no live set).
+		withRec := append(append([]*ast.CallExpr(nil), live...), reachable(recCalls)...)
+		plain, deferredSites := splitDeferred(withRec, deferred, sites)
+		origin := []flowgraph.CallSite{{Block: g.Entry, Index: -1}}
+		if bypassed, known := liveExitReachable(g, origin, plain, deferredSites, nil); known && !bypassed {
+			effect |= model.EffectMust
+		}
+	}
+	if returned {
+		effect |= model.EffectReturns
+	} else if escapes {
+		effect |= model.EffectOpaque
+	}
+	if b.usedInLiveLiteral(body, obj) {
+		effect |= model.EffectOpaque
+	}
+	return effect
+}
+
+// isRecursivePass reports whether call, made while a function's parameters
+// are being analyzed, calls a function in the same recursion cycle as that
+// function: it can reach the function again, and the function calls it, so
+// the two are in one strongly connected component of the static call graph.
+func (b *builder) isRecursivePass(call *ast.CallExpr) bool {
+	if !b.inParamPrepass || b.prepassFunc == nil {
+		return false
+	}
+	callee := b.resolveCalleeFunc(call.Fun)
+	if callee == nil || b.funcs[callee] == nil {
+		return false
+	}
+	return b.reaches(callee, b.prepassFunc)
+}
+
+// reaches reports whether from can reach to through same-package static
+// calls (from == to counts: direct self-recursion).
+func (b *builder) reaches(from, to *types.Func) bool {
+	if b.staticCalls == nil {
+		b.staticCalls = map[*types.Func][]*types.Func{}
+		for fn, decl := range b.funcs {
+			if decl.Body == nil {
+				continue
+			}
+			seen := map[*types.Func]bool{}
+			ast.Inspect(decl.Body, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if callee := b.resolveCalleeFunc(call.Fun); callee != nil && b.funcs[callee] != nil && !seen[callee] {
+						seen[callee] = true
+						b.staticCalls[fn] = append(b.staticCalls[fn], callee)
+					}
+				}
+				return true
+			})
+		}
+	}
+	visited := map[*types.Func]bool{}
+	var walk func(*types.Func) bool
+	walk = func(fn *types.Func) bool {
+		if fn == to {
+			return true
+		}
+		if visited[fn] {
+			return false
+		}
+		visited[fn] = true
+		for _, next := range b.staticCalls[fn] {
+			if walk(next) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(from)
+}
+
+// usedInLiveLiteral reports whether obj is referenced inside a function
+// literal of body that is not provably dead (see deadFuncLits).
+func (b *builder) usedInLiveLiteral(body *ast.BlockStmt, obj types.Object) bool {
+	if body == nil || obj == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		lit, ok := n.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		if b.inDeadLiteral(lit.Pos()) {
+			return false
+		}
+		ast.Inspect(lit.Body, func(m ast.Node) bool {
+			if id, ok := m.(*ast.Ident); ok && b.in.Info.Uses[id] == obj {
+				found = true
+			}
+			return !found
+		})
+		return false
+	})
+	return found
+}
+
+// recordParamEffects merges next into b.paramEffects[obj] by union and
+// reports whether the recorded state changed: either the set grew, or this
+// is the first time obj has been recorded at all (a lookup miss and a
+// recorded empty set are different things -- argumentEffects' pending
+// result depends on telling them apart -- so recording the empty set for
+// the first time is still a real change dependents need to see).
+//
+// Union is what keeps the interprocedural fixed point well-defined: a
+// callee's effect only ever grows as more of its own callees resolve, and
+// the caller's effect is derived from it monotonically, so every sweep can
+// only add bits and the loop terminates.
+func (b *builder) recordParamEffects(obj types.Object, next model.ParamEffect) bool {
+	prev, existed := b.paramEffects[obj]
+	merged := prev | next
+	b.paramEffects[obj] = merged
 	return !existed || merged != prev
 }
 
-// argumentConsumed reports whether obj, passed directly as call's argument
+// argumentEffects reports what the callee does with obj, passed directly as call's argument
 // at some position -- a direct argument, or one element of a `...`-spread
 // composite literal (see argumentIndexOf) -- is consumed by the callee's
 // own body: for a same-package callee, a pure lookup into
@@ -1388,29 +1600,37 @@ func (b *builder) recordParamConsumption(obj types.Object, next bool) bool {
 //     pending: a fact is either present (verified) or absent (falls
 //     back) on the spot -- there is no sweep to wait for, since this
 //     build has no way to ever compute that package's own result itself.
-func (b *builder) argumentConsumed(call *ast.CallExpr, obj types.Object) (consumed, verified, pending bool) {
+func (b *builder) argumentEffects(call *ast.CallExpr, obj types.Object) (effect model.ParamEffect, verified, pending bool) {
 	funcObj := b.resolveCalleeFunc(call.Fun)
 	if funcObj == nil {
-		return false, false, false
+		return 0, false, false
 	}
 	index := argumentIndexOf(call, obj, funcObj, b.in.Info, b.singleAssignTargets)
 	if index == -1 {
-		return false, false, false
+		return 0, false, false
 	}
 	if decl := b.funcs[funcObj]; decl != nil {
 		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
 		if paramObj == nil {
-			return false, false, false
+			return 0, false, false
 		}
-		paramConsumed, known := b.paramConsumption[paramObj]
-		return paramConsumed, known, !known
+		paramEffect, known := b.paramEffects[paramObj]
+		return paramEffect, known, !known
+	}
+	if b.in.LookupParamEffects != nil {
+		if paramEffect, known := b.in.LookupParamEffects(funcObj, index); known {
+			return paramEffect, true, false
+		}
 	}
 	if b.in.LookupParamConsumption != nil {
-		if paramConsumed, known := b.in.LookupParamConsumption(funcObj, index); known {
-			return paramConsumed, true, false
+		if consumed, known := b.in.LookupParamConsumption(funcObj, index); known {
+			if consumed {
+				return model.EffectOpaque, true, false
+			}
+			return 0, true, false
 		}
 	}
-	return false, false, false
+	return 0, false, false
 }
 
 // resolveCalleeFunc resolves call's callee to a *types.Func for
@@ -1804,29 +2024,29 @@ func variadicCancelElementCalled(body *ast.BlockStmt, containerObj types.Object,
 	return found
 }
 
-// exportedParamConsumption returns, for each of fd's own cancel-like,
-// group-like, or variadic-cancel-collection parameters, by position,
-// whether computeParameterConsumption's fixed point (already fully
-// converged by the time buildFunction runs -- Build's pre-pass sweep
-// loop always finishes before its main per-function loop begins)
-// recorded it as consumed. This becomes model.Function.ParamConsumption,
-// which a cross-package caller can consult the same way argumentConsumed
-// already consults b.paramConsumption directly for a same-package one --
-// see analyzer.go's fact export and Input.LookupParamConsumption.
-func (b *builder) exportedParamConsumption(fd *ast.FuncDecl) map[int]bool {
+// exportedParamEffects returns, for each of fd's own cancel-like,
+// group-like, or variadic-cancel-collection parameters, by position, the
+// effects computeParameterEffects' fixed point (already fully converged by
+// the time buildFunction runs -- Build's pre-pass sweep loop always
+// finishes before its main per-function loop begins) recorded for it. This
+// becomes model.Function.ParamEffects, which a cross-package caller
+// consults with exactly the semantics argumentEffects gives b.paramEffects
+// for a same-package one -- see analyzer.go's fact export and
+// Input.LookupParamEffects.
+func (b *builder) exportedParamEffects(fd *ast.FuncDecl) map[int]model.ParamEffect {
 	if fd.Type.Params == nil {
 		return nil
 	}
-	var out map[int]bool
+	var out map[int]model.ParamEffect
 	record := func(index int, obj types.Object) {
-		consumed, ok := b.paramConsumption[obj]
+		effect, ok := b.paramEffects[obj]
 		if !ok {
 			return
 		}
 		if out == nil {
-			out = map[int]bool{}
+			out = map[int]model.ParamEffect{}
 		}
-		out[index] = consumed
+		out[index] = effect
 	}
 	index := 0
 	params := fd.Type.Params.List
@@ -1853,26 +2073,28 @@ func (b *builder) exportedParamConsumption(fd *ast.FuncDecl) map[int]bool {
 	return out
 }
 
-// exportedParamDoneCalled returns, for each of fd's own
-// sync.WaitGroup-typed parameters, by position, whether
-// computeParamDoneCalled's fixed point (already fully converged by the
-// time buildFunction runs) recorded Done() as eventually called on it.
-// This becomes model.Function.ParamDoneCalled -- see analyzer.go's fact
-// export and Input.LookupParamDoneCalled.
-func (b *builder) exportedParamDoneCalled(fd *ast.FuncDecl) map[int]bool {
+// exportedParamDoneEffects returns, for each of fd's own
+// sync.WaitGroup-typed parameters, by position, the Done() effects
+// computeParamDoneEffects' fixed point (already fully converged by the time
+// buildFunction runs) recorded for it. This becomes
+// model.Function.ParamDoneEffects -- see analyzer.go's fact export and
+// Input.LookupParamDoneEffects.
+func (b *builder) exportedParamDoneEffects(fd *ast.FuncDecl) map[int]model.ParamEffect {
 	if fd.Type.Params == nil {
 		return nil
 	}
-	var out map[int]bool
+	var out map[int]model.ParamEffect
 	index := 0
 	for _, field := range fd.Type.Params.List {
 		for _, name := range field.Names {
 			obj := b.in.Info.ObjectOf(name)
-			if obj != nil && name.Name != "_" && groupKind(obj.Type()) == "waitgroup" && b.paramDoneCalled[obj] {
-				if out == nil {
-					out = map[int]bool{}
+			if obj != nil && name.Name != "_" && groupKind(obj.Type()) == "waitgroup" {
+				if effect, ok := b.paramDoneEffects[obj]; ok && effect != 0 {
+					if out == nil {
+						out = map[int]model.ParamEffect{}
+					}
+					out[index] = effect
 				}
-				out[index] = true
 			}
 			index++
 		}
@@ -1966,11 +2188,34 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 		// the callee receiving the function, so no assignment-context
 		// guard applies either way.
 		if c.cancelObj != nil && (hasObject(argObjects, c.cancelObj) || spreadArgumentContains(call, c.cancelObj, b.in.Info, b.singleAssignTargets)) {
-			if consumed, verified, pending := b.argumentConsumed(call, c.cancelObj); verified {
-				if consumed {
+			if b.isRecursivePass(call) {
+				c.recCalls = append(c.recCalls, call)
+			}
+			if effect, verified, pending := b.argumentEffects(call, c.cancelObj); verified {
+				// Apply the callee's effect at THIS call (audit finding
+				// F6), not as a blanket "consumed" that erases the
+				// obligation wherever it happened.
+				switch {
+				case effect.Hands():
+					// The callee may keep or return it: not ours to
+					// discharge any more, and nothing finer is known.
 					c.binding.Escapes = true
-					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "passed as an argument; the callee's own body consumes it", Span: ptrSpan(b.span(call))})
-				} else {
+					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-transferred", Message: "passed as an argument; the callee hands it on (stores, returns or otherwise transfers it) rather than consuming it itself", Span: ptrSpan(b.span(call))})
+				case effect.Has(model.EffectMust):
+					// The callee cancels on every path: this call IS a
+					// cancel call for the owner, with its own place in
+					// the owner's control flow.
+					c.binding.Called = true
+					c.callSites = append(c.callSites, call)
+					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "callee-consumes", Message: "passed as an argument; the callee's own body calls it on every path", Span: ptrSpan(b.span(call))})
+				case effect.Has(model.EffectMay):
+					// The callee cancels only under a condition of its
+					// own. That condition is not erased: this call is
+					// never a discharge, only a possible one.
+					c.binding.Called = true
+					c.mayCalls = append(c.mayCalls, call)
+					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "callee-may-consume", Message: "passed as an argument; the callee's own body calls it only on some of its paths", Span: ptrSpan(b.span(call))})
+				default:
 					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never calls or further transfers it", Span: ptrSpan(b.span(call))})
 				}
 			} else if pending && b.inParamPrepass {
@@ -2031,11 +2276,30 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 			// *this* function's own CFG to anchor to. That is an existing,
 			// separately documented limitation, not something this
 			// change affects.)
-			if consumed, verified, pending := b.argumentConsumed(call, g.obj); verified {
-				if consumed {
+			if b.isRecursivePass(call) {
+				g.recCalls = append(g.recCalls, call)
+			}
+			if effect, verified, pending := b.argumentEffects(call, g.obj); verified {
+				switch {
+				case effect.Has(model.EffectMust):
+					// The callee joins on every path: a Wait for the
+					// owner, at this call.
 					g.group.Joined = true
-					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-consumed", Message: "passed as an argument; the callee's own body joins or further transfers it", Span: ptrSpan(b.span(call))})
-				} else {
+					g.helperJoinCalls = append(g.helperJoinCalls, call)
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "callee-joins", Message: "passed as an argument; the callee's own body joins it on every path", Span: ptrSpan(b.span(call))})
+				case effect.Hands():
+					// Unchanged from before effects were distinguished:
+					// the callee may hand the group on, which is kept
+					// as "joined" so a literal count imbalance stays
+					// live (see the long note above). It is labeled
+					// for what it is, a hand-off, not a join.
+					g.group.Joined = true
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-transferred", Message: "passed as an argument; the callee hands it on (or joins it only conditionally and hands it on), so it is treated as joined without a verified join", Span: ptrSpan(b.span(call))})
+				case effect.Has(model.EffectMay):
+					g.group.Joined = true
+					g.mayJoinCalls = append(g.mayJoinCalls, call)
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "callee-may-join", Message: "passed as an argument; the callee's own body joins it only on some of its paths", Span: ptrSpan(b.span(call))})
+				default:
 					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never joins or further transfers it", Span: ptrSpan(b.span(call))})
 				}
 			} else if pending && b.inParamPrepass {
@@ -2052,11 +2316,13 @@ func (b *builder) observeReturn(ret *ast.ReturnStmt, cancels []*cancelState, gro
 	for _, c := range cancels {
 		if c.cancelObj != nil && hasObject(used, c.cancelObj) && !claimed[c.cancelObj] {
 			c.binding.Escapes = true
+			c.returned = true
 		}
 	}
 	for _, g := range groups {
 		if g.obj != nil && hasObject(used, g.obj) && !claimed[g.obj] {
 			g.group.Escapes = true
+			g.returned = true
 		}
 	}
 }
@@ -4468,7 +4734,15 @@ func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types
 			}
 			return
 		}
-		if b.calleeDoneParamMatches(goStmt.Call, obj) {
+		// A worker that may call Done() is counted as one Done. The tally
+		// this feeds is an upper bound on the Dones that can happen, which
+		// is exactly what the only claim made from it needs: an
+		// undercount ("Add(3) but at most two Dones") holds even if every
+		// conditional Done fires, so it cannot be a false positive, while
+		// an exact balance is never asserted (a worker that calls Done on
+		// some paths only is not presented as a matched Done, audit
+		// finding F6: see calleeDoneEffect's Must/May distinction).
+		if b.calleeDoneEffect(goStmt.Call, obj).Has(model.EffectMay) {
 			noteSpawnedDoneInto(bal, scope)
 		}
 		return
@@ -4722,25 +4996,20 @@ func literalNonNegativeInt(e ast.Expr, info *types.Info) (int, bool) {
 	return int(n), true
 }
 
-// calleeDoneParamMatches reports whether call's target is a resolvable
-// function -- same-package (via b.paramDoneCalled, computeParamDoneCalled's
-// own fixed point) or, for a callee outside the current package, via a
-// versioned fact (Input.LookupParamDoneCalled) -- that receives obj as a
-// direct argument at some position, and whose own body eventually calls
-// Done() on that corresponding parameter, to any depth: the named-
-// function counterpart to bodyCallsMethodOn's closure-capture check
-// above, for the equally common `wg.Add(1); go worker(&wg)` idiom, where
-// worker's whole job (however many further named helpers it delegates
-// to) is to call Done() on whatever it's given. This deliberately does
-// not reuse b.paramConsumption (Phase 5's own fixed point for cancel/group
-// parameters): that answers a different question -- does the parameter
-// get Wait()ed or further transferred -- appropriate for verifying an
-// ownership handoff, not for a worker whose job is specifically to
-// decrement the counter its caller already incremented.
-func (b *builder) calleeDoneParamMatches(call *ast.CallExpr, obj types.Object) bool {
+// calleeDoneEffect reports what call's target does with obj on the
+// sync.WaitGroup parameter obj is passed as: model.EffectMust if it calls
+// Done() on every path, model.EffectMay if only on some, zero if neither or
+// unknown. The target must be a resolvable function: same-package via
+// b.paramDoneEffects (computeParamDoneEffects' fixed point), cross-package
+// via Input.LookupParamDoneEffects. This is deliberately narrower than
+// argumentEffects's "does the callee consume or transfer it": a worker's
+// job is specifically to decrement the counter its caller already
+// incremented, and an observed Done somewhere is neither an all-path nor
+// an exactly-once guarantee (audit finding F6).
+func (b *builder) calleeDoneEffect(call *ast.CallExpr, obj types.Object) model.ParamEffect {
 	funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
 	if !ok {
-		return false
+		return 0
 	}
 	index := -1
 	for i, arg := range call.Args {
@@ -4750,41 +5019,48 @@ func (b *builder) calleeDoneParamMatches(call *ast.CallExpr, obj types.Object) b
 		}
 	}
 	if index == -1 {
-		return false
+		return 0
 	}
 	if decl := b.funcs[funcObj]; decl != nil {
 		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
 		if paramObj == nil {
-			return false
+			return 0
 		}
-		return b.paramDoneCalled[paramObj]
+		return b.paramDoneEffects[paramObj]
 	}
-	if b.in.LookupParamDoneCalled != nil {
-		if called, ok := b.in.LookupParamDoneCalled(funcObj, index); ok {
-			return called
+	if b.in.LookupParamDoneEffects != nil {
+		if effect, ok := b.in.LookupParamDoneEffects(funcObj, index); ok {
+			return effect
 		}
 	}
-	return false
+	return 0
 }
 
-// computeParamDoneCalled (re)computes, for every sync.WaitGroup-typed
-// parameter of fd, whether Done() is eventually called on it: directly
-// in fd's own body (bodyCallsMethodOn), or via fd passing it on, as a
-// direct argument to an ordinary call or a go-statement's call, to a
-// further resolvable same-package function whose own corresponding
-// parameter -- per this same fixed point, one step further along --
-// already eventually calls Done() (bodyDelegatesDone). Build calls this
-// once per function per sweep, in the same loop as
-// computeParameterConsumption and for the identical structural reason: a
-// chain of several named helpers (`worker(wg){ helper(wg) }`,
+// computeParamDoneEffects (re)computes, for every sync.WaitGroup-typed
+// parameter of fd, what fd's body does about Done() on it: model.EffectMay
+// if some reachable path calls it, model.EffectMust if every path does. A
+// path calls it directly (obj.Done(), including via defer), or by passing
+// the group on, as a direct argument to an ordinary call or a go
+// statement's call, to a resolvable same-package function whose own
+// corresponding parameter -- per this same fixed point, one step further
+// along -- must call it (a discharge at that call) or may (a possible one).
+// Build calls this once per function per sweep, in the same loop as
+// computeParameterEffects and for the identical structural reason: a chain
+// of several named helpers (`worker(wg){ helper(wg) }`,
 // `helper(wg){ wg.Done() }`) needs helper's own answer known before
-// worker's can be, regardless of which order they happen to be declared
-// in. Unlike computeParameterConsumption, this needs no "pending"
-// signal: recordParamDoneCalled's OR-merge means a not-yet-true entry
-// mid-sweep is just today's correct answer, not a wrong one standing in
-// for a right one, and later sweeps can only ever raise it, never need to
-// retract it.
-func (b *builder) computeParamDoneCalled(fd *ast.FuncDecl) (reportChanged bool) {
+// worker's can be, regardless of declaration order. Unlike
+// computeParameterEffects, this needs no "pending" signal:
+// recordParamDoneEffects' union means a not-yet-grown entry mid-sweep is
+// just today's correct answer, and later sweeps can only ever add bits.
+//
+// The decision is the same one computeParameterEffects makes (see
+// paramEffectOf): only a call in code some normal path can reach counts, and
+// must means no path from entry avoids every one (a deferred Done covers
+// every path that registered it). A Done inside a function literal is not
+// counted, as before. The exactly-once question is not asked: Must means
+// "at least once on every path", and a caller treating it as one matched
+// Done is a documented approximation (docs/limitations.md).
+func (b *builder) computeParamDoneEffects(fd *ast.FuncDecl) (reportChanged bool) {
 	if fd.Type.Params == nil || fd.Body == nil {
 		return false
 	}
@@ -4800,43 +5076,46 @@ func (b *builder) computeParamDoneCalled(fd *ast.FuncDecl) (reportChanged bool) 
 	if len(groupParams) == 0 {
 		return false
 	}
+	self, _ := b.in.Info.Defs[fd.Name].(*types.Func)
+	name := fd.Name.Name
+	if self != nil {
+		name = self.FullName()
+	}
+	cfgraph, sites := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
+	deferred := deferredCallSet(fd.Body)
+	b.deadLiterals = b.deadFuncLits(fd.Body)
+	defer func() { b.deadLiterals = nil }()
 	for _, obj := range groupParams {
-		next := bodyCallsMethodOn(fd.Body, obj, "Done", b.in.Info) || b.bodyDelegatesDone(fd.Body, obj)
-		if b.recordParamDoneCalled(obj, next) {
+		direct, must, may, rec := b.doneCalls(fd.Body, obj, self)
+		next := b.paramEffectOf(fd.Body, cfgraph, sites, deferred, obj, append(direct, must...), may, rec, false, false)
+		// Only the Done question is asked here: a use inside a literal, or a
+		// hand-off, says nothing about whether Done is called.
+		next &= model.EffectMay | model.EffectMust
+		if b.recordParamDoneEffects(obj, next) {
 			reportChanged = true
 		}
 	}
 	return reportChanged
 }
 
-// recordParamDoneCalled merges next into b.paramDoneCalled[obj] via OR
-// (see the field's own doc comment for why no "pending"/existed
-// distinction is needed here, unlike recordParamConsumption) and reports
-// whether the recorded value changed, which is what tells Build's sweep
-// loop whether another pass is needed.
-func (b *builder) recordParamDoneCalled(obj types.Object, next bool) bool {
-	prev := b.paramDoneCalled[obj]
-	if next && !prev {
-		b.paramDoneCalled[obj] = true
-		return true
-	}
-	return false
+// recordParamDoneEffects merges next into b.paramDoneEffects[obj] by union
+// and reports whether the recorded value changed, which is what tells
+// Build's sweep loop whether another pass is needed.
+func (b *builder) recordParamDoneEffects(obj types.Object, next model.ParamEffect) bool {
+	prev := b.paramDoneEffects[obj]
+	merged := prev | next
+	b.paramDoneEffects[obj] = merged
+	return merged != prev
 }
 
-// bodyDelegatesDone reports whether body passes obj as a direct argument,
-// at some call site (an ordinary call or a go-statement's call, but not
-// one reached only through a further-nested function literal -- the same
-// scoping bodyCallsMethodOn already uses), to a resolvable same-package
-// function whose own corresponding parameter is, per
-// computeParamDoneCalled's own fixed point, already known to eventually
-// call Done(). Existence-only, like bodyCallsMethodOn: it does not
-// establish this happens on every path, only that it appears somewhere.
-func (b *builder) bodyDelegatesDone(body ast.Node, obj types.Object) bool {
-	found := false
+// doneCalls classifies the calls in body (not inside a function literal)
+// that can make Done() happen on obj: direct are obj.Done() calls; must and
+// may are calls that pass obj on to a resolvable same-package function whose
+// own Done effect is, respectively, must or may-only; rec are calls that pass
+// it to a function in the same recursion cycle as self, which count as
+// discharges only in a function with a real one (see paramEffectOf).
+func (b *builder) doneCalls(body ast.Node, obj types.Object, self *types.Func) (direct, must, may, rec []*ast.CallExpr) {
 	ast.Inspect(body, func(n ast.Node) bool {
-		if found {
-			return false
-		}
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
@@ -4847,6 +5126,10 @@ func (b *builder) bodyDelegatesDone(body ast.Node, obj types.Object) bool {
 		case *ast.GoStmt:
 			call = x.Call
 		default:
+			return true
+		}
+		if selectorReceiverObject(call.Fun, b.in.Info) == obj && selectorMethod(call.Fun) == "Done" {
+			direct = append(direct, call)
 			return true
 		}
 		funcObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
@@ -4868,13 +5151,21 @@ func (b *builder) bodyDelegatesDone(body ast.Node, obj types.Object) bool {
 			return true
 		}
 		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
-		if paramObj != nil && b.paramDoneCalled[paramObj] {
-			found = true
-			return false
+		if paramObj == nil {
+			return true
+		}
+		if self != nil && b.reaches(funcObj, self) {
+			rec = append(rec, call)
+		}
+		switch effect := b.paramDoneEffects[paramObj]; {
+		case effect.Has(model.EffectMust):
+			must = append(must, call)
+		case effect.Has(model.EffectMay):
+			may = append(may, call)
 		}
 		return true
 	})
-	return found
+	return direct, must, may, rec
 }
 
 // bodyCallsMethodOn reports whether body contains a call obj.method(...)
@@ -5435,6 +5726,16 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		}
 		plainCalls, deferredCallSites := splitDeferred(c.callSites, deferredCalls, callSites)
 		if len(plainCalls)+len(deferredCallSites) == 0 {
+			if len(callSitesOf(c.mayCalls, callSites)) > 0 {
+				// The only thing that can call it is a callee that cancels
+				// on some of its own paths: the condition inside the
+				// callee is not erased by passing the function to it
+				// (audit finding F6), so there is no path on which the
+				// call is known to happen.
+				no := false
+				c.binding.CalledOnAllPaths = &no
+				c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "call-not-on-all-paths", Message: "the only consumer is a callee that calls it on some of its own paths, so no path is known to call it"})
+			}
 			continue // Called came from a shape with no call-site node recorded here (e.g. a variadic-spread element call)
 		}
 		// Checked from the acquisition, not from function entry: a path
@@ -5466,15 +5767,25 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 			continue // LL1003/LL1004 already fire on this; nothing further to establish
 		}
 		waitSites := callSitesOf(gr.waitCallSites, callSites)
-		if len(waitSites) == 0 {
+		// A helper that joins the group on every path is a join at its
+		// call, for the all-path question; stop-before-wait below only
+		// ever reasons about direct Wait() calls.
+		joinSites := append(append([]flowgraph.CallSite(nil), waitSites...), callSitesOf(gr.helperJoinCalls, callSites)...)
+		if len(joinSites) == 0 {
+			if len(callSitesOf(gr.mayJoinCalls, callSites)) > 0 {
+				// Only a callee that joins on some of its own paths: its
+				// condition is not erased (audit finding F6).
+				no := false
+				gr.group.JoinedOnAllPaths = &no
+				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "the only join is a callee that waits on some of its own paths, so no path is known to join this group"})
+			}
 			continue // Joined came from a join_wrapper call, not a direct Wait(); no call site here to find a block for
 		}
-		waitBlocks := blockSetOf(waitSites)
 		// The join obligation begins when worker accounting starts
 		// (Add/Go), not at function entry: a path that never started a
 		// worker has nothing to join (audit finding F3). Stop-before-wait
 		// below still reasons from entry, which is a separate question.
-		bypassed, known := liveExitReachable(g, callSitesOf(gr.startCalls, callSites), nil, waitSites, nil)
+		bypassed, known := liveExitReachable(g, callSitesOf(gr.startCalls, callSites), nil, joinSites, nil)
 		if known {
 			onAllPaths := !bypassed
 			gr.group.JoinedOnAllPaths = &onAllPaths
@@ -5482,6 +5793,10 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the point a worker is started to the function's return bypasses every Wait() call for this group"})
 			}
 		}
+		if len(waitSites) == 0 {
+			continue
+		}
+		waitBlocks := blockSetOf(waitSites)
 		reachableAvoidingWaits := g.ReachableAvoiding(g.Entry, waitBlocks)
 		if deferOnlyStopSeen {
 			gr.group.StopAfterWait = true

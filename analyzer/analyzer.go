@@ -46,21 +46,22 @@ type FunctionFact struct {
 	// loop). The prior booleans are kept for informational/JSON value and
 	// as a fallback for a fact whose Version predates this field.
 	LoopUnresolved bool
-	// ParamConsumption is model.Function.ParamConsumption, unchanged: by
-	// parameter position, whether this function's own body consumes a
-	// cancel-like/group-like parameter there, or (for its one trailing
-	// variadic parameter, when cancel-like-elemented) whether every
-	// element is demonstrably called. This is what lets argumentConsumed
-	// verify a cross-package callee via Input.LookupParamConsumption,
-	// the direct-parameter-passing counterpart of LoopUnresolved above.
-	ParamConsumption map[int]bool
-	// ParamDoneCalled is model.Function.ParamDoneCalled, unchanged:
-	// calleeDoneParamMatches's own question for a sync.WaitGroup
-	// parameter, distinct from ParamConsumption's (does something
-	// eventually call Done() on it, versus is it eventually Wait()ed or
-	// transferred) -- what lets Input.LookupParamDoneCalled verify the
-	// `wg.Add(1); go worker(&wg)` idiom across a package boundary.
-	ParamDoneCalled map[int]bool
+	// ParamEffects is model.Function.ParamEffects, unchanged: by parameter
+	// position, what this function's own body does with a cancel-like or
+	// group-like parameter there (may / must / returns / opaque, see
+	// model.ParamEffect), or (for its one trailing variadic parameter, when
+	// cancel-like-elemented) whether every element is demonstrably called.
+	// This is what lets argumentEffects apply a cross-package callee's
+	// effect at the call site via Input.LookupParamEffects, with the same
+	// semantics a same-package callee gets (audit finding F6), the
+	// direct-parameter-passing counterpart of LoopUnresolved above.
+	ParamEffects map[int]model.ParamEffect
+	// ParamDoneEffects is model.Function.ParamDoneEffects, unchanged:
+	// calleeDoneEffect's own question for a sync.WaitGroup parameter,
+	// distinct from ParamEffects' -- what lets Input.LookupParamDoneEffects
+	// judge the `wg.Add(1); go worker(&wg)` idiom across a package boundary
+	// with the same semantics as a same-package worker.
+	ParamDoneEffects map[int]model.ParamEffect
 	// ReturnFieldSites is model.Function.ReturnFieldSites, unchanged: see
 	// its own doc comment, and Input.LookupReturnFieldSites' doc comment
 	// for the architectural limit specific to this one fact (unlike
@@ -135,27 +136,27 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 			ImportedUnresolvedLoop: &loopUnresolved,
 		}, true
 	}
-	lookupParam := func(fn *types.Func, index int) (consumed, ok bool) {
+	lookupParam := func(fn *types.Func, index int) (effect model.ParamEffect, ok bool) {
 		if pass.ImportObjectFact == nil || fn == nil {
-			return false, false
+			return 0, false
 		}
 		var fact FunctionFact
 		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
-			return false, false
+			return 0, false
 		}
-		consumed, ok = fact.ParamConsumption[index]
-		return consumed, ok
+		effect, ok = fact.ParamEffects[index]
+		return effect, ok
 	}
-	lookupParamDone := func(fn *types.Func, index int) (called, ok bool) {
+	lookupParamDone := func(fn *types.Func, index int) (effect model.ParamEffect, ok bool) {
 		if pass.ImportObjectFact == nil || fn == nil {
-			return false, false
+			return 0, false
 		}
 		var fact FunctionFact
 		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
-			return false, false
+			return 0, false
 		}
-		called, ok = fact.ParamDoneCalled[index]
-		return called, ok
+		effect, ok = fact.ParamDoneEffects[index]
+		return effect, ok
 	}
 	lookupReturnFieldSites := func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
 		if pass.ImportObjectFact == nil || fn == nil {
@@ -170,9 +171,9 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 	cwd, _ := os.Getwd()
 	program, err := frontend.Build(frontend.Input{
 		Fset: pass.Fset, Files: frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd), Pkg: pass.Pkg, Info: pass.TypesInfo,
-		LookupFunctionSummary:   lookup,
-		LookupParamConsumption: lookupParam,
-		LookupParamDoneCalled:  lookupParamDone,
+		LookupFunctionSummary:  lookup,
+		LookupParamEffects:     lookupParam,
+		LookupParamDoneEffects: lookupParamDone,
 		LookupReturnFieldSites: lookupReturnFieldSites,
 	}, cfg)
 	if err != nil {
@@ -237,8 +238,8 @@ func exportFunctionFacts(pass *analysis.Pass, program model.Program) {
 				Version: version.FactVersion, InfiniteLoop: summary.InfiniteLoop, HasReturn: summary.HasReturn,
 				ContextStop: summary.ContextStop, ChannelStop: summary.ChannelStop, ExplicitStop: summary.ExplicitStop,
 				LoopUnresolved:   engine.UnresolvedLoop(summary.CFG),
-				ParamConsumption: fn.ParamConsumption,
-				ParamDoneCalled:  fn.ParamDoneCalled,
+				ParamEffects:     fn.ParamEffects,
+				ParamDoneEffects: fn.ParamDoneEffects,
 				ReturnFieldSites: fn.ReturnFieldSites,
 			})
 		}

@@ -507,18 +507,14 @@ func run(g *sync.WaitGroup) {
 	}
 }
 
-func TestParameterPassing_GroupHelperConditionalWaitUnverifiedGap(t *testing.T) {
-	// Known, accepted limitation (docs/limitations.md): computeParameterConsumption's
-	// scratch pass over the callee's body does not run computeOrdering
-	// or computeGroupBalances against it, so it has no way to tell a
-	// Wait() call that is actually reached from one buried inside a
-	// condition that happens to never be true for this particular call
-	// site's own argument. run's own Wait() is gated behind `ok`, and
-	// Start passes a literal false -- Wait() genuinely never executes,
-	// so this group is never joined at all, but is currently reported
-	// clean anyway. If this starts firing, that is a real improvement:
-	// update this test (and docs/limitations.md's Phase 5 paragraph) to
-	// match, do not treat a newly-passing test here as a regression.
+func TestParameterPassing_GroupHelperConditionalWaitIsNotAJoin(t *testing.T) {
+	// This used to be a documented gap (GroupHelperConditionalWaitUnverifiedGap):
+	// the helper's own Wait() is gated behind `ok`, and a boolean "consumed
+	// somewhere" fact erased that condition, so the owner's group was
+	// reported clean. With explicit effects the helper is may-only
+	// (audit finding F6), so passing the group to it is never a join: the
+	// owner is reported. (The literal `false` argument is not evaluated;
+	// the helper would equally be reported for `run(&wg, c)`.)
 	diags := analyzeSource(t, `package p
 import "sync"
 func Start() {
@@ -535,8 +531,8 @@ func run(g *sync.WaitGroup, ok bool) {
 	}
 }
 `)
-	if len(diags) != 0 {
-		t.Fatalf("documented known gap: a helper's conditionally-unreached Wait() is not currently verified; if this now fires, update this test and docs/limitations.md to match the improvement, got %#v", diags)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" {
+		t.Fatalf("a group handed to a helper that waits only conditionally must still be reported, got %#v", diags)
 	}
 }
 
@@ -1211,13 +1207,13 @@ func Start() {
 	}
 	cfg := config.Default()
 
-	doneCalledTrue := func(fn *types.Func, index int) (bool, bool) {
+	doneCalledTrue := func(fn *types.Func, index int) (model.ParamEffect, bool) {
 		if _, ok := printlnAt0(fn, index); ok {
-			return true, true
+			return model.EffectMay | model.EffectMust, true
 		}
-		return false, false
+		return 0, false
 	}
-	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupParamConsumption: printlnAt0, LookupParamDoneCalled: doneCalledTrue}, cfg)
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupParamConsumption: printlnAt0, LookupParamDoneEffects: doneCalledTrue}, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1225,13 +1221,13 @@ func Start() {
 		t.Fatalf("a cross-package worker a fact verifies as eventually calling Done() should not fire, got diagnostics = %#v", diags)
 	}
 
-	doneCalledFalse := func(fn *types.Func, index int) (bool, bool) {
+	doneCalledFalse := func(fn *types.Func, index int) (model.ParamEffect, bool) {
 		if _, ok := printlnAt0(fn, index); ok {
-			return false, true
+			return 0, true
 		}
-		return false, false
+		return 0, false
 	}
-	program, err = Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupParamConsumption: printlnAt0, LookupParamDoneCalled: doneCalledFalse}, cfg)
+	program, err = Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupParamConsumption: printlnAt0, LookupParamDoneEffects: doneCalledFalse}, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

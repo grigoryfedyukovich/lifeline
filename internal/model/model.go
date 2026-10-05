@@ -1,5 +1,7 @@
 package model
 
+import "strings"
+
 // Span is parser-independent source metadata. Offsets are byte offsets in the
 // source file; lines and columns are one-based.
 type Span struct {
@@ -410,6 +412,61 @@ type ReturnFieldSite struct {
 	Kind        string `json:"kind"`
 }
 
+// ParamEffect is a set of effects a function body has on one of its own
+// cancel-like or group-like parameters. It replaces the single "is it
+// consumed" boolean, which could not tell apart a helper that always
+// cancels, one that cancels under a condition, and one that merely hands the
+// value on, and so let the first and last two erase the owner's obligation
+// alike (audit finding F6).
+//
+// The zero value is meaningful: the body was analyzed and does none of the
+// below, a checked "not consumed". A parameter with no recorded effect at
+// all (not analyzed, or beyond a bound) is absent from the map instead.
+type ParamEffect uint8
+
+const (
+	// EffectMay: some normal path from entry calls the cancel function or
+	// joins the group (a reachable call, directly or through a callee's own
+	// must effect). Says nothing about the paths that do not.
+	EffectMay ParamEffect = 1 << iota
+	// EffectMust: every normal path from entry to exit does, with a
+	// deferred call counting on every path that registered it. Applying
+	// this at a call site discharges the caller's obligation at that call.
+	EffectMust
+	// EffectReturns: the value is returned to the caller, which owns it
+	// again.
+	EffectReturns
+	// EffectOpaque: the value is used in a way this analysis does not
+	// follow: stored, sent, captured by a function literal that may run,
+	// or passed to a callee it cannot resolve or that itself does the same.
+	// Ownership may have moved; nothing is claimed either way.
+	EffectOpaque
+)
+
+// Has reports whether every bit of e2 is set in e.
+func (e ParamEffect) Has(e2 ParamEffect) bool { return e&e2 == e2 }
+
+// Hands reports whether the callee may keep or return the value, which
+// makes it the callee's (or someone else's) to discharge, not the
+// caller's.
+func (e ParamEffect) Hands() bool { return e&(EffectReturns|EffectOpaque) != 0 }
+
+func (e ParamEffect) String() string {
+	if e == 0 {
+		return "none"
+	}
+	var parts []string
+	for _, p := range []struct {
+		bit  ParamEffect
+		name string
+	}{{EffectMay, "may"}, {EffectMust, "must"}, {EffectReturns, "returns"}, {EffectOpaque, "opaque"}} {
+		if e&p.bit != 0 {
+			parts = append(parts, p.name)
+		}
+	}
+	return strings.Join(parts, "+")
+}
+
 type Function struct {
 	Name          string          `json:"name"`
 	Span          Span            `json:"span"`
@@ -419,32 +476,29 @@ type Function struct {
 	Groups        []JoinGroup     `json:"groups,omitempty"`
 	BodyLifecycle Goroutine       `json:"body_lifecycle"`
 	IR            []Instruction   `json:"ir,omitempty"`
-	// ParamConsumption records, by parameter position, whether this
-	// function's own body consumes a cancel-like/group-like parameter at
-	// that position (computeParameterConsumption's fixed-point result,
-	// docs/cfg-migration-plan.md Phase 5) or -- for the single trailing
-	// variadic parameter only, when its element type is cancel-like --
-	// whether the body demonstrably calls every element via a `for _, v
-	// := range param { v() }` loop. A same-package caller in this same
-	// build already has this via the builder's own paramConsumption map;
-	// this field exists so a caller in a *different* package can still
-	// answer the same question via a versioned fact (analyzer.go's
-	// FunctionFact, Input.LookupParamConsumption), the same way
-	// BodyLifecycle already travels across a package boundary for
-	// goroutine targets. Indices with no entry are simply parameters this
-	// analysis never reached a verified answer for, same as any other
-	// unresolvable case -- never a stand-in for "false".
-	ParamConsumption map[int]bool `json:"param_consumption,omitempty"`
-	// ParamDoneCalled records, by parameter position, whether this
-	// function's own body -- or a further resolvable same-package
-	// function it delegates to, to any depth -- eventually calls Done()
-	// on a sync.WaitGroup parameter there (computeParamDoneCalled's
-	// fixed point, calleeDoneParamMatches's own question, distinct from
-	// ParamConsumption's "is it Wait()ed or transferred"). Exists so a
-	// cross-package caller can answer the `wg.Add(1); go worker(&wg)`
-	// idiom's question the same way a same-package one already can --
-	// see analyzer.go's FunctionFact and Input.LookupParamDoneCalled.
-	ParamDoneCalled map[int]bool `json:"param_done_called,omitempty"`
+	// ParamEffects records, by parameter position, what this function's own
+	// body does with a cancel-like or group-like parameter, as the explicit
+	// effects of ParamEffect (the fixed-point result of
+	// computeParameterEffects, docs/cfg-migration-plan.md Phase 5) or, for
+	// the single trailing variadic parameter only, whether the body
+	// demonstrably calls every element via `for _, v := range param { v() }`.
+	// A same-package caller in this same build already has this via the
+	// builder's own paramEffects map; this field exists so a caller in a
+	// *different* package answers the same question with the same
+	// semantics via a versioned fact (analyzer.go's FunctionFact,
+	// Input.LookupParamEffects). Indices with no entry are parameters this
+	// analysis never reached a verified answer for.
+	ParamEffects map[int]ParamEffect `json:"param_effects,omitempty"`
+	// ParamDoneEffects records, by parameter position, what this function's
+	// own body does about Done() on a sync.WaitGroup parameter: EffectMay if
+	// some path calls it, EffectMust if every path does, directly or through
+	// further same-package functions. Only those two bits are used. It is
+	// calleeDoneEffect's question, distinct from ParamEffects' (is the group
+	// Wait()ed or transferred), and exists so the `wg.Add(1); go worker(&wg)`
+	// idiom is judged the same way across a package boundary. An observed
+	// Done somewhere is not presented as an all-path or exactly-once
+	// guarantee (audit finding F6).
+	ParamDoneEffects map[int]ParamEffect `json:"param_done_effects,omitempty"`
 	// ReturnFieldSites records, for a function recognized as a
 	// "constructor" (computeFieldOwnership: it stores a cancel-like or
 	// group-like binding into a named field of a struct literal that is

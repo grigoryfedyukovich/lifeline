@@ -19,6 +19,12 @@ const (
 	// so a version-3 fact may claim a loop was resolved only because an
 	// earlier delegation deleted it from the graph (audit finding F1).
 	// Rejecting version-3 facts is safer than reinterpreting them.
-	FactVersion = 4
+	//
+	// FactVersion 5 replaces FunctionFact.ParamConsumption (a bare "consumed
+	// somehow") with ParamEffects (may / must / returns / opaque). The two
+	// are not interchangeable: the boolean let a helper that cancels under a
+	// condition, one that cancels always and one that merely hands the value
+	// on all erase the caller's obligation alike (audit finding F6).
+	FactVersion = 5
 	Backend     = "local-ast-types-ssa-summary/v2"
 )
