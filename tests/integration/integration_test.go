@@ -172,6 +172,9 @@ func TestTutorialExamples(t *testing.T) {
 		// reported an error (internal/frontend's errorBranchSkipper): the
 		// checked-and-deferred idiom is clean, while an unrelated early
 		// return after a successful call still leaks.
+		// A cancel function declared inside a function literal is that
+		// literal's obligation, judged like one in a named function.
+		{name: "closure_local_cancel", args: []string{"./examples/closure_local_cancel"}, needle: "[LL1001]"},
 		{name: "context_wrapper_error_checked", args: []string{"-config", "./examples/context_wrapper_error_checked/lifeline.yaml", "./examples/context_wrapper_error_checked"}, needle: "no lifecycle diagnostics"},
 		{name: "context_wrapper_error_early_return", args: []string{"-config", "./examples/context_wrapper_error_early_return/lifeline.yaml", "./examples/context_wrapper_error_early_return"}, needle: "[LL1001]"},
 		// A call to a method on a tracked handle is followed into the

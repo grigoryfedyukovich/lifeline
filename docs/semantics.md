@@ -27,7 +27,7 @@ It does not retain AST node identities.
 
 ## Function boundaries
 
-A named function and every function literal have distinct lifecycle bodies. Loops, returns, breaks, select exits, and stop calls inside a nested literal do not alter the enclosing body's lifecycle summary.
+A named function and every function literal have distinct lifecycle bodies, and each literal is also analyzed as a unit for the cancel functions and join groups it declares itself (see `docs/limitations.md`). Loops, returns, breaks, select exits, and stop calls inside a nested literal do not alter the enclosing body's lifecycle summary.
 
 Nested `go` statements are still discovered and modeled as separate start sites. References to an outer cancel function or group from a nested closure remain references to the same typed object and may discharge or transfer the outer obligation.
 

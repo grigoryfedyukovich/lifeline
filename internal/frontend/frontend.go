@@ -89,6 +89,15 @@ type Input struct {
 type funcSource struct {
 	decl *ast.FuncDecl
 	obj  *types.Func
+	// lit is non-nil for a function literal analyzed as its own unit
+	// (audit finding F5). decl is then a synthetic declaration sharing the
+	// literal's type and body, and name is its stable identity
+	// (`outer.func1`, `outer.func1.1`, ...), following the Go toolchain's
+	// closure naming. Literal units only own the cancel and join-group
+	// bindings declared inside them; they take no part in the
+	// inter-procedural passes, which are about named functions.
+	lit  *ast.FuncLit
+	name string
 }
 
 type builder struct {
@@ -223,6 +232,9 @@ type builder struct {
 	// facts are final) into callerFindings, which Build attaches to the
 	// callers' own functions after every function has been built.
 	collectObligations bool
+	// deadLiterals are the ranges of function literals that can never run
+	// (see deadFuncLits) in the function body currently being built.
+	deadLiterals       []posRange
 	pendingObligations []pendingObligation
 	callerFindings     []callerFinding
 	contextInterface   *types.Interface
@@ -439,10 +451,25 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		}
 	}
 
-	program := model.Program{PackagePath: in.Pkg.Path(), FunctionCount: len(sources), Suppressions: collectSuppressions(in.Fset, in.Files)}
+	// Function literals are analysis units of their own (audit finding F5):
+	// enumerated after every declaration, in source order with the nesting
+	// parent first, and counted against the same max_functions bound, so a
+	// truncated run drops closures before it drops named functions.
+	var lits []funcSource
+	for _, source := range sources {
+		lits = append(lits, literalSources(source)...)
+	}
+	total := len(sources) + len(lits)
+	program := model.Program{PackagePath: in.Pkg.Path(), FunctionCount: total, Suppressions: collectSuppressions(in.Fset, in.Files)}
 	limit := len(sources)
 	if limit > cfg.MaxFunctions {
 		limit = cfg.MaxFunctions
+	}
+	litLimit := len(lits)
+	if litLimit > cfg.MaxFunctions-limit {
+		litLimit = cfg.MaxFunctions - limit
+	}
+	if limit+litLimit < total {
 		program.Truncated = true
 	}
 	for _, source := range sources[:limit] {
@@ -529,6 +556,9 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	for _, source := range sources[:limit] {
 		program.Functions = append(program.Functions, b.buildFunction(source))
 	}
+	for _, source := range lits[:litLimit] {
+		program.Functions = append(program.Functions, b.buildFunction(source))
+	}
 	b.attachCallerFindings(&program)
 	return program, nil
 }
@@ -588,6 +618,127 @@ type groupState struct {
 	pendingAliasEscapes []*groupState
 }
 
+// literalSources enumerates every function literal inside source's body, in
+// source order with a literal before the literals nested in it, naming them
+// as the Go toolchain does: `outer.func1`, `outer.func2`, and
+// `outer.func1.1` for a literal inside the first one. The enumeration is
+// stable for a given source text, which is what lets a finding in a closure
+// keep its identity from run to run.
+func literalSources(source funcSource) []funcSource {
+	outer := source.decl.Name.Name
+	if source.obj != nil {
+		outer = source.obj.FullName()
+	}
+	var out []funcSource
+	var walk func(parent string, nested bool, root ast.Node)
+	walk = func(parent string, nested bool, root ast.Node) {
+		n := 0
+		ast.Inspect(root, func(x ast.Node) bool {
+			lit, ok := x.(*ast.FuncLit)
+			if !ok || x == root {
+				return true
+			}
+			n++
+			name := fmt.Sprintf("%s.func%d", parent, n)
+			if nested {
+				name = fmt.Sprintf("%s.%d", parent, n)
+			}
+			decl := &ast.FuncDecl{Name: ast.NewIdent(name), Type: lit.Type, Body: lit.Body}
+			out = append(out, funcSource{decl: decl, lit: lit, name: name})
+			walk(name, true, lit.Body)
+			return false // nested literals were handled by the recursive walk
+		})
+	}
+	walk(outer, false, source.decl.Body)
+	return out
+}
+
+// posRange is a half-open source range.
+type posRange struct{ from, to token.Pos }
+
+func (b *builder) inDeadLiteral(pos token.Pos) bool {
+	for _, r := range b.deadLiterals {
+		if pos >= r.from && pos < r.to {
+			return true
+		}
+	}
+	return false
+}
+
+// deadFuncLits returns the source ranges of function literals in body that
+// can never run: a literal assigned to the blank identifier, or held by a
+// local variable whose every use is itself a blank assignment. Defining a
+// closure is not invoking it, so what such a literal's body does (a
+// captured cancel function called inside it, say) must not discharge any
+// outer obligation (audit finding F5).
+//
+// Deliberately narrow: a literal stored in a variable that is called,
+// passed along, returned or captured elsewhere is "transferred", and keeps
+// being credited permissively as before, because whether and when it runs
+// is not visible here.
+func (b *builder) deadFuncLits(body *ast.BlockStmt) []posRange {
+	if body == nil {
+		return nil
+	}
+	info := b.in.Info
+	isBlank := func(e ast.Expr) bool {
+		id, ok := e.(*ast.Ident)
+		return ok && id.Name == "_"
+	}
+	var dead []posRange
+	held := map[types.Object]*ast.FuncLit{} // local variable -> the literal it was initialized with
+	blankUse := map[*ast.Ident]bool{}       // identifiers appearing as the whole RHS of `_ = x`
+	record := func(lhs, rhs ast.Expr) {
+		if lit, ok := ast.Unparen(rhs).(*ast.FuncLit); ok {
+			if isBlank(lhs) {
+				dead = append(dead, posRange{lit.Pos(), lit.End()})
+			} else if id, ok := lhs.(*ast.Ident); ok {
+				if v, ok := info.ObjectOf(id).(*types.Var); ok {
+					held[v] = lit
+				}
+			}
+			return
+		}
+		if id, ok := ast.Unparen(rhs).(*ast.Ident); ok && isBlank(lhs) {
+			blankUse[id] = true
+		}
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			if (x.Tok == token.ASSIGN || x.Tok == token.DEFINE) && len(x.Lhs) == len(x.Rhs) {
+				for i := range x.Lhs {
+					record(x.Lhs[i], x.Rhs[i])
+				}
+			}
+		case *ast.ValueSpec:
+			if len(x.Names) == len(x.Values) {
+				for i := range x.Names {
+					record(x.Names[i], x.Values[i])
+				}
+			}
+		}
+		return true
+	})
+	if len(held) > 0 {
+		alive := map[types.Object]bool{}
+		ast.Inspect(body, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok {
+				if obj := info.Uses[id]; obj != nil && held[obj] != nil && !blankUse[id] {
+					alive[obj] = true
+				}
+			}
+			return true
+		})
+		for obj, lit := range held {
+			if !alive[obj] {
+				dead = append(dead, posRange{lit.Pos(), lit.End()})
+			}
+		}
+	}
+	return dead
+}
+
 func (b *builder) buildFunction(source funcSource) model.Function {
 	fd := source.decl
 	name := fd.Name.Name
@@ -601,6 +752,15 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	states, groups := b.collectBindings(fd, contexts)
+	if source.lit != nil {
+		// A literal owns only what it declares. A cancel function or group
+		// that is assigned inside it but declared outside is used outside
+		// too, where this unit cannot see, so judging it here would report
+		// uses it never saw (audit finding F5).
+		states, groups = b.declaredWithin(source.lit, states, groups)
+	}
+	b.deadLiterals = b.deadFuncLits(fd.Body)
+	defer func() { b.deadLiterals = nil }()
 
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
 	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
@@ -646,6 +806,18 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	sort.Slice(fn.Cancels, func(i, j int) bool { return fn.Cancels[i].Span.StartOffset < fn.Cancels[j].Span.StartOffset })
 	sort.Slice(fn.Groups, func(i, j int) bool { return fn.Groups[i].Span.StartOffset < fn.Groups[j].Span.StartOffset })
 
+	if source.lit != nil {
+		// What the declaration that contains this literal already reports,
+		// it reports once: its walk descends into closures for goroutine
+		// starts, and its summary describes the whole body. The literal
+		// unit exists for the cancel and join-group bindings declared in
+		// it, so nothing else is carried (and nothing is reported twice).
+		fn.Goroutines = nil
+		fn.BodyLifecycle = model.Goroutine{}
+		fn.ParamConsumption = nil
+		fn.ParamDoneCalled = nil
+		return fn
+	}
 	ir := localssa.Build(name, fd.Body, b.in.Info)
 	fn.IR = make([]model.Instruction, 0, len(ir.Instructions))
 	for _, in := range ir.Instructions {
@@ -655,6 +827,28 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		})
 	}
 	return fn
+}
+
+// declaredWithin keeps the bindings whose variable is declared inside lit.
+// A blank cancel result has no variable and is always local to the
+// statement that discarded it.
+func (b *builder) declaredWithin(lit *ast.FuncLit, states []*cancelState, groups []*groupState) ([]*cancelState, []*groupState) {
+	inside := func(obj types.Object) bool {
+		return obj.Pos() >= lit.Body.Pos() && obj.Pos() < lit.Body.End()
+	}
+	var ks []*cancelState
+	for _, s := range states {
+		if s.cancelObj == nil || inside(s.cancelObj) {
+			ks = append(ks, s)
+		}
+	}
+	var kg []*groupState
+	for _, g := range groups {
+		if g.obj == nil || inside(g.obj) {
+			kg = append(kg, g)
+		}
+	}
+	return ks, kg
 }
 
 func (b *builder) collectContextParams(ft *ast.FuncType, contexts map[types.Object]string) {
@@ -982,6 +1176,9 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		}
 		if funcDepth == 0 {
 			b.observeLifecycleNode(n, contexts, labels, &fn.BodyLifecycle)
+		}
+		if b.inDeadLiteral(n.Pos()) {
+			return true // a literal that never runs has no effects (see deadFuncLits)
 		}
 		switch x := n.(type) {
 		case *ast.CallExpr:

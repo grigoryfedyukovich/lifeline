@@ -69,7 +69,7 @@ For each function within `max_functions`, the frontend performs:
 2. one combined pass for body lifecycle, ownership uses, and goroutine starts;
 3. one SSA-like instruction pass.
 
-Nested function literals have separate lifecycle boundaries. The combined pass may traverse them to observe uses of outer values and discover inner goroutine starts, but their loops and exits are excluded from the enclosing body's lifecycle summary.
+Nested function literals have separate lifecycle boundaries, and `Build` enumerates every literal as an analysis unit (`literalSources`) with a stable identity, so the cancel functions and join groups declared inside one get their own records. The combined pass may traverse them to observe uses of outer values and discover inner goroutine starts, but their loops and exits are excluded from the enclosing body's lifecycle summary.
 
 Wrapper names are compiled into maps once per package. Object-use sets are collected once per relevant call or subtree instead of rescanning once per tracked cancel/group object.
 
