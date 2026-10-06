@@ -89,4 +89,4 @@ The explicit bounds are:
 - `max_functions` per package;
 - the standalone command timeout.
 
-`max_functions` is applied before lifecycle and SSA-like construction. Direct same-package target inspection cannot bypass it. Every diagnostic repeats the bound values. Reaching the function bound or timeout emits `LL9001`; JSON reports are marked incomplete.
+`max_functions` is applied before lifecycle and SSA-like construction. Direct same-package target inspection cannot bypass it. Every diagnostic repeats the bound values. Reaching the function bound (which counts function literals as well as named functions) or timeout emits `LL9001` and sets `status.incomplete`; the status is independent of whether `LL9001` is displayed, so ignoring the rule hides the notice and not the fact.

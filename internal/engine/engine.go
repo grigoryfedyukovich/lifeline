@@ -63,7 +63,23 @@ var sharedAssumptions = []string{
 	"absence of a recognized protocol is evidence, not a proof of nontermination",
 }
 
+// Analyze is AnalyzeWithStatus without the run status. It exists for callers
+// that only render diagnostics; anything that reports whether the run was
+// complete must use AnalyzeWithStatus, because the diagnostics returned here
+// have already been filtered by configuration and suppression comments and
+// say nothing reliable about what was analyzed (audit finding F8).
 func Analyze(program model.Program, cfg config.Config) []Diagnostic {
+	diags, _ := AnalyzeWithStatus(program, cfg)
+	return diags
+}
+
+// AnalyzeWithStatus returns the diagnostics for program, filtered by
+// configuration and suppression comments, together with the run's Status.
+// The status is computed from the program and from what the filter removed,
+// never from the filtered diagnostics, so no amount of rule ignoring or
+// suppression can change it: suppressing LL9001 hides the notice, not the
+// fact that analysis stopped early.
+func AnalyzeWithStatus(program model.Program, cfg config.Config) ([]Diagnostic, Status) {
 	meta := analysisMetadata{
 		assumptions: sharedAssumptions,
 		bounds:      map[string]any{"max_functions": cfg.MaxFunctions, "timeout": cfg.Timeout},
@@ -250,12 +266,15 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 		}
 		out = append(out, d)
 	}
+	status := StatusOf(program, meta.assumptions)
 	filtered := out[:0]
 	for _, d := range out {
 		if ignored(cfg.Ignore, d.RuleID) {
+			status.Suppressed.note("config", d.RuleID)
 			continue
 		}
 		if d.RuleID != "LL9001" && suppressedByComment(program.Suppressions, d) {
+			status.Suppressed.note("comment", d.RuleID)
 			continue
 		}
 		filtered = append(filtered, d)
@@ -270,7 +289,7 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 		}
 		return a.RuleID < b.RuleID
 	})
-	return filtered
+	return filtered, status
 }
 
 func base(program model.Program, fn model.Function, rule string, verdict Verdict, message string, pos model.Span, protocol string, evidence []model.Evidence, suggestion string, fix *model.SuggestedFix, meta analysisMetadata) Diagnostic {
@@ -396,6 +415,17 @@ func unsupportedReason(g model.Goroutine) (string, bool) {
 	}
 	return "", false
 }
+
+// FailsStatusPolicy reports whether the run status violates the configured
+// status policy: an incomplete run under fail_on_incomplete, or an
+// approximated one under fail_on_unsupported. It reads only the status, so
+// it cannot be defeated by ignoring or suppressing diagnostics.
+func FailsStatusPolicy(st Status, cfg config.Config) bool {
+	return (cfg.FailOnIncomplete && st.Incomplete) || (cfg.FailOnUnsupported && st.Unsupported.Total() > 0)
+}
+
+// Ignored reports whether the configuration hides diagnostics of rule id.
+func Ignored(list []string, id string) bool { return ignored(list, id) }
 
 func FailsPolicy(diags []Diagnostic, failOn []string) bool {
 	if len(failOn) == 0 {

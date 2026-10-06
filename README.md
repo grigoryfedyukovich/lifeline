@@ -42,7 +42,7 @@ examples/ignored_context/worker.go:10:2: [LL1002] goroutine has an unconditional
 | `LL1003` | A local `sync.WaitGroup` accounts for workers but isn't fully, verifiably joined before the owner returns (no `Wait` observed, `Wait` skipped by some return path, or a proven `Add`/`Done` count mismatch). |
 | `LL1004` | The same as `LL1003`, for a local `errgroup.Group` (no count-mismatch condition: `errgroup.Group` manages its own bookkeeping). |
 | `LL1005` | A `sync.WaitGroup`/`errgroup.Group` is joined before its workers' own stop signal is proven to have been sent yet. |
-| `LL9001` | Analysis is incomplete because a configured timeout or function bound was reached. Verdict: `UNKNOWN`. |
+| `LL9001` | Analysis is incomplete because a configured timeout or function bound was reached. Verdict: `UNKNOWN`. Hiding it (`ignore`) hides the notice only: the run status still says the run was incomplete. |
 
 Every diagnostic includes a stable rule ID, source span, protocol, evidence, assumptions, configured bounds, backend version, and an action only when the recognizer has grounded support for it.
 
@@ -112,6 +112,28 @@ package/import/path.Type.Method
 
 Configured context wrappers are assumed to return `(context, cancel)` in result positions 0 and 1. Configured start wrappers are inspected when they receive a function literal. Join and stop wrappers are recognized by canonical call name.
 
+## Run status
+
+Diagnostics can be filtered (`ignore`, `//lifeline:ignore`), so they cannot say whether the run was complete. The JSON bundle and the SARIF run therefore carry a separate `status`, computed before any filtering:
+
+```text
+status.incomplete          analysis was stopped by a bound (max_functions) or a deadline (timeout)
+status.reasons             why, one entry per cause
+status.units               discovered / analyzed / skipped units (named functions and function literals), excluded_files
+status.unsupported         what was judged under an approximation:
+                             targets                  goroutine targets that could not be inspected
+                             handed_off_obligations   cancel functions / groups assumed to have moved elsewhere
+                             unestablished_path_checks  discharged somewhere, all-paths question not answered
+status.suppressed          diagnostics found and then hidden, by config / by comment / by rule
+status.assumptions         what the results rest on
+```
+
+`incomplete` (a resource gap: results cover only part of the input) and `unsupported` (a semantic gap: results are real but rest on approximations) are separate dimensions. A clean `incomplete: false` run is not a claim that no protocol violation exists, and it is not equivalent to a run with `unsupported` entries; text output states both situations when they apply.
+
+Policy on the status is separate from `fail_on`: `-fail-on-incomplete` (`fail_on_incomplete: true`) and `-fail-on-unsupported` (`fail_on_unsupported: true`) fail with `ci_exit_code` based on the status alone, so ignoring `LL9001` cannot be used to pass an incomplete run.
+
+Under `go vet`, which shows only diagnostics, the same data is available as a result and as a companion file: pass `-lifeline.status-out=PATH` and each analyzed package appends one JSON line (`package`, `coverage`, `status`). The analyzer also returns that record (`*analyzer.Result`) as its result, for drivers that consume analyzer results.
+
 ## Command line
 
 ```text
@@ -119,6 +141,8 @@ Configured context wrappers are assumed to return `(context, cancel)` in result 
 -format FORMAT        text, json, or sarif
 -fail-on RULES        comma-separated rule IDs or all
 -ci-exit-code N       policy-failure code; 2 and 3 are reserved
+-fail-on-incomplete   fail when analysis was cut short by a bound or timeout, whatever the diagnostics say
+-fail-on-unsupported  fail when any part of the input was judged under an approximation
 -timeout DURATION     overall standalone timeout
 -max-functions N      per-package analysis bound
 -tests                include same-package _test.go files
@@ -131,7 +155,7 @@ Exit codes:
 | Code | Meaning |
 |---:|---|
 | `0` | Analysis completed, even if user-level diagnostics were emitted. |
-| configured | A `-fail-on` policy matched. |
+| configured | A `-fail-on` policy matched, or `-fail-on-incomplete` / `-fail-on-unsupported` matched the run status. |
 | `2` | Invalid configuration, package, syntax, or type information. |
 | `3` | Internal invariant failure or rendering error. |
 

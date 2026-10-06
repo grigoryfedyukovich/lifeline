@@ -23,7 +23,7 @@ Status meanings:
 | Go packages plus project wrapper config | Implemented | Go package patterns; strict JSON/YAML/TOML config |
 | Source diagnostics, safe fixes, analysis facts | Implemented | Text/JSON/SARIF, narrow lost-cancel edit, versioned function object facts |
 | Standalone exit 0 despite findings | Implemented | Default policy test |
-| Configurable CI failure code | Implemented | `-fail-on`, `-ci-exit-code` |
+| Configurable CI failure code | Implemented | `-fail-on`, `-fail-on-incomplete`, `-fail-on-unsupported`, `-ci-exit-code` |
 | Distinct invalid/internal exit codes | Implemented | Exit 2 and 3 integration behavior |
 | Diagnostics state protocol and missing element | Implemented | Stable rule contract and protocol fields |
 | Declarative unknown wrappers | Implemented | Context/start/join/stop wrapper lists |
@@ -36,7 +36,7 @@ Status meanings:
 | Exact modeled/abstracted semantics | Implemented | `docs/semantics.md`, `docs/limitations.md`, current specification |
 | Every bounded result prints its bound | Implemented | Text/JSON diagnostics include `max_functions` and timeout |
 | Solver evidence replay | Not applicable | No solver backend is used |
-| `UNKNOWN` first-class | Implemented | `LL9001`, bundle `incomplete` |
+| `UNKNOWN` first-class | Implemented | `LL9001`, bundle `status.incomplete` |
 | `UNSUPPORTED` first-class | Partial | Unsupported targets are explicit model evidence and never treated as proof, but no separate user-visible verdict is emitted yet |
 | Tool/backend versions in reports | Implemented | JSON diagnostics/bundle, text model line, SARIF driver |
 | Three original running examples | Implemented | Golden and tutorial examples run in CI |
@@ -46,7 +46,7 @@ Status meanings:
 | Syntax/type spans and hints | Implemented | Standalone loader error paths |
 | Timeout produces `UNKNOWN` | Implemented | `LL9001` timeout path |
 | Internal crash report with reproduction, no upload | Implemented | Panic boundary in standalone main |
-| Partial results labeled incomplete | Implemented | `LL9001` and JSON bundle flag |
+| Partial results labeled incomplete | Implemented | `LL9001`, plus `status.incomplete` that survives hiding `LL9001` (JSON, SARIF, text, vet status file) |
 | Startup below one second for small examples | Implemented in recorded environment | Warm-cache example: ~0.34 s |
 | Typical examples below five seconds | Implemented in recorded environment | Integration examples pass comfortably |
 | Memory below 512 MB | Implemented in recorded environment | 38 MB small example; 71 MB warm `net/http` |

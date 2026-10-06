@@ -67,6 +67,18 @@ Lifeline 0.1.1 is intentionally conservative and bounded.
 - Suggested edits are emitted only for a blank cancel result in a short declaration, and only where the rewrite is valid Go that keeps the resource's scope and lifetime (see the README's "Safe suggested fix"). It is withheld for `if`/`for`/`switch` initializers, anywhere inside a `for` or `range` body, under a label or in a function that uses `goto`, and when the cancel function takes an argument. Those cases keep their diagnostic and need a manual fix: rewriting an initializer or releasing per iteration is a different, scope-preserving transformation that is not attempted. The checks are structural and conservative: a `goto` anywhere in the function withholds every fix in it, and a function literal's own statements are not analyzed (so get no fix). A fix inside a plain nested block is still offered, and its `defer` runs at function return like any `defer cancel()` written there by hand.
 - The local SSA-like summary has no phi nodes and is not a full control-flow SSA representation.
 
+## Run status and what "complete" means
+
+`status.incomplete` (and the JSON `incomplete` flag) says a bound or a deadline stopped the run, nothing more. It is deliberately not "semantically complete": a run with `incomplete: false` has analyzed everything it was given, under the model's approximations, and has not proven that no violation exists. What the model approximated is counted separately in `status.unsupported`:
+
+- `targets`: goroutine start sites whose body could not be inspected;
+- `handed_off_obligations`: cancel functions and join groups assumed to have moved elsewhere (stored in a field or global, returned, sent, captured by a function literal that may run, or passed somewhere not followed) and not judged further in the function that created them. A constructor whose callers in the package are checked at their own call sites is not counted, because that transfer is verified; a cancel function returned to a caller outside that tracking is;
+- `unestablished_path_checks`: bindings known to be discharged somewhere whose all-paths question has no answer, so they are credited, not verified (for example a discharge inside a closure that may run).
+
+Things this status does **not** count, so a zero is not evidence of their absence: wrapper functions not declared in the configuration (they create no binding at all), unmodeled calls that never touched a tracked value, aliasing the model does not follow, function literals at package level, and the effects of reflection or generated dispatch. `excluded_files` counts files removed by `ignore_paths` or because they are generated, which were never analyzed. The status is function- and package-scoped like the analysis: under `go vet` it is per package (`-lifeline.status-out` writes one record each, and `go vet` also analyzes dependencies for facts, so the file contains a record for every package vet visited, not only the ones named on the command line).
+
+A timeout in standalone mode is recorded in the status, and its `LL9001` notice follows `ignore` like every other diagnostic. `fail_on_incomplete` and `fail_on_unsupported` read only the status. Timeouts are not enforced inside the frontend (they stop work between packages), so a timeout reports partial results and cannot bound a single large package; see the resource-control notes.
+
 ## False positives and negatives
 
 A warning means the supported model found a missing protocol element. Code may still terminate through an unsupported mechanism. Conversely, accepting a context argument, break, return, or channel-close path is not proof that the path is reachable or correctly owned.

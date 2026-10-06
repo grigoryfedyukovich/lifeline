@@ -19,7 +19,15 @@ type Bundle struct {
 	Tool          Tool                `json:"tool"`
 	Diagnostics   []engine.Diagnostic `json:"diagnostics"`
 	Coverage      engine.Coverage     `json:"coverage"`
-	Incomplete    bool                `json:"incomplete"`
+	// Status is the run status, independent of the diagnostics above: they
+	// may be filtered by configuration and suppression comments, it never
+	// is (audit finding F8).
+	Status engine.Status `json:"status"`
+	// Incomplete is Status.Incomplete: analysis was stopped by a bound or a
+	// deadline, so the diagnostics cover only part of the input. It is not a
+	// statement about semantic completeness; see Status.Unsupported for
+	// what was judged under approximation.
+	Incomplete bool `json:"incomplete"`
 }
 
 type Tool struct {
@@ -28,38 +36,38 @@ type Tool struct {
 	Backend string `json:"backend"`
 }
 
-func New(diags []engine.Diagnostic, coverage engine.Coverage) Bundle {
-	incomplete := false
-	for _, d := range diags {
-		if d.Verdict == engine.Unknown {
-			incomplete = true
-		}
-	}
-	return Bundle{SchemaVersion: version.ReportSchema, Tool: Tool{Name: version.Tool, Version: version.Version, Backend: version.Backend}, Diagnostics: append([]engine.Diagnostic{}, diags...), Coverage: coverage, Incomplete: incomplete}
+// New builds the machine-readable bundle. Incomplete comes from the run
+// status, never from the diagnostics: a diagnostic list that has had its
+// truncation notice filtered out must not read as a complete run.
+func New(diags []engine.Diagnostic, coverage engine.Coverage, status engine.Status) Bundle {
+	return Bundle{SchemaVersion: version.ReportSchema, Tool: Tool{Name: version.Tool, Version: version.Version, Backend: version.Backend}, Diagnostics: append([]engine.Diagnostic{}, diags...), Coverage: coverage, Status: status, Incomplete: status.Incomplete}
 }
 
-func Write(w io.Writer, format string, diags []engine.Diagnostic, coverage engine.Coverage, cwd string) error {
+func Write(w io.Writer, format string, diags []engine.Diagnostic, coverage engine.Coverage, status engine.Status, cwd string) error {
 	switch format {
 	case "text":
-		return writeText(w, diags, coverage, cwd)
+		return writeText(w, diags, coverage, status, cwd)
 	case "json":
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		bundle := New(relativeDiagnostics(diags, cwd), relativeCoverage(coverage, cwd))
+		bundle := New(relativeDiagnostics(diags, cwd), relativeCoverage(coverage, cwd), status)
 		return enc.Encode(bundle)
 	case "sarif":
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		return enc.Encode(makeSARIF(diags, coverage, cwd))
+		return enc.Encode(makeSARIF(diags, coverage, status, cwd))
 	default:
 		return fmt.Errorf("unsupported output format %q", format)
 	}
 }
 
-func writeText(w io.Writer, diags []engine.Diagnostic, coverage engine.Coverage, cwd string) error {
+func writeText(w io.Writer, diags []engine.Diagnostic, coverage engine.Coverage, status engine.Status, cwd string) error {
 	buffered := bufio.NewWriter(w)
 	if len(diags) == 0 {
 		if err := writeCleanSummary(buffered, relativeCoverage(coverage, cwd)); err != nil {
+			return err
+		}
+		if err := writeStatusNotes(buffered, diags, status, true); err != nil {
 			return err
 		}
 		return buffered.Flush()
@@ -88,7 +96,57 @@ func writeText(w io.Writer, diags []engine.Diagnostic, coverage engine.Coverage,
 			return err
 		}
 	}
+	if err := writeStatusNotes(buffered, diags, status, false); err != nil {
+		return err
+	}
 	return buffered.Flush()
+}
+
+// writeStatusNotes says in text what the run status says in JSON, in the two
+// situations where leaving it out would mislead:
+//
+//   - the run was cut short but no LL9001 is shown (it was ignored): the
+//     incompleteness is stated here regardless of what was hidden;
+//   - a clean result (clean == true) that rests on approximations or on
+//     hidden diagnostics: it must not read as the same thing as a fully
+//     modeled run with nothing to report.
+//
+// A run with findings and no incompleteness prints nothing here.
+func writeStatusNotes(w io.Writer, diags []engine.Diagnostic, status engine.Status, clean bool) error {
+	if status.Incomplete {
+		shown := false
+		for _, d := range diags {
+			if d.RuleID == "LL9001" {
+				shown = true
+			}
+		}
+		if !shown {
+			for _, r := range status.Reasons {
+				if _, err := fmt.Fprintf(w, "lifeline: analysis incomplete (%s): %s; results cover only part of the input\n", r.Kind, r.Message); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if !clean {
+		return nil
+	}
+	if u := status.Unsupported; u.HandedOff+u.UnestablishedPathChecks > 0 {
+		if _, err := fmt.Fprintf(w, "  approximations: %d obligation(s) handed off to code outside the owning function, %d all-path check(s) not established\n", u.HandedOff, u.UnestablishedPathChecks); err != nil {
+			return err
+		}
+	}
+	if n := status.Suppressed.Total(); n > 0 {
+		if _, err := fmt.Fprintf(w, "  %d diagnostic(s) found and hidden by configuration or suppression comments\n", n); err != nil {
+			return err
+		}
+	}
+	if status.Units.ExcludedFiles > 0 {
+		if _, err := fmt.Fprintf(w, "  %d file(s) excluded from analysis (generated or ignore_paths)\n", status.Units.ExcludedFiles); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeCleanSummary renders the zero-diagnostics case. It distinguishes
@@ -229,7 +287,7 @@ type sarifPhysical struct {
 	} `json:"region"`
 }
 
-func makeSARIF(diags []engine.Diagnostic, coverage engine.Coverage, cwd string) sarifLog {
+func makeSARIF(diags []engine.Diagnostic, coverage engine.Coverage, status engine.Status, cwd string) sarifLog {
 	rules := append([]engine.Rule(nil), engine.Rules...)
 	sort.Slice(rules, func(i, j int) bool { return rules[i].ID < rules[j].ID })
 	driver := sarifDriver{Name: version.Tool, Version: version.Version, InformationURI: version.InformationURI}
@@ -243,7 +301,7 @@ func makeSARIF(diags []engine.Diagnostic, coverage engine.Coverage, cwd string) 
 	// per-target results: unsupported targets are not rule violations, and
 	// giving them a fabricated ruleId would misrepresent them as findings
 	// against a registered rule to SARIF consumers.
-	run := sarifRun{Tool: sarifTool{Driver: driver}, Results: []sarifResult{}, Properties: map[string]any{"backend": version.Backend, "coverage": relativeCoverage(coverage, cwd)}}
+	run := sarifRun{Tool: sarifTool{Driver: driver}, Results: []sarifResult{}, Properties: map[string]any{"backend": version.Backend, "coverage": relativeCoverage(coverage, cwd), "status": status, "incomplete": status.Incomplete}}
 	for _, d := range diags {
 		level := "warning"
 		if d.Verdict == engine.Unknown {

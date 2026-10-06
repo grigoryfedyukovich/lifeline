@@ -17,19 +17,30 @@ import (
 const SchemaVersion = 1
 
 type Config struct {
-	SchemaVersion   int      `json:"schema_version"`
-	Format          string   `json:"format"`
-	CIExitCode      int      `json:"ci_exit_code"`
-	Timeout         string   `json:"timeout"`
-	MaxFunctions    int      `json:"max_functions"`
-	IncludeTests    bool     `json:"include_tests"`
-	FailOn          []string `json:"fail_on"`
-	Ignore          []string `json:"ignore"`
-	IgnorePaths     []string `json:"ignore_paths"`
-	ContextWrappers []string `json:"context_wrappers"`
-	StartWrappers   []string `json:"start_wrappers"`
-	JoinWrappers    []string `json:"join_wrappers"`
-	StopWrappers    []string `json:"stop_wrappers"`
+	SchemaVersion int      `json:"schema_version"`
+	Format        string   `json:"format"`
+	CIExitCode    int      `json:"ci_exit_code"`
+	Timeout       string   `json:"timeout"`
+	MaxFunctions  int      `json:"max_functions"`
+	IncludeTests  bool     `json:"include_tests"`
+	FailOn        []string `json:"fail_on"`
+	// FailOnIncomplete makes a run whose analysis was cut short by a bound
+	// or a deadline (engine.Status.Incomplete) fail with ci_exit_code,
+	// whatever its diagnostics say and whether or not LL9001 is hidden. It
+	// is a policy on the run status, separate from fail_on, which is a
+	// policy on diagnostics (audit finding F8).
+	FailOnIncomplete bool `json:"fail_on_incomplete"`
+	// FailOnUnsupported does the same when any part of the input was judged
+	// under an approximation (engine.Unsupported.Total() > 0): goroutine
+	// targets that could not be inspected, obligations handed off to code
+	// outside the owning function, or path checks left unestablished.
+	FailOnUnsupported bool     `json:"fail_on_unsupported"`
+	Ignore            []string `json:"ignore"`
+	IgnorePaths       []string `json:"ignore_paths"`
+	ContextWrappers   []string `json:"context_wrappers"`
+	StartWrappers     []string `json:"start_wrappers"`
+	JoinWrappers      []string `json:"join_wrappers"`
+	StopWrappers      []string `json:"stop_wrappers"`
 }
 
 func Default() Config {
@@ -202,19 +213,21 @@ func decodeJSON(data []byte, cfg *Config) error {
 }
 
 var setters = map[string]func(*Config, any) error{
-	"schema_version":   func(c *Config, v any) error { n, e := asInt(v); c.SchemaVersion = n; return e },
-	"format":           func(c *Config, v any) error { s, e := asString(v); c.Format = s; return e },
-	"ci_exit_code":     func(c *Config, v any) error { n, e := asInt(v); c.CIExitCode = n; return e },
-	"timeout":          func(c *Config, v any) error { s, e := asString(v); c.Timeout = s; return e },
-	"max_functions":    func(c *Config, v any) error { n, e := asInt(v); c.MaxFunctions = n; return e },
-	"include_tests":    func(c *Config, v any) error { b, e := asBool(v); c.IncludeTests = b; return e },
-	"fail_on":          func(c *Config, v any) error { s, e := asStrings(v); c.FailOn = s; return e },
-	"ignore":           func(c *Config, v any) error { s, e := asStrings(v); c.Ignore = s; return e },
-	"ignore_paths":     func(c *Config, v any) error { s, e := asStrings(v); c.IgnorePaths = s; return e },
-	"context_wrappers": func(c *Config, v any) error { s, e := asStrings(v); c.ContextWrappers = s; return e },
-	"start_wrappers":   func(c *Config, v any) error { s, e := asStrings(v); c.StartWrappers = s; return e },
-	"join_wrappers":    func(c *Config, v any) error { s, e := asStrings(v); c.JoinWrappers = s; return e },
-	"stop_wrappers":    func(c *Config, v any) error { s, e := asStrings(v); c.StopWrappers = s; return e },
+	"schema_version":      func(c *Config, v any) error { n, e := asInt(v); c.SchemaVersion = n; return e },
+	"format":              func(c *Config, v any) error { s, e := asString(v); c.Format = s; return e },
+	"ci_exit_code":        func(c *Config, v any) error { n, e := asInt(v); c.CIExitCode = n; return e },
+	"timeout":             func(c *Config, v any) error { s, e := asString(v); c.Timeout = s; return e },
+	"max_functions":       func(c *Config, v any) error { n, e := asInt(v); c.MaxFunctions = n; return e },
+	"include_tests":       func(c *Config, v any) error { b, e := asBool(v); c.IncludeTests = b; return e },
+	"fail_on":             func(c *Config, v any) error { s, e := asStrings(v); c.FailOn = s; return e },
+	"fail_on_incomplete":  func(c *Config, v any) error { b, e := asBool(v); c.FailOnIncomplete = b; return e },
+	"fail_on_unsupported": func(c *Config, v any) error { b, e := asBool(v); c.FailOnUnsupported = b; return e },
+	"ignore":              func(c *Config, v any) error { s, e := asStrings(v); c.Ignore = s; return e },
+	"ignore_paths":        func(c *Config, v any) error { s, e := asStrings(v); c.IgnorePaths = s; return e },
+	"context_wrappers":    func(c *Config, v any) error { s, e := asStrings(v); c.ContextWrappers = s; return e },
+	"start_wrappers":      func(c *Config, v any) error { s, e := asStrings(v); c.StartWrappers = s; return e },
+	"join_wrappers":       func(c *Config, v any) error { s, e := asStrings(v); c.JoinWrappers = s; return e },
+	"stop_wrappers":       func(c *Config, v any) error { s, e := asStrings(v); c.StopWrappers = s; return e },
 }
 
 // decodeFlat deliberately implements a strict, reproducible subset sufficient

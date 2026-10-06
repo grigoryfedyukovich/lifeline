@@ -2,12 +2,14 @@
 package analyzer
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
@@ -24,6 +26,20 @@ type options struct {
 	maxFunctions int
 	timeout      string
 	ignoreRules  string
+	statusOut    string
+}
+
+// Result is what a run of the analyzer returns to a driver that consumes
+// analyzer results (it is the Analyzer's ResultType), and what -status-out
+// writes. It carries the run's coverage and status, which vet's diagnostics
+// alone cannot: a package with no diagnostics looks the same whether it was
+// fully analyzed, truncated by max_functions, or rested on approximations,
+// and a hidden LL9001 leaves nothing behind at all (audit finding F8). The
+// status is computed before any diagnostic is filtered.
+type Result struct {
+	Package  string          `json:"package"`
+	Coverage engine.Coverage `json:"coverage"`
+	Status   engine.Status   `json:"status"`
 }
 
 // FunctionFact is a versioned, conservative summary of a function body. It is
@@ -82,14 +98,16 @@ func (*FunctionFact) AFact() {}
 func New() *analysis.Analyzer {
 	opts := new(options)
 	a := &analysis.Analyzer{
-		Name:      "lifeline",
-		Doc:       "reports goroutines with unclear cancellation, ownership, or join protocols",
-		FactTypes: []analysis.Fact{new(FunctionFact)},
+		Name:       "lifeline",
+		Doc:        "reports goroutines with unclear cancellation, ownership, or join protocols",
+		FactTypes:  []analysis.Fact{new(FunctionFact)},
+		ResultType: reflect.TypeOf((*Result)(nil)),
 	}
 	a.Flags.StringVar(&opts.configPath, "config", "", "path to lifeline YAML, TOML, or JSON configuration")
 	a.Flags.IntVar(&opts.maxFunctions, "max-functions", 0, "override the maximum number of functions analyzed per package")
 	a.Flags.StringVar(&opts.timeout, "timeout", "", "override the per-package analysis timeout metadata")
 	a.Flags.StringVar(&opts.ignoreRules, "ignore", "", "comma-separated rule identifiers to suppress")
+	a.Flags.StringVar(&opts.statusOut, "status-out", "", "append one JSON line per package with its coverage and run status to this file (a companion report: vet itself shows only diagnostics)")
 	a.Run = func(pass *analysis.Pass) (any, error) { return run(pass, opts) }
 	return a
 }
@@ -169,8 +187,9 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		return fact.ReturnFieldSites, true
 	}
 	cwd, _ := os.Getwd()
+	kept := frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd)
 	program, err := frontend.Build(frontend.Input{
-		Fset: pass.Fset, Files: frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd), Pkg: pass.Pkg, Info: pass.TypesInfo,
+		Fset: pass.Fset, Files: kept, Pkg: pass.Pkg, Info: pass.TypesInfo, ExcludedFiles: len(pass.Files) - len(kept),
 		LookupFunctionSummary:  lookup,
 		LookupParamEffects:     lookupParam,
 		LookupParamDoneEffects: lookupParamDone,
@@ -181,7 +200,13 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 	}
 
 	exportFunctionFacts(pass, program)
-	diags := engine.Analyze(program, cfg)
+	diags, status := engine.AnalyzeWithStatus(program, cfg)
+	result := &Result{Package: pass.Pkg.Path(), Coverage: engine.Summarize(program), Status: status}
+	if opts.statusOut != "" {
+		if err := appendStatus(opts.statusOut, result); err != nil {
+			return nil, fmt.Errorf("lifeline: write status: %w", err)
+		}
+	}
 	files := buildFileIndex(pass.Fset, pass.Files)
 	for _, d := range diags {
 		ad := analysis.Diagnostic{
@@ -208,7 +233,24 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		}
 		pass.Report(ad)
 	}
-	return nil, nil
+	return result, nil
+}
+
+// appendStatus appends result as one JSON line. vet runs the tool once per
+// package, possibly in parallel processes, so each record is written with a
+// single append of a single line.
+func appendStatus(path string, result *Result) error {
+	line, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(line, '\n'))
+	return err
 }
 
 func exportFunctionFacts(pass *analysis.Pass, program model.Program) {

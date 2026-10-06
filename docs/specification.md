@@ -75,7 +75,7 @@ Vet mode follows the normal `go vet` diagnostic exit convention.
 | `LL1003` | `WARNING` | A local `sync.WaitGroup` records worker starts but isn't fully, verifiably joined before the owner returns: no `Wait`/ownership transfer observed at all, a `Wait` observed but not on every return path, or a `Wait` on every path with a literal `Add`/`Done` count that still doesn't balance. |
 | `LL1004` | `WARNING` | The same three conditions as `LL1003`, for a local `errgroup.Group` (the count-mismatch condition never applies: `errgroup.Group` manages its own `Add`/`Done`-equivalent bookkeeping internally). |
 | `LL1005` | `WARNING` | A `sync.WaitGroup`/`errgroup.Group` is joined before its workers' own recognized stop signal (a context a worker of the group uses, or an assumed `stop_wrapper`) is guaranteed to have been sent, proven via CFG reachability and deferred-call order rather than merely unproven the other way. |
-| `LL9001` | `UNKNOWN` | `max_functions` or the standalone timeout makes analysis incomplete. |
+| `LL9001` | `UNKNOWN` | `max_functions` or the standalone timeout makes analysis incomplete. Hiding it does not change `status.incomplete`. |
 
 An unsupported direct target is retained as `unsupported` model evidence and is never interpreted as a successful termination proof. Version 0.1.1 does not emit a separate user-visible unsupported diagnostic; this remaining specification gap is tracked in the roadmap.
 
@@ -148,7 +148,8 @@ Supported keys:
 
 ```text
 schema_version, format, ci_exit_code, timeout, max_functions,
-include_tests, fail_on, ignore, ignore_paths, context_wrappers,
+include_tests, fail_on, fail_on_incomplete, fail_on_unsupported, ignore,
+ignore_paths, context_wrappers,
 start_wrappers, join_wrappers, stop_wrappers
 ```
 
@@ -176,7 +177,7 @@ Each diagnostic contains:
 7. tool and backend versions;
 8. a suggested action and edit only when mechanically defensible.
 
-Text, JSON, and SARIF 2.1.0 are supported. JSON bundles mark the complete report `incomplete` when any `UNKNOWN` diagnostic is present.
+Text, JSON, and SARIF 2.1.0 are supported. JSON bundles and SARIF runs carry a `status` object that is computed from the analysis, not from the diagnostics that survived filtering: `incomplete` is true exactly when a bound or deadline stopped the run, whether or not `LL9001` is displayed. `status.unsupported` counts what was judged under an approximation and is a separate dimension from `incomplete`; `status.suppressed` counts diagnostics hidden by configuration or comments; `status.units` counts discovered, analyzed and skipped units and excluded files. `fail_on_incomplete` and `fail_on_unsupported` are policies on the status. Under `go vet` the status is returned as the analyzer's result and appended per package to `-lifeline.status-out`.
 
 ## 11. Bounds and errors
 

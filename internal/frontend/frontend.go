@@ -50,6 +50,10 @@ type Input struct {
 	// consumed" as a checked absence of any effect.
 	LookupParamConsumption func(fn *types.Func, paramIndex int) (consumed, ok bool)
 
+	// ExcludedFiles is the number of files the caller removed with
+	// FilterFiles before building (see Program.ExcludedFiles).
+	ExcludedFiles int
+
 	// LookupParamEffects is LookupParamConsumption with the distinctions
 	// the engine needs (audit finding F6): what fn's body does with the
 	// cancel-like or group-like parameter at this position, as a
@@ -479,7 +483,7 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		lits = append(lits, literalSources(source)...)
 	}
 	total := len(sources) + len(lits)
-	program := model.Program{PackagePath: in.Pkg.Path(), FunctionCount: total, Suppressions: collectSuppressions(in.Fset, in.Files)}
+	program := model.Program{PackagePath: in.Pkg.Path(), FunctionCount: total, ExcludedFiles: in.ExcludedFiles, Suppressions: collectSuppressions(in.Fset, in.Files)}
 	limit := len(sources)
 	if limit > cfg.MaxFunctions {
 		limit = cfg.MaxFunctions

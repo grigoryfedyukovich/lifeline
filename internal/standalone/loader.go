@@ -55,11 +55,11 @@ type loadedPackage struct {
 	Info  *types.Info
 }
 
-func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, error) {
+func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, engine.Status, error) {
 	cwd, _ := os.Getwd()
 	packages, err := listPackages(ctx, patterns)
 	if err != nil {
-		return nil, engine.Coverage{}, err
+		return nil, engine.Coverage{}, engine.Status{}, err
 	}
 	exports := map[string]string{}
 	for _, p := range packages {
@@ -73,7 +73,7 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 			continue
 		}
 		if p.Error != nil {
-			return nil, engine.Coverage{}, fmt.Errorf("package %s: %s", p.ImportPath, p.Error.Err)
+			return nil, engine.Coverage{}, engine.Status{}, fmt.Errorf("package %s: %s", p.ImportPath, p.Error.Err)
 		}
 		if len(p.GoFiles)+len(p.CgoFiles) == 0 {
 			continue
@@ -84,6 +84,7 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 	type packageResult struct {
 		diagnostics []engine.Diagnostic
 		coverage    engine.Coverage
+		status      engine.Status
 	}
 	results := make([]packageResult, len(roots))
 	workCtx, cancel := context.WithCancel(ctx)
@@ -124,12 +125,13 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 					fail(fmt.Errorf("load %s: %w", p.ImportPath, err))
 					return
 				}
-				program, err := frontend.Build(frontend.Input{Fset: loaded.Fset, Files: frontend.FilterFiles(loaded.Fset, loaded.Files, cfg, cwd), Pkg: loaded.Pkg, Info: loaded.Info}, cfg)
+				kept := frontend.FilterFiles(loaded.Fset, loaded.Files, cfg, cwd)
+				program, err := frontend.Build(frontend.Input{Fset: loaded.Fset, Files: kept, Pkg: loaded.Pkg, Info: loaded.Info, ExcludedFiles: len(loaded.Files) - len(kept)}, cfg)
 				if err != nil {
 					fail(fmt.Errorf("analyze %s: %w", p.ImportPath, err))
 					return
 				}
-				results[i].diagnostics = engine.Analyze(program, cfg)
+				results[i].diagnostics, results[i].status = engine.AnalyzeWithStatus(program, cfg)
 				results[i].coverage = engine.Summarize(program)
 			}
 		}()
@@ -138,17 +140,19 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 
 	var all []engine.Diagnostic
 	var totalCoverage engine.Coverage
+	var totalStatus engine.Status
 	for i := range results {
 		all = append(all, results[i].diagnostics...)
 		totalCoverage = totalCoverage.Add(results[i].coverage)
+		totalStatus = totalStatus.Add(results[i].status)
 	}
 	if firstErr != nil {
-		return all, totalCoverage, firstErr
+		return all, totalCoverage, totalStatus, firstErr
 	}
 	if err := ctx.Err(); err != nil {
-		return all, totalCoverage, err
+		return all, totalCoverage, totalStatus, err
 	}
-	return all, totalCoverage, nil
+	return all, totalCoverage, totalStatus, nil
 }
 
 func listPackages(ctx context.Context, patterns []string) ([]listedPackage, error) {

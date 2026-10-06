@@ -37,7 +37,7 @@ Warm Go cache result:
 
 ```text
 diagnostics: 0
-incomplete: false
+incomplete: false  (status.incomplete; says nothing about status.unsupported)
 elapsed: 0.86 s
 maximum resident set: 71,068 KB
 ```

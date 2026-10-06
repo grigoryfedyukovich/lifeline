@@ -28,6 +28,8 @@ type options struct {
 	configPath   string
 	format       string
 	failOn       string
+	failIncompl  bool
+	failUnsupp   bool
 	ciExitCode   int
 	timeout      string
 	maxFunctions int
@@ -51,7 +53,9 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	fs.StringVar(&opts.configPath, "config", "", "path to lifecycle configuration")
 	fs.StringVar(&opts.format, "format", "", "output format: text, json, or sarif")
 	fs.StringVar(&opts.failOn, "fail-on", "", "comma-separated rule IDs or all")
-	fs.IntVar(&opts.ciExitCode, "ci-exit-code", 0, "exit code used when fail-on policy matches")
+	fs.IntVar(&opts.ciExitCode, "ci-exit-code", 0, "exit code used when a fail policy matches")
+	fs.BoolVar(&opts.failIncompl, "fail-on-incomplete", false, "fail when analysis was cut short by a bound or timeout, whatever the diagnostics say")
+	fs.BoolVar(&opts.failUnsupp, "fail-on-unsupported", false, "fail when any part of the input was judged under an approximation (see status.unsupported)")
 	fs.StringVar(&opts.timeout, "timeout", "", "overall analysis timeout")
 	fs.IntVar(&opts.maxFunctions, "max-functions", 0, "maximum functions analyzed per package")
 	fs.BoolVar(&opts.includeTests, "tests", false, "include same-package _test.go files")
@@ -82,6 +86,12 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	}
 	if visited["fail-on"] {
 		cfg.FailOn = config.SplitCSV(opts.failOn)
+	}
+	if visited["fail-on-incomplete"] {
+		cfg.FailOnIncomplete = opts.failIncompl
+	}
+	if visited["fail-on-unsupported"] {
+		cfg.FailOnUnsupported = opts.failUnsupp
 	}
 	if visited["ci-exit-code"] {
 		cfg.CIExitCode = opts.ciExitCode
@@ -153,21 +163,28 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 	start := time.Now()
-	diags, coverage, err := analyzePatterns(ctx, patterns, cfg)
+	diags, coverage, status, err := analyzePatterns(ctx, patterns, cfg)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			diags = append(diags, timeoutDiagnostic(cfg, time.Since(start)))
+			d := timeoutDiagnostic(cfg, time.Since(start))
+			// The timeout is part of the run status whether or not its
+			// diagnostic is displayed: hiding LL9001 hides a notice, not the
+			// fact that the run was cut short (audit finding F8).
+			status = status.WithTimeout(d.Message)
+			if !engine.Ignored(cfg.Ignore, d.RuleID) {
+				diags = append(diags, d)
+			}
 		} else {
 			fmt.Fprintf(stderr, "lifeline: %v\n", err)
 			return ExitInvalid
 		}
 	}
 	cwd, _ := os.Getwd()
-	if err := report.Write(stdout, cfg.Format, diags, coverage, cwd); err != nil {
+	if err := report.Write(stdout, cfg.Format, diags, coverage, status, cwd); err != nil {
 		fmt.Fprintf(stderr, "lifeline: render report: %v\n", err)
 		return ExitInternal
 	}
-	if engine.FailsPolicy(diags, cfg.FailOn) {
+	if engine.FailsPolicy(diags, cfg.FailOn) || engine.FailsStatusPolicy(status, cfg) {
 		return cfg.CIExitCode
 	}
 	return ExitOK
