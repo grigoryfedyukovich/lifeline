@@ -5226,24 +5226,6 @@ func deferredCallSet(body *ast.BlockStmt) map[*ast.CallExpr]bool {
 	return set
 }
 
-// allCallsDeferred reports whether every call in calls is present in
-// deferred -- i.e. every registration of this stop signal is via defer,
-// so the signal never actually fires until the enclosing function is
-// already on its way out. A binding with no call sites at all is not
-// "all deferred" (there is nothing to have proven anything about); see
-// computeOrdering.
-func allCallsDeferred(calls []*ast.CallExpr, deferred map[*ast.CallExpr]bool) bool {
-	if len(calls) == 0 {
-		return false
-	}
-	for _, call := range calls {
-		if !deferred[call] {
-			return false
-		}
-	}
-	return true
-}
-
 // collectStopWrapperCalls finds every call in body (not descending into a
 // nested FuncLit) that resolves to a configured stop_wrapper -- the same
 // recognition internal/cfg's trusted-stop edges use (b.trustedTerminator),
@@ -5606,6 +5588,264 @@ func blockSetOf(sites []flowgraph.CallSite) map[model.BlockID]bool {
 	return set
 }
 
+// stopSignal is one call that may send a group's workers their stop signal,
+// with where it sits in the owner's control flow and when it actually runs.
+type stopSignal struct {
+	call     *ast.CallExpr
+	site     flowgraph.CallSite
+	deferred bool
+	// wrapper is true for a configured stop_wrapper call, which is not tied
+	// to any particular context or worker: its connection to the group is an
+	// assumption, not something this analysis observed.
+	wrapper bool
+}
+
+// computeStopOrdering decides whether gr is joined before its workers' own
+// stop signal (LL1005): StopAfterWait, with the evidence that justifies it.
+//
+// It replaces a function-wide pool of stop signals applied to every joined
+// group (audit finding F7), which let an unrelated goroutine's deferred
+// cancel make an independent, finite group look like it waited before its
+// own signal, and which ignored when a deferred call really runs.
+//
+// What counts as this group's stop signal:
+//   - a call to the cancel function of a context some worker of this group
+//     uses, directly or through contexts derived from it (the workers are the
+//     `go` statements, and Go calls, that start this group's accounting);
+//   - a configured stop_wrapper call, which names no context and no worker,
+//     so its relation to the group is assumed, and said to be (the group's
+//     StopCorrelation, and the evidence).
+//
+// A cancel function whose context no worker of the group uses is not this
+// group's signal at all, however it is ordered relative to Wait.
+//
+// When a group is unsafe: every one of its stop signals is proven to run
+// only after a Wait. A signal that can come before the Wait (an explicit
+// cancel() ahead of Wait() alongside a `defer cancel()` safety net) makes
+// the order safe on those paths, and a second signal after Wait does not
+// change that. A signal this analysis cannot place in the graph withholds
+// the claim.
+//
+// When each call runs: a plain call runs at its place in the graph; a
+// deferred call runs when the function returns, after all plain code, and
+// deferred calls run in the reverse of the order they were registered, so
+//
+//	plain stop,    plain Wait:    stop is after Wait iff the graph proves it
+//	deferred stop, plain Wait:    after (the Wait ran in the body)
+//	plain stop,    deferred Wait: before (the Wait runs at return)
+//	deferred both:                the one registered LATER runs first, so the
+//	                              stop is after the Wait iff the Wait was
+//	                              registered after the stop, on every path
+//
+// (`defer wg.Wait(); defer cancel()` cancels first and is safe;
+// `defer cancel(); defer wg.Wait()` waits first and deadlocks). Registration
+// order is read off the graph, which records a defer at its statement.
+func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) {
+	stops, placeable := b.stopSignalsFor(gr, cancels, wrapperCalls, body, callSites, deferredCalls)
+	if len(stops) == 0 || !placeable {
+		return
+	}
+	var waits []stopSignal // reused: a wait is a call with a place and a time
+	for _, call := range gr.waitCallSites {
+		if site, ok := callSites[call]; ok {
+			waits = append(waits, stopSignal{call: call, site: site, deferred: deferredCalls[call]})
+		}
+	}
+	if len(waits) == 0 {
+		return
+	}
+	var plainWaits []flowgraph.CallSite
+	for _, w := range waits {
+		if !w.deferred {
+			plainWaits = append(plainWaits, w.site)
+		}
+	}
+	plainBlocks := blockSetOf(plainWaits)
+	reachAvoidingPlain := g.ReachableAvoiding(g.Entry, plainBlocks)
+
+	allAfter := true
+	assumed := false
+	for _, st := range stops {
+		after := false
+		switch {
+		case !st.deferred && len(plainWaits) > 0:
+			after = stopProvenAfterWait(g, plainWaits, plainBlocks, reachAvoidingPlain, st.site)
+		case st.deferred && len(plainWaits) > 0:
+			after = true // a plain Wait runs in the body, a deferred stop at return
+		}
+		if !after && st.deferred {
+			for _, w := range waits {
+				if w.deferred && registeredBefore(g, st.site, w.site) {
+					after = true // the Wait was registered later, so it runs first
+					break
+				}
+			}
+		}
+		if !after {
+			allAfter = false
+			break
+		}
+		if st.wrapper {
+			assumed = true
+		}
+	}
+	if !allAfter {
+		return
+	}
+	gr.group.StopAfterWait = true
+	switch {
+	case assumed:
+		gr.group.StopCorrelation = "assumed-wrapper"
+		gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "every call to the configured stop wrapper only runs after this Wait; the wrapper is assumed to be what stops this group's workers, which is not verified"})
+	default:
+		gr.group.StopCorrelation = "worker-context"
+		gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "a worker of this group uses a context whose cancel function is only ever called after this Wait: " + describeStopOrder(stops, waits)})
+	}
+}
+
+// describeStopOrder says in words which side of the Wait each stop signal
+// falls on, and whether it runs at function return.
+func describeStopOrder(stops, waits []stopSignal) string {
+	waitDeferred := false
+	for _, w := range waits {
+		if w.deferred {
+			waitDeferred = true
+		}
+	}
+	var parts []string
+	for _, st := range stops {
+		switch {
+		case st.deferred && waitDeferred:
+			parts = append(parts, "a deferred stop signal registered before a deferred Wait, so the Wait runs first at return")
+		case st.deferred:
+			parts = append(parts, "a deferred stop signal, which does not run until the function returns, after the Wait")
+		default:
+			parts = append(parts, "a stop signal reachable only after the Wait")
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// registeredBefore reports whether the statement at a is proven to have run
+// before the statement at b, on every path from entry that reaches b. It is
+// the same proof stopProvenAfterWait makes, between two defer statements.
+func registeredBefore(g *model.CFG, a, bsite flowgraph.CallSite) bool {
+	if a.Block == bsite.Block {
+		return a.Index < bsite.Index
+	}
+	return !g.ReachableAvoiding(g.Entry, map[model.BlockID]bool{a.Block: true})[bsite.Block]
+}
+
+// stopSignalsFor collects gr's candidate stop signals (see
+// computeStopOrdering), placed in the owner's control flow. placeable is
+// false when some candidate has no place there, in which case no claim is
+// made.
+func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, body *ast.BlockStmt, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) (stops []stopSignal, placeable bool) {
+	placeable = true
+	add := func(calls []*ast.CallExpr, wrapper bool) {
+		for _, call := range calls {
+			site, ok := callSites[call]
+			if !ok {
+				placeable = false
+				continue
+			}
+			stops = append(stops, stopSignal{call: call, site: site, deferred: deferredCalls[call], wrapper: wrapper})
+		}
+	}
+	used := b.workerContexts(gr, body)
+	if len(used) > 0 {
+		parents := map[types.Object][]types.Object{}
+		for _, c := range cancels {
+			if c.ctxObj == nil || c.acquireCall == nil {
+				continue
+			}
+			for o := range objectsUsedInExpressions(c.acquireCall.Args, b.in.Info, true) {
+				parents[c.ctxObj] = append(parents[c.ctxObj], o)
+			}
+		}
+		for _, c := range cancels {
+			if !c.binding.Called || c.ctxObj == nil || !derivesFromAny(used, c.ctxObj, parents) {
+				continue
+			}
+			add(c.callSites, false)
+		}
+	}
+	add(wrapperCalls, true)
+	return stops, placeable
+}
+
+// derivesFromAny reports whether any context in used is target itself or
+// derived from it, through the factory calls recorded in parents (a context
+// made from another one is stopped when its parent is cancelled).
+func derivesFromAny(used map[types.Object]bool, target types.Object, parents map[types.Object][]types.Object) bool {
+	seen := map[types.Object]bool{}
+	var reaches func(types.Object) bool
+	reaches = func(o types.Object) bool {
+		if o == target {
+			return true
+		}
+		if seen[o] {
+			return false
+		}
+		seen[o] = true
+		for _, p := range parents[o] {
+			if reaches(p) {
+				return true
+			}
+		}
+		return false
+	}
+	for o := range used {
+		if reaches(o) {
+			return true
+		}
+	}
+	return false
+}
+
+// workerContexts returns the objects used by gr's workers: the goroutines
+// (`go` statements anywhere in body) and Go calls that start this group's
+// accounting. A worker belongs to the group when it calls Done on it, when
+// it is a function that Done()s the group passed to it, or when it is a
+// function literal handed to the group's own Go method.
+func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.Object]bool {
+	used := map[types.Object]bool{}
+	addLit := func(lit *ast.FuncLit) {
+		for o := range objectsUsed(lit.Body, b.in.Info, false) {
+			used[o] = true
+		}
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		gs, ok := n.(*ast.GoStmt)
+		if !ok {
+			return true
+		}
+		if lit, ok := gs.Call.Fun.(*ast.FuncLit); ok {
+			if bodyCallsMethodOn(lit.Body, gr.obj, "Done", b.in.Info) {
+				addLit(lit)
+			}
+			return true
+		}
+		if b.calleeDoneEffect(gs.Call, gr.obj).Has(model.EffectMay) {
+			for o := range objectsUsedInExpressions(gs.Call.Args, b.in.Info, true) {
+				used[o] = true
+			}
+		}
+		return true
+	})
+	for _, call := range gr.startCalls {
+		if selectorMethod(call.Fun) != "Go" {
+			continue
+		}
+		for _, arg := range call.Args {
+			if lit, ok := arg.(*ast.FuncLit); ok {
+				addLit(lit)
+			}
+		}
+	}
+	return used
+}
+
 // stopProvenAfterWait reports whether stop is guaranteed to be reached, on
 // every path from g's entry, only after at least one of waitSites has
 // already run. When stop shares a block with a wait site, this is decided
@@ -5703,22 +5943,7 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		return
 	}
 	deferredCalls := deferredCallSet(body)
-	var stopSignals []*ast.CallExpr
-	deferOnlyStopSeen := false
-	for _, c := range cancels {
-		if c.binding.Called && c.binding.UsedByChild {
-			stopSignals = append(stopSignals, c.callSites...)
-			if allCallsDeferred(c.callSites, deferredCalls) {
-				deferOnlyStopSeen = true
-			}
-		}
-	}
 	stopWrapperCalls := b.collectStopWrapperCalls(body)
-	stopSignals = append(stopSignals, stopWrapperCalls...)
-	if allCallsDeferred(stopWrapperCalls, deferredCalls) {
-		deferOnlyStopSeen = true
-	}
-	stopSites := callSitesOf(stopSignals, callSites)
 
 	for _, c := range cancels {
 		if !c.binding.Called {
@@ -5796,20 +6021,7 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		if len(waitSites) == 0 {
 			continue
 		}
-		waitBlocks := blockSetOf(waitSites)
-		reachableAvoidingWaits := g.ReachableAvoiding(g.Entry, waitBlocks)
-		if deferOnlyStopSeen {
-			gr.group.StopAfterWait = true
-			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "the worker stop signal is only ever sent via a deferred call, which does not run until the function is already returning -- after this Wait() call"})
-			continue
-		}
-		for _, stop := range stopSites {
-			if stopProvenAfterWait(g, waitSites, waitBlocks, reachableAvoidingWaits, stop) {
-				gr.group.StopAfterWait = true
-				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "the worker stop signal is only reachable after this Wait() call"})
-				break
-			}
-		}
+		b.computeStopOrdering(gr, cancels, stopWrapperCalls, body, g, callSites, deferredCalls)
 	}
 }
 

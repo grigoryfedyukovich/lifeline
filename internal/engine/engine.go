@@ -226,6 +226,11 @@ func Analyze(program model.Program, cfg config.Config) []Diagnostic {
 			if group.StopAfterWait {
 				msg := fmt.Sprintf("%s %q is joined before its workers' own stop signal is guaranteed to have been sent", group.Kind, group.Name)
 				suggestion := "send the stop signal before waiting, not after"
+				if group.StopCorrelation == "assumed-wrapper" {
+					// A configured stop wrapper names no context and no worker:
+					// say that the connection is an assumption.
+					msg = fmt.Sprintf("%s %q is joined before the configured stop wrapper is called; the wrapper is assumed to be what stops this group's workers", group.Kind, group.Name)
+				}
 				out = append(out, base(program, fn, "LL1005", Warning, msg, group.Span, "wait-before-stop", group.Evidence, suggestion, nil, meta))
 			}
 		}

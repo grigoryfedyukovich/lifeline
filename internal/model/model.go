@@ -152,6 +152,13 @@ type JoinGroup struct {
 	// a mere inability to prove the safe order, only from a positive CFG
 	// proof of the unsafe one.
 	StopAfterWait bool `json:"stop_after_wait"`
+	// StopCorrelation says how StopAfterWait connects the stop signal to
+	// this group's workers: "worker-context" when a worker of this group
+	// demonstrably uses the context whose cancel function is the signal,
+	// "assumed-wrapper" when the signal is a configured stop_wrapper call,
+	// which names no context or worker, so the relation is assumed and not
+	// verified (audit finding F7). Empty when StopAfterWait is false.
+	StopCorrelation string `json:"stop_correlation,omitempty"`
 	// UnjoinedRound is true iff a sync.WaitGroup is reused for a further
 	// round of asynchronous work (a `go` statement recognized as a
 	// worker-start, computeGroupRoundBalances) after this group's own
