@@ -105,7 +105,7 @@ func dumpFacts(ctx context.Context, patterns []string, cfg config.Config, format
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		loaded, err := loadOne(p, exports, cfg.IncludeTests)
+		loaded, err := loadOne(ctx, p, exports, cfg.IncludeTests)
 		if err != nil {
 			return fmt.Errorf("load %s: %w", p.ImportPath, err)
 		}

@@ -183,7 +183,7 @@ Text, JSON, and SARIF 2.1.0 are supported. JSON bundles and SARIF runs carry a `
 
 - `max_functions` is applied before function lifecycle and SSA-like construction.
 - Same-package direct targets beyond the bound are not inspected through a side path.
-- The standalone overall timeout produces `LL9001` rather than a success/failure claim.
+- The standalone overall timeout and vet's per-package frontend timeout produce `LL9001` rather than a success/failure claim. Frontend cancellation is cooperative; parsing/type checking are not hard-interrupted.
 - Syntax and type failures contain source-oriented Go diagnostics and a recovery hint.
 - Internal panics are caught in standalone mode and print a local reproduction command without uploading source.
 

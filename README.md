@@ -132,7 +132,7 @@ status.assumptions         what the results rest on
 
 Policy on the status is separate from `fail_on`: `-fail-on-incomplete` (`fail_on_incomplete: true`) and `-fail-on-unsupported` (`fail_on_unsupported: true`) fail with `ci_exit_code` based on the status alone, so ignoring `LL9001` cannot be used to pass an incomplete run.
 
-Under `go vet`, which shows only diagnostics, the same data is available as a result and as a companion file: pass `-lifeline.status-out=PATH` and each analyzed package appends one JSON line (`package`, `coverage`, `status`). The analyzer also returns that record (`*analyzer.Result`) as its result, for drivers that consume analyzer results.
+Under `go vet`, which shows only diagnostics, the same data is available as a result and as a companion file: pass `-lifeline.status-out=PATH` and each analyzed package appends one JSON line (`package`, `coverage`, `status`). The analyzer also returns that record (`*analyzer.Result`) as its result, for drivers that consume analyzer results. `-lifeline.timeout=DURATION` is enforced as a cooperative per-package frontend deadline; the standalone `-timeout` remains an overall deadline across the selected roots.
 
 ## Command line
 

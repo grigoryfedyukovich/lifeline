@@ -16,6 +16,7 @@
 package cfg
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -95,7 +96,20 @@ type CallSite struct {
 }
 
 func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.Info, isTrustedTerminator func(*ast.CallExpr) bool) (*model.CFG, map[*ast.CallExpr]CallSite) {
-	b := &builder{fset: fset, info: info, labels: map[string]model.BlockID{}, isTrustedTerminator: isTrustedTerminator, callSites: map[*ast.CallExpr]CallSite{}}
+	g, calls, _ := BuildContext(context.Background(), name, fset, body, info, isTrustedTerminator)
+	return g, calls
+}
+
+// BuildContext is Build with cooperative cancellation. It checks ctx while
+// traversing statements and labels so a standalone deadline can interrupt CFG
+// construction for a very large function instead of waiting for the whole body
+// to finish. A partial graph may be returned with ctx.Err(); callers must not
+// treat that graph as a complete analysis result.
+func BuildContext(ctx context.Context, name string, fset *token.FileSet, body *ast.BlockStmt, info *types.Info, isTrustedTerminator func(*ast.CallExpr) bool) (*model.CFG, map[*ast.CallExpr]CallSite, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b := &builder{ctx: ctx, fset: fset, info: info, labels: map[string]model.BlockID{}, isTrustedTerminator: isTrustedTerminator, callSites: map[*ast.CallExpr]CallSite{}}
 	entry := b.newBlock("entry")
 	exit := b.newBlock("exit")
 	b.exit = exit
@@ -104,10 +118,10 @@ func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.In
 		b.preAllocateLabels(body)
 		b.stmtList(body.List)
 	}
-	if b.current != invalidBlock {
+	if b.err == nil && b.current != invalidBlock {
 		b.addEdge(b.current, exit, model.EdgeNormal, "", b.spanOf(body))
 	}
-	return &model.CFG{Function: name, Entry: entry, Exit: exit, Blocks: b.blocks}, b.callSites
+	return &model.CFG{Function: name, Entry: entry, Exit: exit, Blocks: b.blocks}, b.callSites, b.err
 }
 
 const invalidBlock = model.BlockID(-1)
@@ -123,6 +137,8 @@ type frame struct {
 }
 
 type builder struct {
+	ctx                 context.Context
+	err                 error
 	fset                *token.FileSet
 	info                *types.Info
 	blocks              []model.BasicBlock
@@ -134,6 +150,17 @@ type builder struct {
 	// callSites is Build's second return value as it's built up; see
 	// Build's own doc comment for exactly which calls get recorded.
 	callSites map[*ast.CallExpr]CallSite
+}
+
+func (b *builder) cancelled() bool {
+	if b.err != nil {
+		return true
+	}
+	if err := b.ctx.Err(); err != nil {
+		b.err = err
+		return true
+	}
+	return false
 }
 
 // recordCall notes that call was found in a statement's own direct effect
@@ -227,6 +254,9 @@ func (b *builder) spanOf(n ast.Node) model.Span {
 // ones already processed.
 func (b *builder) preAllocateLabels(body ast.Node) {
 	ast.Inspect(body, func(n ast.Node) bool {
+		if b.cancelled() {
+			return false
+		}
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
@@ -264,6 +294,9 @@ func (b *builder) resolveContinue(label string) (model.BlockID, bool) {
 // them the way control actually flows.
 func (b *builder) stmtList(list []ast.Stmt) {
 	for _, s := range list {
+		if b.cancelled() {
+			return
+		}
 		b.stmt(s, "")
 	}
 }
@@ -273,6 +306,9 @@ func (b *builder) stmtList(list []ast.Stmt) {
 // target (for(); switch; select accept a label for break/continue
 // resolution); it is empty otherwise.
 func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
+	if b.cancelled() {
+		return
+	}
 	switch x := s.(type) {
 	case nil:
 		return

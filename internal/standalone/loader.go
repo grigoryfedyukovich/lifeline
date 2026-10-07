@@ -120,14 +120,21 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 					return
 				}
 				p := roots[i]
-				loaded, err := loadOne(p, exports, cfg.IncludeTests)
+				loaded, err := loadOne(workCtx, p, exports, cfg.IncludeTests)
 				if err != nil {
 					fail(fmt.Errorf("load %s: %w", p.ImportPath, err))
 					return
 				}
 				kept := frontend.FilterFiles(loaded.Fset, loaded.Files, cfg, cwd)
-				program, err := frontend.Build(frontend.Input{Fset: loaded.Fset, Files: kept, Pkg: loaded.Pkg, Info: loaded.Info, ExcludedFiles: len(loaded.Files) - len(kept)}, cfg)
+				program, err := frontend.BuildContext(workCtx, frontend.Input{Fset: loaded.Fset, Files: kept, Pkg: loaded.Pkg, Info: loaded.Info, ExcludedFiles: len(loaded.Files) - len(kept)}, cfg)
 				if err != nil {
+					// BuildContext may have completed some functions before a deadline.
+					// Preserve those diagnostics/coverage; main adds the timeout reason to
+					// the run status independently of diagnostic filtering.
+					if program.FunctionCount > 0 || len(program.Functions) > 0 {
+						results[i].diagnostics, results[i].status = engine.AnalyzeWithStatus(program, cfg)
+						results[i].coverage = engine.Summarize(program)
+					}
 					fail(fmt.Errorf("analyze %s: %w", p.ImportPath, err))
 					return
 				}
@@ -188,7 +195,7 @@ func listPackages(ctx context.Context, patterns []string) ([]listedPackage, erro
 	return packages, nil
 }
 
-func loadOne(p listedPackage, exports map[string]string, includeTests bool) (*loadedPackage, error) {
+func loadOne(ctx context.Context, p listedPackage, exports map[string]string, includeTests bool) (*loadedPackage, error) {
 	fset := token.NewFileSet()
 	names := append([]string{}, p.GoFiles...)
 	names = append(names, p.CgoFiles...)
@@ -197,6 +204,9 @@ func loadOne(p listedPackage, exports map[string]string, includeTests bool) (*lo
 	}
 	var files []*ast.File
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		path := filepath.Join(p.Dir, name)
 		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.AllErrors)
 		if err != nil {
@@ -232,7 +242,13 @@ func loadOne(p listedPackage, exports map[string]string, includeTests bool) (*lo
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 		Scopes:     make(map[ast.Node]*types.Scope),
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	typed, err := conf.Check(p.ImportPath, fset, files, info)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		if len(typeErrors) > 5 {
 			typeErrors = append(typeErrors[:5], fmt.Sprintf("... %d more type errors", len(typeErrors)-5))

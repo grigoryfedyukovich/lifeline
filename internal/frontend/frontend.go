@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/constant"
@@ -122,6 +123,8 @@ type funcSource struct {
 }
 
 type builder struct {
+	ctx       context.Context
+	err       error
 	in        Input
 	cfg       config.Config
 	funcs     map[*types.Func]*ast.FuncDecl
@@ -276,6 +279,29 @@ type builder struct {
 	// a mix) from looping forever. See handleSummaryOf.
 	receiverSummaries map[types.Object]*receiverSummary
 	receiverStack     []types.Object
+}
+
+func (b *builder) cancelled() bool {
+	if b.err != nil {
+		return true
+	}
+	if err := b.ctx.Err(); err != nil {
+		b.err = err
+		return true
+	}
+	return false
+}
+
+func (b *builder) inspect(root ast.Node, visit func(ast.Node) bool) {
+	if b.cancelled() {
+		return
+	}
+	ast.Inspect(root, func(n ast.Node) bool {
+		if b.cancelled() {
+			return false
+		}
+		return visit(n)
+	})
 }
 
 // returnFieldSite is the shape computeFieldOwnership records into
@@ -437,10 +463,22 @@ func collectSuppressions(fset *token.FileSet, files []*ast.File) map[string]map[
 }
 
 func Build(in Input, cfg config.Config) (model.Program, error) {
+	return BuildContext(context.Background(), in, cfg)
+}
+
+// BuildContext is Build with cooperative cancellation. Standalone analysis uses
+// it so a configured deadline is observed inside frontend fixed points, AST
+// walks, CFG construction, and local SSA construction instead of only between
+// packages. Build remains the compatibility wrapper for go/analysis and tests.
+func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Program, error) {
 	if in.Fset == nil || in.Pkg == nil || in.Info == nil {
 		return model.Program{}, fmt.Errorf("frontend requires file set, package, and type information")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	b := &builder{
+		ctx:               ctx,
 		in:                in,
 		cfg:               cfg,
 		funcs:             map[*types.Func]*ast.FuncDecl{},
@@ -461,7 +499,13 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
+		if err := ctx.Err(); err != nil {
+			return model.Program{}, err
+		}
 		for _, d := range file.Decls {
+			if err := ctx.Err(); err != nil {
+				return model.Program{}, err
+			}
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok || fd.Body == nil {
 				continue
@@ -480,9 +524,16 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	// truncated run drops closures before it drops named functions.
 	var lits []funcSource
 	for _, source := range sources {
-		lits = append(lits, literalSources(source)...)
+		more, err := literalSourcesContext(ctx, source)
+		if err != nil {
+			return model.Program{}, err
+		}
+		lits = append(lits, more...)
 	}
 	total := len(sources) + len(lits)
+	if err := ctx.Err(); err != nil {
+		return model.Program{PackagePath: in.Pkg.Path(), FunctionCount: total, ExcludedFiles: in.ExcludedFiles}, err
+	}
 	program := model.Program{PackagePath: in.Pkg.Path(), FunctionCount: total, ExcludedFiles: in.ExcludedFiles, Suppressions: collectSuppressions(in.Fset, in.Files)}
 	limit := len(sources)
 	if limit > cfg.MaxFunctions {
@@ -538,8 +589,14 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	// functions -- which is independent of paramConsumption's own
 	// question and does not need its own separate loop.
 	for {
+		if err := ctx.Err(); err != nil {
+			return program, err
+		}
 		changed := false
 		for _, source := range sources[:limit] {
+			if err := ctx.Err(); err != nil {
+				return program, err
+			}
 			if b.computeParameterEffects(source.decl) {
 				changed = true
 			}
@@ -563,11 +620,20 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 	// caller must in turn be checked before buildFunction's real pass
 	// below looks up the answer.
 	for _, source := range sources[:limit] {
+		if err := ctx.Err(); err != nil {
+			return program, err
+		}
 		b.computeFieldOwnership(source)
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return program, err
+		}
 		changed := false
 		for _, source := range sources[:limit] {
+			if err := ctx.Err(); err != nil {
+				return program, err
+			}
 			if b.computeConstructorCallerConsumption(source) {
 				changed = true
 			}
@@ -577,10 +643,24 @@ func Build(in Input, cfg config.Config) (model.Program, error) {
 		}
 	}
 	for _, source := range sources[:limit] {
-		program.Functions = append(program.Functions, b.buildFunction(source))
+		if err := ctx.Err(); err != nil {
+			return program, err
+		}
+		fn := b.buildFunction(source)
+		if b.err != nil {
+			return program, b.err
+		}
+		program.Functions = append(program.Functions, fn)
 	}
 	for _, source := range lits[:litLimit] {
-		program.Functions = append(program.Functions, b.buildFunction(source))
+		if err := ctx.Err(); err != nil {
+			return program, err
+		}
+		fn := b.buildFunction(source)
+		if b.err != nil {
+			return program, b.err
+		}
+		program.Functions = append(program.Functions, fn)
 	}
 	b.attachCallerFindings(&program)
 	return program, nil
@@ -669,15 +749,31 @@ type groupState struct {
 // stable for a given source text, which is what lets a finding in a closure
 // keep its identity from run to run.
 func literalSources(source funcSource) []funcSource {
+	out, _ := literalSourcesContext(context.Background(), source)
+	return out
+}
+
+func literalSourcesContext(ctx context.Context, source funcSource) ([]funcSource, error) {
 	outer := source.decl.Name.Name
 	if source.obj != nil {
 		outer = source.obj.FullName()
 	}
 	var out []funcSource
+	var walkErr error
 	var walk func(parent string, nested bool, root ast.Node)
 	walk = func(parent string, nested bool, root ast.Node) {
+		if walkErr != nil {
+			return
+		}
 		n := 0
 		ast.Inspect(root, func(x ast.Node) bool {
+			if walkErr != nil {
+				return false
+			}
+			if err := ctx.Err(); err != nil {
+				walkErr = err
+				return false
+			}
 			lit, ok := x.(*ast.FuncLit)
 			if !ok || x == root {
 				return true
@@ -694,7 +790,7 @@ func literalSources(source funcSource) []funcSource {
 		})
 	}
 	walk(outer, false, source.decl.Body)
-	return out
+	return out, walkErr
 }
 
 // posRange is a half-open source range.
@@ -747,7 +843,7 @@ func (b *builder) deadFuncLits(body *ast.BlockStmt) []posRange {
 			blankUse[id] = true
 		}
 	}
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.AssignStmt:
 			if (x.Tok == token.ASSIGN || x.Tok == token.DEFINE) && len(x.Lhs) == len(x.Rhs) {
@@ -766,7 +862,7 @@ func (b *builder) deadFuncLits(body *ast.BlockStmt) []posRange {
 	})
 	if len(held) > 0 {
 		alive := map[types.Object]bool{}
-		ast.Inspect(body, func(n ast.Node) bool {
+		b.inspect(body, func(n ast.Node) bool {
 			if id, ok := n.(*ast.Ident); ok {
 				if obj := info.Uses[id]; obj != nil && held[obj] != nil && !blankUse[id] {
 					alive[obj] = true
@@ -796,6 +892,9 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	states, groups := b.collectBindings(fd, contexts)
+	if b.cancelled() {
+		return fn
+	}
 	if source.lit != nil {
 		// A literal owns only what it declares. A cancel function or group
 		// that is assigned inside it but declared outside is used outside
@@ -804,17 +903,34 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		states, groups = b.declaredWithin(source.lit, states, groups)
 	}
 	b.deadLiterals = b.deadFuncLits(fd.Body)
+	if b.cancelled() {
+		return fn
+	}
 	defer func() { b.deadLiterals = nil }()
 
 	fn.BodyLifecycle = b.newLifecycleSummary(fd.Body, contexts, "function-body", b.span(fd.Body), false)
-	fn.BodyLifecycle.CFG, _ = flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
+	var err error
+	fn.BodyLifecycle.CFG, _, err = flowgraph.BuildContext(b.ctx, name, b.in.Fset, fd.Body, b.in.Info, b.trustedTerminator(contexts))
+	if err != nil {
+		b.err = err
+		return fn
+	}
 	b.collectObligations = true
 	b.observeFunctionBody(fd.Body, contexts, states, groups, &fn, source.obj)
+	if b.cancelled() {
+		return fn
+	}
 	b.collectObligations = false
 	b.markFieldGroupEscapes(fd.Body, groups)
+	if b.cancelled() {
+		return fn
+	}
 	resolveAliasEscapes(states, groups)
 	b.computeGroupBalances(groups, fd.Body, b.in.Info)
 	b.computeGroupRoundBalances(groups, fd.Body, b.in.Info)
+	if b.cancelled() {
+		return fn
+	}
 	// computeOrdering needs real control-flow reachability, not
 	// fn.BodyLifecycle.CFG's own trusted-stop edges: those model "a call
 	// receiving a tracked context is trusted to be able to end the
@@ -830,8 +946,15 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	// builds its own, separate, purely structural CFG (nil trust
 	// predicate) rather than reusing fn.BodyLifecycle.CFG, at the cost of
 	// building the CFG twice per function.
-	orderingCFG, orderingCallBlocks := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
+	orderingCFG, orderingCallBlocks, err := flowgraph.BuildContext(b.ctx, name, b.in.Fset, fd.Body, b.in.Info, nil)
+	if err != nil {
+		b.err = err
+		return fn
+	}
 	b.computeOrdering(groups, states, fd.Body, orderingCFG, orderingCallBlocks)
+	if b.cancelled() {
+		return fn
+	}
 	b.resolveObligations()
 	if source.obj != nil {
 		b.summaries[source.obj] = cloneGoroutine(fn.BodyLifecycle)
@@ -862,7 +985,11 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		fn.ParamDoneEffects = nil
 		return fn
 	}
-	ir := localssa.Build(name, fd.Body, b.in.Info)
+	ir, err := localssa.BuildContext(b.ctx, name, fd.Body, b.in.Info)
+	if err != nil {
+		b.err = err
+		return fn
+	}
 	fn.IR = make([]model.Instruction, 0, len(ir.Instructions))
 	for _, in := range ir.Instructions {
 		fn.IR = append(fn.IR, model.Instruction{
@@ -1007,7 +1134,7 @@ func (b *builder) fixableAssignments(fd *ast.FuncDecl) map[*ast.AssignStmt]bool 
 	}
 	usesGoto := false
 	var stack []ast.Node
-	ast.Inspect(fd.Body, func(n ast.Node) bool {
+	b.inspect(fd.Body, func(n ast.Node) bool {
 		if n == nil {
 			stack = stack[:len(stack)-1]
 			return true
@@ -1059,7 +1186,7 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 	var allNames map[string]bool         // computed only for the rare blank-cancel fix
 	var fixable map[*ast.AssignStmt]bool // computed only for the rare blank-cancel fix
 
-	ast.Inspect(fd.Body, func(n ast.Node) bool {
+	b.inspect(fd.Body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
@@ -1202,7 +1329,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 	funcDepth := 0
 	var nodeIsFuncLit []bool
 	labels := labeledLoops(body)
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			last := len(nodeIsFuncLit) - 1
 			if last >= 0 {
@@ -1482,7 +1609,7 @@ func (b *builder) reaches(from, to *types.Func) bool {
 				continue
 			}
 			seen := map[*types.Func]bool{}
-			ast.Inspect(decl.Body, func(n ast.Node) bool {
+			b.inspect(decl.Body, func(n ast.Node) bool {
 				if call, ok := n.(*ast.CallExpr); ok {
 					if callee := b.resolveCalleeFunc(call.Fun); callee != nil && b.funcs[callee] != nil && !seen[callee] {
 						seen[callee] = true
@@ -1520,7 +1647,7 @@ func (b *builder) usedInLiveLiteral(body *ast.BlockStmt, obj types.Object) bool 
 		return false
 	}
 	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if found {
 			return false
 		}
@@ -1531,7 +1658,7 @@ func (b *builder) usedInLiveLiteral(body *ast.BlockStmt, obj types.Object) bool 
 		if b.inDeadLiteral(lit.Pos()) {
 			return false
 		}
-		ast.Inspect(lit.Body, func(m ast.Node) bool {
+		b.inspect(lit.Body, func(m ast.Node) bool {
 			if id, ok := m.(*ast.Ident); ok && b.in.Info.Uses[id] == obj {
 				found = true
 			}
@@ -2623,7 +2750,7 @@ func (b *builder) collectFieldCaptures(body *ast.BlockStmt, cancels []*cancelSta
 	}
 	funcDepth := 0
 	var nodeIsFuncLit []bool
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			last := len(nodeIsFuncLit) - 1
 			if last >= 0 {
@@ -3023,7 +3150,7 @@ func (b *builder) walkFieldCaptureUses(body ast.Node, byVar map[types.Object][]*
 		return
 	}
 	var stack []ast.Node
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			stack = stack[:len(stack)-1]
 			return true
@@ -3566,7 +3693,7 @@ func (b *builder) paramSummaryOf(fn *types.Func, index int) (sum *receiverSummar
 func (b *builder) walkReceiverUses(body *ast.BlockStmt, recv types.Object, sum *receiverSummary) int {
 	lowest := noReceiverCycle
 	var stack []ast.Node
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			stack = stack[:len(stack)-1]
 			return true
@@ -4186,7 +4313,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 	callerCFG, callerCallSites := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
 	funcDepth := 0
 	var nodeIsFuncLit []bool
-	ast.Inspect(fd.Body, func(n ast.Node) bool {
+	b.inspect(fd.Body, func(n ast.Node) bool {
 		if n == nil {
 			last := len(nodeIsFuncLit) - 1
 			if last >= 0 {
@@ -5119,7 +5246,7 @@ func (b *builder) recordParamDoneEffects(obj types.Object, next model.ParamEffec
 // it to a function in the same recursion cycle as self, which count as
 // discharges only in a function with a real one (see paramEffectOf).
 func (b *builder) doneCalls(body ast.Node, obj types.Object, self *types.Func) (direct, must, may, rec []*ast.CallExpr) {
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
@@ -5244,7 +5371,7 @@ func (b *builder) collectStopWrapperCalls(body *ast.BlockStmt) []*ast.CallExpr {
 	if body == nil {
 		return calls
 	}
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
@@ -5449,9 +5576,9 @@ func (b *builder) errorBranchSkipper(body *ast.BlockStmt, errObj types.Object, o
 	// the value untrackable.
 	var reassigns []token.Pos
 	unsafe := false
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if lit, ok := n.(*ast.FuncLit); ok {
-			ast.Inspect(lit.Body, func(m ast.Node) bool {
+			b.inspect(lit.Body, func(m ast.Node) bool {
 				if _, ok := assignsErr(m); ok {
 					unsafe = true
 				}
@@ -5517,7 +5644,7 @@ func (b *builder) errorBranchSkipper(body *ast.BlockStmt, errObj types.Object, o
 	}
 	keys := map[edgeKey]bool{}
 	var stack []ast.Node
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			stack = stack[:len(stack)-1]
 			return true
@@ -5819,7 +5946,7 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 			used[o] = true
 		}
 	}
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		gs, ok := n.(*ast.GoStmt)
 		if !ok {
 			return true
@@ -6107,7 +6234,7 @@ func (b *builder) analyzeLifecycleBody(body *ast.BlockStmt, contexts map[types.O
 	}
 	g.CFG, _ = flowgraph.Build(kind, b.in.Fset, body, b.in.Info, b.trustedTerminator(contexts))
 	labels := labeledLoops(body)
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
@@ -6191,7 +6318,7 @@ func (b *builder) loopExitEvidence(loop *ast.ForStmt, label string, contexts map
 	}
 	breakDepth := 0
 	var breakable []bool
-	ast.Inspect(loop.Body, func(n ast.Node) bool {
+	b.inspect(loop.Body, func(n ast.Node) bool {
 		if n == nil {
 			if last := len(breakable) - 1; last >= 0 {
 				if breakable[last] {
@@ -6495,7 +6622,7 @@ func (b *builder) markFieldGroupEscapes(body ast.Node, groups []*groupState) {
 		}
 	}
 	var stack []ast.Node
-	ast.Inspect(body, func(n ast.Node) bool {
+	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			stack = stack[:len(stack)-1]
 			return true

@@ -2,7 +2,9 @@
 package analyzer
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"golang.org/x/tools/go/analysis"
 
@@ -105,7 +108,7 @@ func New() *analysis.Analyzer {
 	}
 	a.Flags.StringVar(&opts.configPath, "config", "", "path to lifeline YAML, TOML, or JSON configuration")
 	a.Flags.IntVar(&opts.maxFunctions, "max-functions", 0, "override the maximum number of functions analyzed per package")
-	a.Flags.StringVar(&opts.timeout, "timeout", "", "override the per-package analysis timeout metadata")
+	a.Flags.StringVar(&opts.timeout, "timeout", "", "override the per-package analysis timeout")
 	a.Flags.StringVar(&opts.ignoreRules, "ignore", "", "comma-separated rule identifiers to suppress")
 	a.Flags.StringVar(&opts.statusOut, "status-out", "", "append one JSON line per package with its coverage and run status to this file (a companion report: vet itself shows only diagnostics)")
 	a.Run = func(pass *analysis.Pass) (any, error) { return run(pass, opts) }
@@ -188,19 +191,37 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 	}
 	cwd, _ := os.Getwd()
 	kept := frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd)
-	program, err := frontend.Build(frontend.Input{
+	duration, err := cfg.Duration()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+	started := time.Now()
+	program, buildErr := frontend.BuildContext(ctx, frontend.Input{
 		Fset: pass.Fset, Files: kept, Pkg: pass.Pkg, Info: pass.TypesInfo, ExcludedFiles: len(pass.Files) - len(kept),
 		LookupFunctionSummary:  lookup,
 		LookupParamEffects:     lookupParam,
 		LookupParamDoneEffects: lookupParamDone,
 		LookupReturnFieldSites: lookupReturnFieldSites,
 	}, cfg)
-	if err != nil {
-		return nil, err
+	timedOut := errors.Is(buildErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+	if buildErr != nil && !timedOut {
+		return nil, buildErr
 	}
 
+	// Facts for functions that completed before a deadline remain valid;
+	// functions not completed simply export no fact, which downstream analysis
+	// already treats as unknown. Never manufacture facts for the interrupted body.
 	exportFunctionFacts(pass, program)
 	diags, status := engine.AnalyzeWithStatus(program, cfg)
+	if timedOut {
+		d := engine.TimeoutDiagnostic(cfg, time.Since(started), pass.Pkg.Path())
+		status = status.WithTimeout(d.Message)
+		if !engine.Ignored(cfg.Ignore, d.RuleID) {
+			diags = append(diags, d)
+		}
+	}
 	result := &Result{Package: pass.Pkg.Path(), Coverage: engine.Summarize(program), Status: status}
 	if opts.statusOut != "" {
 		if err := appendStatus(opts.statusOut, result); err != nil {

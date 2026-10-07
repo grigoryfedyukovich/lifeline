@@ -13,7 +13,6 @@ import (
 
 	"github.com/gfedyukovich/lifeline/internal/config"
 	"github.com/gfedyukovich/lifeline/internal/engine"
-	"github.com/gfedyukovich/lifeline/internal/model"
 	"github.com/gfedyukovich/lifeline/internal/report"
 	"github.com/gfedyukovich/lifeline/internal/version"
 )
@@ -166,7 +165,7 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	diags, coverage, status, err := analyzePatterns(ctx, patterns, cfg)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			d := timeoutDiagnostic(cfg, time.Since(start))
+			d := engine.TimeoutDiagnostic(cfg, time.Since(start), "")
 			// The timeout is part of the run status whether or not its
 			// diagnostic is displayed: hiding LL9001 hides a notice, not the
 			// fact that the run was cut short (audit finding F8).
@@ -188,17 +187,4 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 		return cfg.CIExitCode
 	}
 	return ExitOK
-}
-
-func timeoutDiagnostic(cfg config.Config, elapsed time.Duration) engine.Diagnostic {
-	return engine.Diagnostic{
-		SchemaVersion: version.ReportSchema,
-		RuleID:        "LL9001", Verdict: engine.Unknown,
-		Message:  fmt.Sprintf("analysis exceeded timeout %s after %s", cfg.Timeout, elapsed.Round(time.Millisecond)),
-		Position: model.Span{}, Protocol: "analysis-timeout",
-		Evidence:    []model.Evidence{{Kind: "timeout", Message: "partial results, if any, are incomplete"}},
-		Assumptions: []string{"the interrupted package may contain additional diagnostics"},
-		Bounds:      map[string]any{"max_functions": cfg.MaxFunctions, "timeout": cfg.Timeout},
-		ToolVersion: version.Version, Backend: version.Backend,
-	}
 }

@@ -77,7 +77,7 @@ Lifeline 0.1.1 is intentionally conservative and bounded.
 
 Things this status does **not** count, so a zero is not evidence of their absence: wrapper functions not declared in the configuration (they create no binding at all), unmodeled calls that never touched a tracked value, aliasing the model does not follow, function literals at package level, and the effects of reflection or generated dispatch. `excluded_files` counts files removed by `ignore_paths` or because they are generated, which were never analyzed. The status is function- and package-scoped like the analysis: under `go vet` it is per package (`-lifeline.status-out` writes one record each, and `go vet` also analyzes dependencies for facts, so the file contains a record for every package vet visited, not only the ones named on the command line).
 
-A timeout in standalone mode is recorded in the status, and its `LL9001` notice follows `ignore` like every other diagnostic. `fail_on_incomplete` and `fail_on_unsupported` read only the status. Timeouts are not enforced inside the frontend (they stop work between packages), so a timeout reports partial results and cannot bound a single large package; see the resource-control notes.
+A timeout in standalone mode is recorded in the status, and its `LL9001` notice follows `ignore` like every other diagnostic. `fail_on_incomplete` and `fail_on_unsupported` read only the status. The deadline is now propagated into frontend fixed points, receiver-owned AST walks, CFG construction, and local SSA-like construction; `go vet` applies the same timeout per package. Cancellation can therefore interrupt a large frontend analysis instead of being noticed only between packages. This is still cooperative rather than a hard process deadline: `parser.ParseFile` and `go/types.Config.Check` are synchronous/non-cooperative, and a few bounded helper scans observe cancellation only when they return. A very large parse or type-check can therefore overrun the configured timeout before the next checkpoint.
 
 ## False positives and negatives
 
@@ -93,6 +93,6 @@ A specific finding can be suppressed inline with a `//lifeline:ignore` comment. 
 
 ## Resource and timing limits
 
-Standalone root packages are analyzed concurrently, but parsing and type checking inside one package are synchronous. A deadline that expires during one of those phases is observed when the operation returns or the next cancellation boundary is reached.
+Standalone root packages are analyzed concurrently. Package loading checks cancellation between source files and before/after type checking; frontend fixed points and the main AST/CFG/local-IR traversals poll the deadline while they run. Vet uses the configured timeout as a per-package frontend deadline. Parsing one source file and Go type checking remain synchronous library calls, so cancellation during either is observed only after that call returns.
 
-End-to-end runtime is recorded in the evaluation document. Phase-separated parse/type-check/model/recognition/render timing is not yet emitted by the tool.
+There is still no node/edge/update or memory budget, and no process isolation for non-cooperative compiler operations. The timeout is therefore a cooperative resource control, not an exact wall-clock guarantee. End-to-end runtime is recorded in the evaluation document; phase-separated parse/type-check/model/recognition/render timing is not yet emitted by the tool.

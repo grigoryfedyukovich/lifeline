@@ -6,6 +6,7 @@
 package localssa
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -42,14 +43,33 @@ type Function struct {
 }
 
 func Build(name string, body *ast.BlockStmt, info *types.Info) Function {
+	f, _ := BuildContext(context.Background(), name, body, info)
+	return f
+}
+
+// BuildContext is Build with cooperative cancellation. It polls ctx for every
+// visited AST node and while collecting identifier uses so one large function
+// cannot make a standalone deadline wait for this debug/inspection IR to finish.
+func BuildContext(ctx context.Context, name string, body *ast.BlockStmt, info *types.Info) (Function, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	f := Function{Name: name}
 	versions := map[types.Object]int{}
+	var buildErr error
 	appendInstruction := func(op Op, n ast.Node, callee string, defs, uses []string) {
 		f.Instructions = append(f.Instructions, Instruction{
 			Index: len(f.Instructions), Op: op, Pos: n.Pos(), End: n.End(), Callee: callee, Defines: defs, Uses: uses,
 		})
 	}
 	ast.Inspect(body, func(n ast.Node) bool {
+		if buildErr != nil {
+			return false
+		}
+		if err := ctx.Err(); err != nil {
+			buildErr = err
+			return false
+		}
 		if n == nil {
 			return true
 		}
@@ -72,23 +92,23 @@ func Build(name string, body *ast.BlockStmt, info *types.Info) Function {
 				versions[obj]++
 				defs = append(defs, fmt.Sprintf("%s#%d", id.Name, versions[obj]))
 			}
-			appendInstruction(OpAssign, x, "", defs, identifierUses(x, info, versions))
+			appendInstruction(OpAssign, x, "", defs, identifierUsesContext(ctx, x, info, versions, &buildErr))
 		case *ast.CallExpr:
-			appendInstruction(OpCall, x, calleeName(info, x), nil, identifierUses(x, info, versions))
+			appendInstruction(OpCall, x, calleeName(info, x), nil, identifierUsesContext(ctx, x, info, versions, &buildErr))
 		case *ast.GoStmt:
-			appendInstruction(OpGo, x, calleeName(info, x.Call), nil, identifierUses(x, info, versions))
+			appendInstruction(OpGo, x, calleeName(info, x.Call), nil, identifierUsesContext(ctx, x, info, versions, &buildErr))
 		case *ast.DeferStmt:
-			appendInstruction(OpDefer, x, calleeName(info, x.Call), nil, identifierUses(x, info, versions))
+			appendInstruction(OpDefer, x, calleeName(info, x.Call), nil, identifierUsesContext(ctx, x, info, versions, &buildErr))
 		case *ast.ForStmt, *ast.RangeStmt:
-			appendInstruction(OpLoop, n, "", nil, identifierUses(n, info, versions))
+			appendInstruction(OpLoop, n, "", nil, identifierUsesContext(ctx, n, info, versions, &buildErr))
 		case *ast.SelectStmt:
-			appendInstruction(OpSelect, x, "", nil, identifierUses(x, info, versions))
+			appendInstruction(OpSelect, x, "", nil, identifierUsesContext(ctx, x, info, versions, &buildErr))
 		case *ast.ReturnStmt:
-			appendInstruction(OpReturn, x, "", nil, identifierUses(x, info, versions))
+			appendInstruction(OpReturn, x, "", nil, identifierUsesContext(ctx, x, info, versions, &buildErr))
 		}
 		return true
 	})
-	return f
+	return f, buildErr
 }
 
 func calleeName(info *types.Info, call *ast.CallExpr) string {
@@ -119,8 +139,20 @@ func calleeName(info *types.Info, call *ast.CallExpr) string {
 }
 
 func identifierUses(n ast.Node, info *types.Info, versions map[types.Object]int) []string {
+	var err error
+	return identifierUsesContext(context.Background(), n, info, versions, &err)
+}
+
+func identifierUsesContext(ctx context.Context, n ast.Node, info *types.Info, versions map[types.Object]int, buildErr *error) []string {
 	var out []string
 	ast.Inspect(n, func(child ast.Node) bool {
+		if *buildErr != nil {
+			return false
+		}
+		if err := ctx.Err(); err != nil {
+			*buildErr = err
+			return false
+		}
 		if _, ok := child.(*ast.FuncLit); ok && child != n {
 			return false
 		}
