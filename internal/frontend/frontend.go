@@ -153,8 +153,9 @@ type builder struct {
 	// consumes it (calls it, or further transfers it) -- Phase 5 of the
 	// AST->CFG migration (docs/cfg-migration-plan.md), "direct parameter
 	// passing", extended to multiple hops by a small interprocedural fixed
-	// point: Build calls computeParameterConsumption for every function
-	// repeatedly, not once, until no entry changes. A missing map entry
+	// point. Build solves it with a reverse-dependency worklist: every
+	// selected function is evaluated once, and only callers of a function
+	// whose summary grows are revisited. A missing map entry
 	// means "not computed yet, possibly still converging", never "verified
 	// not consumed" -- see argumentConsumed's pending return value, which
 	// is what lets a chain resolve correctly regardless of which order
@@ -174,12 +175,12 @@ type builder struct {
 	// yet") this analysis treats it as everywhere else, and is simply
 	// corrected upward on a later sweep if warranted.
 	paramDoneEffects map[types.Object]model.ParamEffect
-	// inParamPrepass is true only while computeParameterConsumption's own
-	// call into observeFunctionBody is on the stack. It tells observeCall
-	// to treat a "pending" dependency (argumentConsumed's third return
-	// value: a real, resolvable same-package callee whose own summary
-	// merely hasn't been computed by this iteration yet) as "no answer
-	// yet, try again next sweep" rather than falling back to "assume
+	// inParamPrepass is true only while computeParameterEffects' own call
+	// into observeFunctionBody is on the stack. It tells observeCall to
+	// treat a "pending" dependency (argumentEffects' third return value: a
+	// real, resolvable same-package callee whose own summary merely hasn't
+	// been computed yet) as "no answer yet; revisit me when that callee
+	// changes" rather than falling back to "assume
 	// transferred" -- that fallback is correct once and for all for a
 	// callee that can never be resolved (a different package, an
 	// interface method, a function value, a `...` spread), but would
@@ -554,59 +555,16 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 	// Pre-pass (Phase 5, docs/cfg-migration-plan.md): compute which
 	// cancel-like/group-like parameters each function's own body consumes,
 	// before any buildFunction call cross-references another function's
-	// result. This must run as its own pass, not be folded into
-	// buildFunction's main loop below: a caller earlier in file order than
-	// its callee would otherwise see an empty result for that callee
-	// purely due to processing order, not because the callee is genuinely
-	// unanalyzable.
-	//
-	// A single sweep over sources[:limit] is not enough on its own: a
-	// chain like A(c){B(c)}, B(c){C(c)}, C(c){/* consume */} needs C's
-	// result before B's can be computed, and B's before A's, so one pass
-	// only resolves as deep as declaration order happens to already
-	// support -- the exact "different analysis result purely from source
-	// order" problem this loop exists to remove. So this keeps re-running
-	// computeParameterConsumption for every function, in the same order
-	// each time, until a full sweep changes nothing: each sweep can only
-	// ever add information (a param's own recorded value can go from
-	// absent to known, or from known-false to known-true, never back --
-	// see argumentConsumed's "pending" case and inParamPrepass), so this
-	// is a small monotone fixed point over a lattice with two possible
-	// rises per parameter, guaranteeing termination in at most that many
-	// sweeps, and it converges to the same result regardless of which
-	// order the functions happen to be declared in. See argumentConsumed
-	// for how a lookup degrades safely (falls back to the prior
-	// unconditional-escape behavior) once the fixed point is reached and a
-	// callee still has no entry at all -- max_functions truncation being
-	// the main reason that would happen.
-	//
-	// computeParamDoneCalled runs in the same sweep, for the same
-	// structural reason (a named-worker's own "does it delegate to Done()
-	// eventually" answer can depend on a further helper's not-yet-computed
-	// one): it answers calleeDoneParamMatches's question -- does a
-	// sync.WaitGroup parameter eventually get Done() called on it,
-	// directly or via any number of further resolvable same-package
-	// functions -- which is independent of paramConsumption's own
-	// question and does not need its own separate loop.
-	for {
-		if err := ctx.Err(); err != nil {
-			return program, err
-		}
-		changed := false
-		for _, source := range sources[:limit] {
-			if err := ctx.Err(); err != nil {
-				return program, err
-			}
-			if b.computeParameterEffects(source.decl) {
-				changed = true
-			}
-			if b.computeParamDoneEffects(source.decl) {
-				changed = true
-			}
-		}
-		if !changed {
-			break
-		}
+	// result. A caller may depend on a callee declared later, so this is a
+	// monotone interprocedural fixed point. Do not solve it by repeatedly
+	// rescanning every selected function: computeParameterEffectFixedPoint
+	// indexes direct and supported single-assignment call dependencies once
+	// and only re-enqueues callers whose callee summary actually grew
+	// (audit finding F11). This preserves declaration-order independence and
+	// recursive convergence while avoiding whole-package rescans for a long
+	// delegation chain.
+	if err := b.computeParameterEffectFixedPoint(sources[:limit]); err != nil {
+		return program, err
 	}
 	// Two further pre-passes, run in this order and each over every
 	// function before the next begins, behind the "constructor-returned
@@ -1380,6 +1338,127 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 	b.singleAssignTargets = nil
 }
 
+// computeParameterEffectFixedPoint solves the same monotone parameter-
+// effect and WaitGroup-Done equations as the old whole-package sweep, but
+// revisits only functions whose inputs can have changed. Every selected
+// function is evaluated once initially. If its summary grows, only its
+// same-package callers are re-enqueued. A recursive edge naturally puts a
+// function/SCC back on the queue until it stabilizes.
+//
+// The reverse dependency index intentionally mirrors the call shapes the
+// effect analysis can resolve: ordinary direct functions/methods plus the
+// narrow single-assignment function-variable form supported by
+// resolveCalleeFunc. Over-approximating dependencies is harmless (it only
+// causes an extra recomputation); missing one would be unsound because a
+// caller could otherwise retain a stale summary.
+func (b *builder) computeParameterEffectFixedPoint(sources []funcSource) error {
+	if len(sources) == 0 {
+		return nil
+	}
+
+	indexByFunc := make(map[*types.Func]int, len(sources))
+	for i, source := range sources {
+		if source.obj != nil {
+			indexByFunc[source.obj] = i
+		}
+	}
+
+	// reverse[callee] contains selected caller indices. Keep each edge once
+	// even when the same caller invokes the same callee multiple times.
+	reverse := make([][]int, len(sources))
+	for callerIndex, source := range sources {
+		if err := b.ctx.Err(); err != nil {
+			return err
+		}
+		if source.decl == nil || source.decl.Body == nil {
+			continue
+		}
+		single := singleAssignmentTargets(source.decl.Body, b.in.Info)
+		seen := map[int]struct{}{}
+		b.inspect(source.decl.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callee := calledFuncForEffectDependency(call.Fun, b.in.Info, single)
+			calleeIndex, ok := indexByFunc[callee]
+			if !ok {
+				return true
+			}
+			if _, duplicate := seen[calleeIndex]; duplicate {
+				return true
+			}
+			seen[calleeIndex] = struct{}{}
+			reverse[calleeIndex] = append(reverse[calleeIndex], callerIndex)
+			return true
+		})
+		if b.err != nil {
+			return b.err
+		}
+	}
+
+	queue := make([]int, len(sources))
+	queued := make([]bool, len(sources))
+	for i := range sources {
+		queue[i] = i
+		queued[i] = true
+	}
+	for head := 0; head < len(queue); head++ {
+		if err := b.ctx.Err(); err != nil {
+			return err
+		}
+		i := queue[head]
+		queued[i] = false
+		source := sources[i]
+		changed := b.computeParameterEffects(source.decl)
+		if b.err != nil {
+			return b.err
+		}
+		if b.computeParamDoneEffects(source.decl) {
+			changed = true
+		}
+		if b.err != nil {
+			return b.err
+		}
+		if !changed {
+			continue
+		}
+		for _, caller := range reverse[i] {
+			if queued[caller] {
+				continue
+			}
+			queued[caller] = true
+			queue = append(queue, caller)
+		}
+	}
+	return nil
+}
+
+// calledFuncForEffectDependency resolves exactly the local call-target forms
+// that can make a caller's parameter-effect summary depend on a callee's
+// summary. The function-variable case deliberately matches resolveCalleeFunc:
+// only a bare local identifier whose single assignment is a bare function
+// identifier is followed.
+func calledFuncForEffectDependency(fun ast.Expr, info *types.Info, single map[types.Object]ast.Expr) *types.Func {
+	if fn, ok := calledObject(fun, info).(*types.Func); ok {
+		return fn
+	}
+	id, ok := fun.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	obj := info.ObjectOf(id)
+	if obj == nil {
+		return nil
+	}
+	target, ok := single[obj].(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	fn, _ := info.ObjectOf(target).(*types.Func)
+	return fn
+}
+
 // computeParameterConsumption (re)computes, for every cancel-like or
 // group-like parameter of fd, whether fd's own body consumes it, by
 // running the same Called/Escapes detection machinery used for
@@ -1392,13 +1471,12 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 // unconditionally trusting that passing it anywhere discharges the
 // caller's own obligation.
 //
-// Build calls this once per function per sweep, as part of a
-// fixed-point loop, not once ever: fd's own body may itself pass a
-// parameter on to another function whose result isn't known yet on an
-// early sweep, in which case that call contributes nothing this time
-// (see inParamPrepass and argumentConsumed's pending result) and fd's
-// recorded value may still rise on a later sweep once that dependency
-// resolves. Recording is monotone -- merged with whatever was already
+// Build calls this from a dependency-driven fixed-point worklist, not
+// just once: fd's own body may itself pass a parameter to another function
+// whose result is not known yet on the first visit. That call contributes
+// nothing until the callee summary grows, at which point the reverse call
+// dependency re-enqueues fd (see inParamPrepass and argumentEffects' pending
+// result). Recording is monotone -- merged with whatever was already
 // there, via OR, never overwritten with a lower value -- both because
 // that is the only direction new information moves in this analysis
 // (something already shown to be consumed stays consumed) and because
@@ -2350,10 +2428,9 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 					c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never calls or further transfers it", Span: ptrSpan(b.span(call))})
 				}
 			} else if pending && b.inParamPrepass {
-				// No answer yet this sweep; leave the binding as-is. If
-				// the callee really does consume it, that will surface as
-				// consumed==true here on a later sweep and this
-				// function's own recorded result will rise to match.
+				// No answer yet on this worklist visit; leave the binding
+				// as-is. If the callee summary grows, its reverse dependency
+				// re-enqueues this function and the result rises to match.
 			} else {
 				c.binding.Escapes = true
 			}
@@ -2434,7 +2511,7 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "parameter-not-consumed", Message: "passed as an argument, but the callee's own body never joins or further transfers it", Span: ptrSpan(b.span(call))})
 				}
 			} else if pending && b.inParamPrepass {
-				// No answer yet this sweep; see the cancel case above.
+				// No answer yet on this worklist visit; see the cancel case above.
 			} else {
 				g.group.Escapes = true
 			}
@@ -5175,14 +5252,15 @@ func (b *builder) calleeDoneEffect(call *ast.CallExpr, obj types.Object) model.P
 // statement's call, to a resolvable same-package function whose own
 // corresponding parameter -- per this same fixed point, one step further
 // along -- must call it (a discharge at that call) or may (a possible one).
-// Build calls this once per function per sweep, in the same loop as
-// computeParameterEffects and for the identical structural reason: a chain
+// Build calls this from the same dependency-driven worklist as
+// computeParameterEffects, for the identical structural reason: a chain
 // of several named helpers (`worker(wg){ helper(wg) }`,
 // `helper(wg){ wg.Done() }`) needs helper's own answer known before
 // worker's can be, regardless of declaration order. Unlike
 // computeParameterEffects, this needs no "pending" signal:
-// recordParamDoneEffects' union means a not-yet-grown entry mid-sweep is
-// just today's correct answer, and later sweeps can only ever add bits.
+// recordParamDoneEffects' union means a not-yet-grown entry on an early
+// worklist visit is just the current safe answer; later visits can only add
+// bits.
 //
 // The decision is the same one computeParameterEffects makes (see
 // paramEffectOf): only a call in code some normal path can reach counts, and
