@@ -219,16 +219,22 @@ type builder struct {
 	// Populated first by computeFieldOwnership's pre-pass (run once, for
 	// every function, before any caller-side check -- covers every
 	// function's own directly-declared binding), then grown further by
-	// computeConstructorCallerConsumption's own sweep (mirroring
-	// computeParameterConsumption's fixed point: this keeps re-running
-	// until a full sweep discovers no new site, so a chain of several
-	// pass-through wrappers is resolved regardless of which order the
-	// functions happen to be declared in) -- consumed by
+	// computeConstructorCallerConsumption's own dependency worklist (mirroring
+	// computeParameterEffects' worklist: when a wrapper gains a returned-field
+	// site, only callers of that wrapper are revisited, so pass-through chains
+	// resolve regardless of declaration order without whole-package rescans) -- consumed by
 	// computeConstructorCallerConsumption itself to know which functions
 	// are "constructors" worth checking callers of, and by
 	// recordReturnedField's own lookup into callerVerdicts below
 	// once every function's callers have been checked.
 	returnFieldInfo map[types.Object][]returnFieldSite
+	// returnFieldsByFunc is the callee-oriented index of returnFieldInfo.
+	// Constructor caller analysis is driven by calls to a particular
+	// function, so looking up that function directly avoids scanning every
+	// known binding/site for every call (audit finding F11). Entries are
+	// maintained only through appendReturnFieldSite, keeping both views in
+	// lockstep.
+	returnFieldsByFunc map[*types.Func][]returnFieldBindingSite
 	// callerVerdicts records, for the same binding-object keys as
 	// returnFieldInfo, one verified verdict PER CONSTRUCTOR CALL SITE (and
 	// per result/field site, for a binding reachable through several):
@@ -318,7 +324,7 @@ type returnFieldSite struct {
 	// itself rather than being re-derived from bindingObj's own static
 	// type at each use: bindingObj is a real cancel/group-typed variable
 	// only for a site computeFieldOwnership registered directly: once
-	// computeConstructorCallerConsumption's own fixed-point sweep chains
+	// computeConstructorCallerConsumption's own fixed-point worklist chains
 	// through a cross-package-originated site (whose bindingObj is a
 	// *types.Func substitute -- see Input.LookupReturnFieldSites' doc
 	// comment -- not a real variable), re-deriving kind from that
@@ -328,6 +334,15 @@ type returnFieldSite struct {
 	// means that break can't happen regardless of which bindingObj a
 	// given site happens to be keyed under.
 	kind string
+}
+
+// returnFieldBindingSite is the callee-indexed view of one
+// returnFieldInfo entry. Keeping the original binding identity beside the
+// site lets constructor caller analysis update the same per-binding verdict
+// maps without a global scan to recover that identity.
+type returnFieldBindingSite struct {
+	bindingObj types.Object
+	site       returnFieldSite
 }
 
 // fieldCapture records a lifecycle binding (a cancel function or a join
@@ -479,24 +494,25 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 		ctx = context.Background()
 	}
 	b := &builder{
-		ctx:               ctx,
-		in:                in,
-		cfg:               cfg,
-		funcs:             map[*types.Func]*ast.FuncDecl{},
-		analyzed:          map[*types.Func]bool{},
-		summaries:         map[*types.Func]model.Goroutine{},
-		fieldGroupObjects: map[fieldGroupKey]*types.Var{},
-		fieldGroupOwners:  map[*types.Var]fieldGroupKey{},
-		paramEffects:      map[types.Object]model.ParamEffect{},
-		paramDoneEffects:  map[types.Object]model.ParamEffect{},
-		returnFieldInfo:   map[types.Object][]returnFieldSite{},
-		callerVerdicts:    map[types.Object]map[callerSiteKey]callerVerdict{},
-		contextInterface:  findContextInterface(in.Pkg),
-		contextFactories:  stringSet(cfg.ContextWrappers),
-		startWrappers:     stringSet(cfg.StartWrappers),
-		joinWrappers:      stringSet(cfg.JoinWrappers),
-		stopWrappers:      stringSet(cfg.StopWrappers),
-		receiverSummaries: map[types.Object]*receiverSummary{},
+		ctx:                ctx,
+		in:                 in,
+		cfg:                cfg,
+		funcs:              map[*types.Func]*ast.FuncDecl{},
+		analyzed:           map[*types.Func]bool{},
+		summaries:          map[*types.Func]model.Goroutine{},
+		fieldGroupObjects:  map[fieldGroupKey]*types.Var{},
+		fieldGroupOwners:   map[*types.Var]fieldGroupKey{},
+		paramEffects:       map[types.Object]model.ParamEffect{},
+		paramDoneEffects:   map[types.Object]model.ParamEffect{},
+		returnFieldInfo:    map[types.Object][]returnFieldSite{},
+		returnFieldsByFunc: map[*types.Func][]returnFieldBindingSite{},
+		callerVerdicts:     map[types.Object]map[callerSiteKey]callerVerdict{},
+		contextInterface:   findContextInterface(in.Pkg),
+		contextFactories:   stringSet(cfg.ContextWrappers),
+		startWrappers:      stringSet(cfg.StartWrappers),
+		joinWrappers:       stringSet(cfg.JoinWrappers),
+		stopWrappers:       stringSet(cfg.StopWrappers),
+		receiverSummaries:  map[types.Object]*receiverSummary{},
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
@@ -583,22 +599,8 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 		}
 		b.computeFieldOwnership(source)
 	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return program, err
-		}
-		changed := false
-		for _, source := range sources[:limit] {
-			if err := ctx.Err(); err != nil {
-				return program, err
-			}
-			if b.computeConstructorCallerConsumption(source) {
-				changed = true
-			}
-		}
-		if !changed {
-			break
-		}
+	if err := b.computeConstructorConsumptionFixedPoint(sources[:limit]); err != nil {
+		return program, err
 	}
 	for _, source := range sources[:limit] {
 		if err := ctx.Err(); err != nil {
@@ -4253,7 +4255,7 @@ func (b *builder) attachCallerFindings(program *model.Program) {
 // appendReturnFieldSite adds newSite to b.returnFieldInfo[bindingObj] if
 // no existing entry for the same (fn, result index, field) is already
 // there, and reports whether it actually added one -- what drives
-// computeConstructorCallerConsumption's own fixed-point sweep (see its
+// computeConstructorCallerConsumption's own fixed-point worklist (see its
 // own doc comment): re-discovering the same site on a later sweep is not
 // new information, and must not be reported as such, or the sweep would
 // never converge. The identity includes the result index and field name
@@ -4267,6 +4269,9 @@ func (b *builder) appendReturnFieldSite(bindingObj types.Object, newSite returnF
 		}
 	}
 	b.returnFieldInfo[bindingObj] = append(b.returnFieldInfo[bindingObj], newSite)
+	if newSite.fn != nil {
+		b.returnFieldsByFunc[newSite.fn] = append(b.returnFieldsByFunc[newSite.fn], returnFieldBindingSite{bindingObj: bindingObj, site: newSite})
+	}
 	return true
 }
 
@@ -4299,17 +4304,20 @@ func (b *builder) appendReturnFieldSite(bindingObj types.Object, newSite returnF
 // carry. This becomes model.Function.ReturnFieldSites; see
 // analyzer.go's fact export and Input.LookupReturnFieldSites.
 func (b *builder) exportedReturnFieldSites(fnObj *types.Func) []model.ReturnFieldSite {
-	if fnObj == nil || len(b.returnFieldInfo) == 0 {
+	if fnObj == nil {
 		return nil
 	}
-	var out []model.ReturnFieldSite
-	for _, sites := range b.returnFieldInfo {
-		for _, site := range sites {
-			if site.fn != fnObj || site.kind == "" {
-				continue
-			}
-			out = append(out, model.ReturnFieldSite{ResultIndex: site.resultIndex, FieldName: site.fieldName, Kind: site.kind})
+	indexed := b.returnFieldsByFunc[fnObj]
+	if len(indexed) == 0 {
+		return nil
+	}
+	out := make([]model.ReturnFieldSite, 0, len(indexed))
+	for _, entry := range indexed {
+		site := entry.site
+		if site.kind == "" {
+			continue
 		}
+		out = append(out, model.ReturnFieldSite{ResultIndex: site.resultIndex, FieldName: site.fieldName, Kind: site.kind})
 	}
 	return out
 }
@@ -4326,6 +4334,115 @@ func (b *builder) computeFieldOwnership(source funcSource) {
 	}
 	captures, _ := b.collectFieldCaptures(fd.Body, cancels, groups)
 	b.resolveFieldCaptures(source.obj, fd.Body, captures)
+}
+
+// computeConstructorConsumptionFixedPoint solves constructor pass-through
+// propagation without rescanning every selected function after each newly
+// discovered wrapper. Every function is checked once initially. When checking
+// source i discovers that source.obj itself forwards a constructor-owned
+// field, only selected callers of source.obj can learn anything new, so only
+// those callers are re-enqueued. This is the constructor analogue of
+// computeParameterEffectFixedPoint and removes the whole-package sweep called
+// out in audit finding F11.
+func (b *builder) computeConstructorConsumptionFixedPoint(sources []funcSource) error {
+	if len(sources) == 0 || (len(b.returnFieldInfo) == 0 && b.in.LookupReturnFieldSites == nil) {
+		return nil
+	}
+
+	indexByFunc := make(map[*types.Func]int, len(sources))
+	for i, source := range sources {
+		if source.obj != nil {
+			indexByFunc[source.obj] = i
+		}
+	}
+
+	// reverse[callee] lists selected callers containing a direct call to that
+	// callee. computeConstructorCallerConsumption resolves exactly these
+	// calledObject forms, so this dependency index matches its semantics.
+	reverse := make([][]int, len(sources))
+	for callerIndex, source := range sources {
+		if err := b.ctx.Err(); err != nil {
+			return err
+		}
+		if source.decl == nil || source.decl.Body == nil {
+			continue
+		}
+		seen := map[int]struct{}{}
+		funcDepth := 0
+		var nodeIsFuncLit []bool
+		b.inspect(source.decl.Body, func(n ast.Node) bool {
+			if n == nil {
+				last := len(nodeIsFuncLit) - 1
+				if last >= 0 {
+					if nodeIsFuncLit[last] {
+						funcDepth--
+					}
+					nodeIsFuncLit = nodeIsFuncLit[:last]
+				}
+				return true
+			}
+			_, isFuncLit := n.(*ast.FuncLit)
+			nodeIsFuncLit = append(nodeIsFuncLit, isFuncLit)
+			if isFuncLit {
+				funcDepth++
+			}
+			if funcDepth > 0 {
+				return true
+			}
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callee, ok := calledObject(call.Fun, b.in.Info).(*types.Func)
+			if !ok {
+				return true
+			}
+			calleeIndex, ok := indexByFunc[callee]
+			if !ok {
+				return true
+			}
+			if _, duplicate := seen[calleeIndex]; duplicate {
+				return true
+			}
+			seen[calleeIndex] = struct{}{}
+			reverse[calleeIndex] = append(reverse[calleeIndex], callerIndex)
+			return true
+		})
+		if b.err != nil {
+			return b.err
+		}
+	}
+
+	queue := make([]int, len(sources))
+	queued := make([]bool, len(sources))
+	for i := range sources {
+		queue[i] = i
+		queued[i] = true
+	}
+	for head := 0; head < len(queue); head++ {
+		if err := b.ctx.Err(); err != nil {
+			return err
+		}
+		i := queue[head]
+		queued[i] = false
+		if !b.computeConstructorCallerConsumption(sources[i]) {
+			if b.err != nil {
+				return b.err
+			}
+			continue
+		}
+		if b.err != nil {
+			return b.err
+		}
+		for _, caller := range reverse[i] {
+			if queued[caller] {
+				continue
+			}
+			queued[caller] = true
+			queue = append(queue, caller)
+		}
+	}
+	return nil
 }
 
 // computeConstructorCallerConsumption is the second of the two
@@ -4349,19 +4466,16 @@ func (b *builder) computeFieldOwnership(source funcSource) {
 // position, since a bare pass-through forwards every position
 // unchanged).
 //
-// Unlike its own original one-hop version, this is now a fixed point,
-// the same structural shape as computeParameterConsumption's (Build
-// keeps re-running it, over every function, until a full sweep
-// registers no new b.returnFieldInfo site): when a caller itself just
-// returns the value onward again (either shape above) -- previously a
-// dead end, out of scope -- it is now registered as an additional,
-// equally valid site for the same binding (appendReturnFieldSite), so a
-// *further* caller of that pass-through function is checked too, to any
-// number of hops, and (since Build's sweep processes every function
-// every pass) regardless of which order the functions happen to be
-// declared in. reportChanged is true iff this call registered at least
-// one new site, which is what tells Build's sweep loop whether another
-// pass is needed. A call this check cannot resolve at all (an interface
+// Unlike its own original one-hop version, this is now part of a fixed
+// point solved by computeConstructorConsumptionFixedPoint's reverse-call
+// worklist: when a caller itself just returns the value onward again
+// (either shape above) -- previously a dead end, out of scope -- it is
+// registered as an additional, equally valid site for the same binding
+// (appendReturnFieldSite), and only callers of that newly recognized
+// wrapper are re-enqueued. A chain therefore resolves to any number of
+// hops regardless of declaration order without repeated package-wide
+// sweeps. reportChanged is true iff this call registered at least one
+// new site, which is what triggers those dependent callers. A call this check cannot resolve at all (an interface
 // method, or a different package with no fact available) records
 // nothing; a call whose handle is used somewhere this check does not
 // follow is recorded as unverified in b.callerVerdicts. Neither yields a
@@ -4418,14 +4532,10 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 		if rs, ok := n.(*ast.ReturnStmt); ok && len(rs.Results) == 1 && source.obj != nil {
 			if call, ok := rs.Results[0].(*ast.CallExpr); ok {
 				if calleeObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func); ok {
-					for bindingObj, sites := range b.returnFieldInfo {
-						for _, site := range sites {
-							if site.fn != calleeObj {
-								continue
-							}
-							if b.appendReturnFieldSite(bindingObj, returnFieldSite{fieldName: site.fieldName, resultIndex: site.resultIndex, fn: source.obj, kind: site.kind}) {
-								reportChanged = true
-							}
+					for _, entry := range b.returnFieldsByFunc[calleeObj] {
+						site := entry.site
+						if b.appendReturnFieldSite(entry.bindingObj, returnFieldSite{fieldName: site.fieldName, resultIndex: site.resultIndex, fn: source.obj, kind: site.kind}) {
+							reportChanged = true
 						}
 					}
 					if b.funcs[calleeObj] == nil && b.in.LookupReturnFieldSites != nil {
@@ -4453,36 +4563,35 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 		if !ok {
 			return true
 		}
-		matchedLocally := false
-		for bindingObj, sites := range b.returnFieldInfo {
-			for _, site := range sites {
-				if site.fn != calleeObj || site.resultIndex >= len(as.Lhs) {
-					continue
-				}
-				matchedLocally = true
-				lhs, ok := as.Lhs[site.resultIndex].(*ast.Ident)
-				if !ok || lhs.Name == "_" {
-					continue
-				}
-				varObj := b.in.Info.ObjectOf(lhs)
-				if varObj == nil {
-					continue
-				}
-				kind := site.kind
-				if kind == "" {
-					// A site predating this field's introduction, or one
-					// whose kind was never resolvable, is not something to
-					// re-derive from bindingObj.Type() here: bindingObj is
-					// only a real cancel/group-typed variable for a site
-					// computeFieldOwnership registered directly, never for
-					// one this fixed point chained through a cross-package
-					// substitute (see returnFieldSite.kind's own doc
-					// comment) -- skip rather than guess.
-					continue
-				}
-				if b.verifyConstructorCallerField(fd.Body, bindingObj, kind, varObj, site, source.obj, callerCFG, callerCallSites, call, name) {
-					reportChanged = true
-				}
+		indexedSites := b.returnFieldsByFunc[calleeObj]
+		matchedLocally := len(indexedSites) != 0
+		for _, entry := range indexedSites {
+			bindingObj, site := entry.bindingObj, entry.site
+			if site.resultIndex >= len(as.Lhs) {
+				continue
+			}
+			lhs, ok := as.Lhs[site.resultIndex].(*ast.Ident)
+			if !ok || lhs.Name == "_" {
+				continue
+			}
+			varObj := b.in.Info.ObjectOf(lhs)
+			if varObj == nil {
+				continue
+			}
+			kind := site.kind
+			if kind == "" {
+				// A site predating this field's introduction, or one
+				// whose kind was never resolvable, is not something to
+				// re-derive from bindingObj.Type() here: bindingObj is
+				// only a real cancel/group-typed variable for a site
+				// computeFieldOwnership registered directly, never for
+				// one this fixed point chained through a cross-package
+				// substitute (see returnFieldSite.kind's own doc
+				// comment) -- skip rather than guess.
+				continue
+			}
+			if b.verifyConstructorCallerField(fd.Body, bindingObj, kind, varObj, site, source.obj, callerCFG, callerCallSites, call, name) {
+				reportChanged = true
 			}
 		}
 		// calleeObj has no same-package returnFieldInfo entry -- either
@@ -4544,7 +4653,7 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 // site's.
 // reportChanged is true iff that registration actually added something
 // new, which is what drives computeConstructorCallerConsumption's own
-// fixed-point sweep.
+// fixed-point worklist.
 func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindingObj types.Object, kind string, varObj types.Object, site returnFieldSite, callerFn *types.Func, callerCFG *model.CFG, callerCallSites map[*ast.CallExpr]flowgraph.CallSite, call *ast.CallExpr, callerName string) (reportChanged bool) {
 	key := callerSiteKey{call: call, resultIndex: site.resultIndex, fieldName: site.fieldName}
 	fc := &fieldCapture{varObj: varObj, fieldName: site.fieldName, returnIndex: -1}
@@ -5309,7 +5418,8 @@ func (b *builder) computeParamDoneEffects(fd *ast.FuncDecl) (reportChanged bool)
 
 // recordParamDoneEffects merges next into b.paramDoneEffects[obj] by union
 // and reports whether the recorded value changed, which is what tells
-// Build's sweep loop whether another pass is needed.
+// computeParameterEffectFixedPoint's worklist whether dependent callers need
+// reevaluation.
 func (b *builder) recordParamDoneEffects(obj types.Object, next model.ParamEffect) bool {
 	prev := b.paramDoneEffects[obj]
 	merged := prev | next

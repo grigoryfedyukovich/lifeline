@@ -3450,8 +3450,8 @@ func Start(parent context.Context) {
 func TestFieldOwnership_ConstructorThreeHopCallerFirstDeclaredStillVerifies(t *testing.T) {
 	// Start (the eventual dropper) is declared before Outer, which is
 	// declared before Middle, which is declared before New -- the
-	// harder direction, requiring the sweep to run to convergence rather
-	// than resolving in a single declaration-order pass.
+	// harder direction, requiring dependency-driven reevaluation to reach callers declared
+	// before the wrappers they depend on.
 	drop := analyzeSource(t, `package p
 import "context"
 type Handle struct{ Cancel context.CancelFunc }
@@ -5070,5 +5070,30 @@ func Start(parent context.Context) {
 `)
 	if len(diags) != 0 {
 		t.Fatalf("a stop signal CFG-ordered before Wait() should not fire, got %#v", diags)
+	}
+}
+
+func TestAppendReturnFieldSiteMaintainsCalleeIndex(t *testing.T) {
+	b := &builder{
+		returnFieldInfo:    map[types.Object][]returnFieldSite{},
+		returnFieldsByFunc: map[*types.Func][]returnFieldBindingSite{},
+	}
+	pkg := types.NewPackage("example.test/p", "p")
+	callee := types.NewFunc(token.NoPos, pkg, "NewHandle", types.NewSignatureType(nil, nil, nil, types.NewTuple(), types.NewTuple(), false))
+	binding := types.NewVar(token.NoPos, pkg, "cancel", types.NewSignatureType(nil, nil, nil, types.NewTuple(), types.NewTuple(), false))
+	site := returnFieldSite{fieldName: "Cancel", resultIndex: 0, fn: callee, kind: "cancel"}
+
+	if !b.appendReturnFieldSite(binding, site) {
+		t.Fatal("first site insertion should report new information")
+	}
+	if b.appendReturnFieldSite(binding, site) {
+		t.Fatal("duplicate site insertion should not report new information")
+	}
+	if got := len(b.returnFieldInfo[binding]); got != 1 {
+		t.Fatalf("binding index has %d entries, want 1", got)
+	}
+	indexed := b.returnFieldsByFunc[callee]
+	if len(indexed) != 1 || indexed[0].bindingObj != binding || indexed[0].site.fieldName != "Cancel" {
+		t.Fatalf("callee index = %#v, want one matching binding/site", indexed)
 	}
 }
