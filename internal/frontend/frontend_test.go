@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"context"
 	"go/ast"
 	"go/importer"
 	"go/parser"
@@ -5095,5 +5096,54 @@ func TestAppendReturnFieldSiteMaintainsCalleeIndex(t *testing.T) {
 	indexed := b.returnFieldsByFunc[callee]
 	if len(indexed) != 1 || indexed[0].bindingObj != binding || indexed[0].site.fieldName != "Cancel" {
 		t.Fatalf("callee index = %#v, want one matching binding/site", indexed)
+	}
+}
+
+func TestStructuralCFGCacheReusesBodyAcrossPasses(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", `package p
+func helper() {}
+func f(ok bool) {
+	if ok { helper() }
+}
+`, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/cache", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body *ast.BlockStmt
+	for _, decl := range file.Decls {
+		if fd, ok := decl.(*ast.FuncDecl); ok && fd.Name.Name == "f" {
+			body = fd.Body
+			break
+		}
+	}
+	if body == nil {
+		t.Fatal("function body not found")
+	}
+	b := &builder{ctx: context.Background(), in: Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info}}
+	first, firstSites, err := b.structuralCFG("p.f", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondSites, err := b.structuralCFG("p.f", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("same body rebuilt instead of reusing cached structural CFG")
+	}
+	if len(b.structuralCFGs) != 1 {
+		t.Fatalf("structural CFG cache size = %d, want 1", len(b.structuralCFGs))
+	}
+	if len(firstSites) == 0 || len(secondSites) != len(firstSites) {
+		t.Fatalf("cached call-site index mismatch: first=%d second=%d", len(firstSites), len(secondSites))
 	}
 }

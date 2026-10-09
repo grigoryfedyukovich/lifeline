@@ -235,6 +235,16 @@ type builder struct {
 	// maintained only through appendReturnFieldSite, keeping both views in
 	// lockstep.
 	returnFieldsByFunc map[*types.Func][]returnFieldBindingSite
+	// structuralCFGs caches the purely structural (no trusted-stop edges)
+	// control-flow graph and call-site index for each function body. The
+	// parameter-effect, Done-effect, constructor-caller, and final ordering
+	// passes all ask questions over the same structural graph; rebuilding it
+	// independently in every pass was one of the repeated-allocation hotspots
+	// called out by audit finding F11. Graphs and call-site maps are immutable
+	// after construction, so sharing them is safe. Trusted lifecycle CFGs are
+	// deliberately not stored here because their extra stop edges depend on
+	// the function's tracked contexts.
+	structuralCFGs map[*ast.BlockStmt]structuralCFG
 	// callerVerdicts records, for the same binding-object keys as
 	// returnFieldInfo, one verified verdict PER CONSTRUCTOR CALL SITE (and
 	// per result/field site, for a binding reachable through several):
@@ -286,6 +296,34 @@ type builder struct {
 	// a mix) from looping forever. See handleSummaryOf.
 	receiverSummaries map[types.Object]*receiverSummary
 	receiverStack     []types.Object
+}
+
+type structuralCFG struct {
+	graph     *model.CFG
+	callSites map[*ast.CallExpr]flowgraph.CallSite
+}
+
+// structuralCFG returns the one purely structural CFG for body used by all
+// frontend passes. The name is display metadata only in internal/cfg and does
+// not affect graph structure, so the body pointer is the correct cache key.
+// Failed or cancelled builds are never cached: callers see the error and a
+// later analysis cannot accidentally reuse a partial graph as complete.
+func (b *builder) structuralCFG(name string, body *ast.BlockStmt) (*model.CFG, map[*ast.CallExpr]flowgraph.CallSite, error) {
+	if body == nil {
+		return flowgraph.BuildContext(b.ctx, name, b.in.Fset, body, b.in.Info, nil)
+	}
+	if cached, ok := b.structuralCFGs[body]; ok {
+		return cached.graph, cached.callSites, nil
+	}
+	if b.structuralCFGs == nil {
+		b.structuralCFGs = map[*ast.BlockStmt]structuralCFG{}
+	}
+	g, sites, err := flowgraph.BuildContext(b.ctx, name, b.in.Fset, body, b.in.Info, nil)
+	if err != nil {
+		return g, sites, err
+	}
+	b.structuralCFGs[body] = structuralCFG{graph: g, callSites: sites}
+	return g, sites, nil
 }
 
 func (b *builder) cancelled() bool {
@@ -506,6 +544,7 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 		paramDoneEffects:   map[types.Object]model.ParamEffect{},
 		returnFieldInfo:    map[types.Object][]returnFieldSite{},
 		returnFieldsByFunc: map[*types.Func][]returnFieldBindingSite{},
+		structuralCFGs:     map[*ast.BlockStmt]structuralCFG{},
 		callerVerdicts:     map[types.Object]map[callerSiteKey]callerVerdict{},
 		contextInterface:   findContextInterface(in.Pkg),
 		contextFactories:   stringSet(cfg.ContextWrappers),
@@ -903,10 +942,11 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	// making every cleanup look skippable. (The trusted call itself no
 	// longer hides the code after it -- see internal/cfg's Build -- but
 	// the extra exit edge still would distort this question.) So this
-	// builds its own, separate, purely structural CFG (nil trust
-	// predicate) rather than reusing fn.BodyLifecycle.CFG, at the cost of
-	// building the CFG twice per function.
-	orderingCFG, orderingCallBlocks, err := flowgraph.BuildContext(b.ctx, name, b.in.Fset, fd.Body, b.in.Info, nil)
+	// uses the body's cached purely structural CFG (nil trust predicate)
+	// rather than fn.BodyLifecycle.CFG. Earlier pre-passes may already have
+	// built this graph, so ordering does not allocate another copy (audit
+	// finding F11).
+	orderingCFG, orderingCallBlocks, err := b.structuralCFG(name, fd.Body)
 	if err != nil {
 		b.err = err
 		return fn
@@ -1589,7 +1629,11 @@ func (b *builder) computeParameterEffects(fd *ast.FuncDecl) (reportChanged bool)
 	if obj, ok := b.in.Info.Defs[fd.Name].(*types.Func); ok && obj != nil {
 		name = obj.FullName()
 	}
-	cfgraph, sites := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
+	cfgraph, sites, err := b.structuralCFG(name, fd.Body)
+	if err != nil {
+		b.err = err
+		return reportChanged
+	}
 	deferred := deferredCallSet(fd.Body)
 	for _, c := range paramCancels {
 		next := b.paramEffectOf(fd.Body, cfgraph, sites, deferred, c.cancelObj, c.callSites, c.mayCalls, c.recCalls, c.binding.Escapes, c.returned)
@@ -4490,18 +4534,20 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 	if fd.Body == nil {
 		return false
 	}
-	// Built once per caller (not per matched call site below) and reused
-	// across every verifyConstructorCallerField call this invocation makes:
-	// the "on all paths" question for a consuming call site is about this
-	// caller's own control flow, never the constructor's, so it needs a
-	// fresh, purely structural CFG for callerBody itself, the same kind
-	// computeOrdering already builds separately from BodyLifecycle.CFG for
-	// the identical reason (see that call site's own comment).
+	// The "on all paths" question for a consuming call site is about this
+	// caller's own control flow, never the constructor's. Reuse the one
+	// purely structural CFG cached for this body: parameter effects, final
+	// ordering, and constructor verification all ask compatible reachability
+	// questions over the same graph (audit finding F11).
 	name := fd.Name.Name
 	if source.obj != nil {
 		name = source.obj.FullName()
 	}
-	callerCFG, callerCallSites := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
+	callerCFG, callerCallSites, err := b.structuralCFG(name, fd.Body)
+	if err != nil {
+		b.err = err
+		return false
+	}
 	funcDepth := 0
 	var nodeIsFuncLit []bool
 	b.inspect(fd.Body, func(n ast.Node) bool {
@@ -5399,7 +5445,11 @@ func (b *builder) computeParamDoneEffects(fd *ast.FuncDecl) (reportChanged bool)
 	if self != nil {
 		name = self.FullName()
 	}
-	cfgraph, sites := flowgraph.Build(name, b.in.Fset, fd.Body, b.in.Info, nil)
+	cfgraph, sites, err := b.structuralCFG(name, fd.Body)
+	if err != nil {
+		b.err = err
+		return reportChanged
+	}
 	deferred := deferredCallSet(fd.Body)
 	b.deadLiterals = b.deadFuncLits(fd.Body)
 	defer func() { b.deadLiterals = nil }()
