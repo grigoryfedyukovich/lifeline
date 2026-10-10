@@ -933,8 +933,9 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		return fn
 	}
 	resolveAliasEscapes(states, groups)
-	b.computeGroupBalances(groups, fd.Body, b.in.Info)
-	b.computeGroupRoundBalances(groups, fd.Body, b.in.Info)
+	groupIndex := buildGroupBalanceIndex(fd.Body, groups, b.in.Info)
+	b.computeGroupBalances(groups, fd.Body, b.in.Info, groupIndex)
+	b.computeGroupRoundBalances(groups, fd.Body, b.in.Info, groupIndex)
 	if b.cancelled() {
 		return fn
 	}
@@ -4857,6 +4858,101 @@ type loopScope struct {
 	otherActivity bool
 }
 
+// groupBalanceIndex is a per-function index of the WaitGroup objects that
+// occur beneath each statement, plus the locations of bare top-level Wait
+// calls. Building it once lets the per-group accounting passes skip
+// unrelated subtrees instead of rescanning the whole function once for
+// every tracked group (audit finding F11).
+type groupBalanceIndex struct {
+	relevant      map[ast.Stmt]map[types.Object]struct{}
+	topLevel      []ast.Stmt
+	waitPositions map[types.Object][]int
+}
+
+func buildGroupBalanceIndex(body *ast.BlockStmt, groups []*groupState, info *types.Info) *groupBalanceIndex {
+	idx := &groupBalanceIndex{
+		relevant:      map[ast.Stmt]map[types.Object]struct{}{},
+		waitPositions: map[types.Object][]int{},
+	}
+	if body == nil || info == nil {
+		return idx
+	}
+	targets := map[types.Object]struct{}{}
+	for _, g := range groups {
+		if g != nil && g.group.Kind == "waitgroup" && g.obj != nil {
+			targets[g.obj] = struct{}{}
+		}
+	}
+	if len(targets) == 0 {
+		return idx
+	}
+
+	// One AST traversal records which tracked group objects occur below
+	// each enclosing statement. This is only a skip index: extra marks are
+	// harmless, while a missing mark could skip a real event. Therefore we
+	// deliberately include identifiers inside nested literals as well; the
+	// semantic walker below still decides which such uses actually count.
+	var stack []ast.Node
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			return true
+		}
+		stack = append(stack, n)
+		id, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		obj := info.Uses[id]
+		if obj == nil {
+			obj = info.Defs[id]
+		}
+		if _, ok := targets[obj]; !ok {
+			return true
+		}
+		for _, ancestor := range stack {
+			stmt, ok := ancestor.(ast.Stmt)
+			if !ok {
+				continue
+			}
+			set := idx.relevant[stmt]
+			if set == nil {
+				set = map[types.Object]struct{}{}
+				idx.relevant[stmt] = set
+			}
+			set[obj] = struct{}{}
+		}
+		return true
+	})
+
+	idx.topLevel = flattenTopLevelStmts(body.List)
+	for pos, stmt := range idx.topLevel {
+		exprStmt, ok := stmt.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		call, ok := exprStmt.X.(*ast.CallExpr)
+		if !ok || selectorMethod(call.Fun) != "Wait" {
+			continue
+		}
+		obj := selectorReceiverObject(call.Fun, info)
+		if _, ok := targets[obj]; ok {
+			idx.waitPositions[obj] = append(idx.waitPositions[obj], pos)
+		}
+	}
+	return idx
+}
+
+func (i *groupBalanceIndex) has(stmt ast.Stmt, obj types.Object) bool {
+	if i == nil || stmt == nil || obj == nil {
+		return false
+	}
+	_, ok := i.relevant[stmt][obj]
+	return ok
+}
+
 // computeGroupBalances fills in CountMismatch for every local WaitGroup in
 // groups (Phase 6, "count intervals" and "common Add/Done relationships",
 // docs/cfg-migration-plan.md): a second, narrower pass over the same
@@ -4871,12 +4967,12 @@ type loopScope struct {
 // what is and isn't recognized; CountMismatch is set only from a positive
 // literal proof of imbalance, never from an inability to fully account for
 // every call site.
-func (b *builder) computeGroupBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info) {
+func (b *builder) computeGroupBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info, index *groupBalanceIndex) {
 	for _, g := range groups {
 		if g.group.Kind != "waitgroup" || g.obj == nil {
 			continue
 		}
-		bal := b.walkGroupBalance(body, g.obj, info)
+		bal := b.walkGroupBalance(body, g.obj, info, index)
 		if bal.fullyKnown && bal.addTotal > bal.doneTotal {
 			g.group.CountMismatch = true
 			g.group.Evidence = append(g.group.Evidence, model.Evidence{
@@ -4898,8 +4994,9 @@ func (b *builder) computeGroupBalances(groups []*groupState, body *ast.BlockStmt
 // anything.
 //
 // The fix: split the function's own top-level statement sequence into
-// segments at each bare, top-level `wg.Wait()` call (splitAtTopLevelWait)
-// and evaluate each segment against the *specific* thing that could go
+// segments at each bare, top-level `wg.Wait()` call. buildGroupBalanceIndex
+// records those boundaries once per function, and this pass evaluates each
+// segment against the *specific* thing that could go
 // wrong for it:
 //
 //   - The segment after this group's last Wait() call (the "trailing"
@@ -4932,36 +5029,26 @@ func (b *builder) computeGroupBalances(groups []*groupState, body *ast.BlockStmt
 // unconditionally close a round the way a bare, top-level one does, and
 // reasoning about that soundly would mean the interval/temporal analysis
 // this stays narrow enough to avoid. A `defer wg.Wait()` is deliberately
-// not treated as a boundary either (isWaitCall only matches a bare
-// expression statement, not a DeferStmt): it runs at function exit, not
+// not treated as a boundary either (the index records only bare expression
+// statements, not DeferStmt calls): it runs at function exit, not
 // inline at that point, so it cannot close out an earlier round the way
 // a plain, sequential call does.
-func (b *builder) computeGroupRoundBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info) {
-	if body == nil {
+func (b *builder) computeGroupRoundBalances(groups []*groupState, body *ast.BlockStmt, info *types.Info, index *groupBalanceIndex) {
+	if body == nil || index == nil {
 		return
 	}
 	for _, g := range groups {
 		if g.group.Kind != "waitgroup" || g.obj == nil {
 			continue
 		}
-		segments := splitAtTopLevelWait(flattenTopLevelStmts(body.List), g.obj, info)
-		if len(segments) < 2 {
+		waits := index.waitPositions[g.obj]
+		if len(waits) == 0 {
 			continue // no top-level Wait() found for this group at all
 		}
 		running := groupBalance{fullyKnown: true}
-		for i, seg := range segments {
-			bal := b.walkGroupBalanceStmts(seg, g.obj, info)
-			if i == len(segments)-1 {
-				// Trailing segment: no Wait() follows it by construction.
-				if bal.spawned > 0 {
-					g.group.UnjoinedRound = true
-					g.group.Evidence = append(g.group.Evidence, model.Evidence{
-						Kind:    "unjoined-round",
-						Message: "a further round of work is started after this group's last Wait call, with no further Wait to join it",
-					})
-				}
-				break
-			}
+		start := 0
+		for i, waitPos := range waits {
+			bal := b.walkGroupBalanceStmts(index.topLevel[start:waitPos], g.obj, info, index)
 			running.addTotal += bal.addTotal
 			running.doneTotal += bal.doneTotal
 			if !bal.fullyKnown {
@@ -4974,6 +5061,18 @@ func (b *builder) computeGroupRoundBalances(groups []*groupState, body *ast.Bloc
 					Message: fmt.Sprintf("literal accounting shows %d more Add than Done by this group's Wait call %d; that call may never return", running.addTotal-running.doneTotal, i+1),
 				})
 			}
+			start = waitPos + 1
+		}
+
+		// The statements after the last Wait form the trailing round. No
+		// further Wait can join a worker started here.
+		trailing := b.walkGroupBalanceStmts(index.topLevel[start:], g.obj, info, index)
+		if trailing.spawned > 0 {
+			g.group.UnjoinedRound = true
+			g.group.Evidence = append(g.group.Evidence, model.Evidence{
+				Kind:    "unjoined-round",
+				Message: "a further round of work is started after this group's last Wait call, with no further Wait to join it",
+			})
 		}
 	}
 }
@@ -5002,50 +5101,14 @@ func flattenTopLevelStmts(list []ast.Stmt) []ast.Stmt {
 	return out
 }
 
-// isWaitCall reports whether s is a bare `obj.Wait()` expression
-// statement -- not a DeferStmt (see computeGroupRoundBalances' own doc
-// comment for why a deferred Wait() is never treated as a boundary), and
-// not wrapped in any further expression form.
-func isWaitCall(s ast.Stmt, obj types.Object, info *types.Info) bool {
-	exprStmt, ok := s.(*ast.ExprStmt)
-	if !ok {
-		return false
-	}
-	call, ok := exprStmt.X.(*ast.CallExpr)
-	if !ok || selectorReceiverObject(call.Fun, info) != obj {
-		return false
-	}
-	return selectorMethod(call.Fun) == "Wait"
-}
-
-// splitAtTopLevelWait splits list into consecutive segments at each
-// element isWaitCall matches for obj, returning one more segment than
-// the number of such calls found (an empty leading or trailing segment
-// is possible, and fine: walkGroupBalanceStmts on an empty list is
-// trivially, fully-known balanced). The Wait() statement itself is
-// excluded from both neighboring segments -- it has nothing of its own
-// to contribute to Add/Done accounting.
-func splitAtTopLevelWait(list []ast.Stmt, obj types.Object, info *types.Info) [][]ast.Stmt {
-	segments := [][]ast.Stmt{{}}
-	for _, s := range list {
-		if isWaitCall(s, obj, info) {
-			segments = append(segments, []ast.Stmt{})
-			continue
-		}
-		last := len(segments) - 1
-		segments[last] = append(segments[last], s)
-	}
-	return segments
-}
-
 // walkGroupBalance computes obj's own Add()/Done() accounting for the
 // whole of body. See walkGroupBalanceStmt for exactly what is and isn't
 // recognized in each statement.
-func (b *builder) walkGroupBalance(body *ast.BlockStmt, obj types.Object, info *types.Info) groupBalance {
+func (b *builder) walkGroupBalance(body *ast.BlockStmt, obj types.Object, info *types.Info, index *groupBalanceIndex) groupBalance {
 	if body == nil {
 		return groupBalance{fullyKnown: true}
 	}
-	return b.walkGroupBalanceStmts(body.List, obj, info)
+	return b.walkGroupBalanceStmts(body.List, obj, info, index)
 }
 
 // walkGroupBalanceStmts computes a fresh, self-contained groupBalance for
@@ -5054,10 +5117,13 @@ func (b *builder) walkGroupBalance(body *ast.BlockStmt, obj types.Object, info *
 // for one isolated arm of a conditional (see foldConditionalArms), which
 // is what makes it safe to call on an arm without that arm's own
 // accounting bleeding into a sibling arm's.
-func (b *builder) walkGroupBalanceStmts(list []ast.Stmt, obj types.Object, info *types.Info) groupBalance {
+func (b *builder) walkGroupBalanceStmts(list []ast.Stmt, obj types.Object, info *types.Info, index *groupBalanceIndex) groupBalance {
 	bal := groupBalance{fullyKnown: true}
 	for _, s := range list {
-		b.walkGroupBalanceStmt(s, obj, info, &bal, nil)
+		if index != nil && !index.has(s, obj) {
+			continue
+		}
+		b.walkGroupBalanceStmt(s, obj, info, &bal, nil, index)
 	}
 	return bal
 }
@@ -5089,7 +5155,7 @@ func (b *builder) walkGroupBalanceStmts(list []ast.Stmt, obj types.Object, info 
 // This is what stops an Add() in one arm and an unrelated Done() in a
 // sibling arm from ever being treated as balancing each other, the way a
 // single shared running total would.
-func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types.Info, bal *groupBalance, scope *loopScope) {
+func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types.Info, bal *groupBalance, scope *loopScope, index *groupBalanceIndex) {
 	if call, ok := groupMethodCall(s, obj, info); ok {
 		switch selectorMethod(call.Fun) {
 		case "Add":
@@ -5123,32 +5189,32 @@ func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types
 	switch x := s.(type) {
 	case *ast.BlockStmt:
 		for _, sub := range x.List {
-			b.walkGroupBalanceStmt(sub, obj, info, bal, scope)
+			b.walkGroupBalanceStmt(sub, obj, info, bal, scope, index)
 		}
 	case *ast.IfStmt:
-		arms := []groupBalance{b.walkGroupBalanceStmts(x.Body.List, obj, info)}
+		arms := []groupBalance{b.walkGroupBalanceStmts(x.Body.List, obj, info, index)}
 		if x.Else != nil {
 			// x.Else is either another *ast.BlockStmt or (for an else-if
 			// chain) a nested *ast.IfStmt; wrapping it as a one-statement
 			// list and recursing through walkGroupBalanceStmt handles
 			// both uniformly, including arbitrarily long else-if chains.
-			arms = append(arms, b.walkGroupBalanceStmts([]ast.Stmt{x.Else}, obj, info))
+			arms = append(arms, b.walkGroupBalanceStmts([]ast.Stmt{x.Else}, obj, info, index))
 		} else {
 			arms = append(arms, groupBalance{fullyKnown: true}) // implicit empty else: "if" not taken
 		}
 		foldConditionalArms(bal, scope, arms)
 	case *ast.ForStmt:
-		b.foldLoopBody(x.Body, obj, info, bal)
+		b.foldLoopBody(x.Body, obj, info, bal, index)
 	case *ast.RangeStmt:
-		b.foldLoopBody(x.Body, obj, info, bal)
+		b.foldLoopBody(x.Body, obj, info, bal, index)
 	case *ast.SwitchStmt:
-		foldConditionalArms(bal, scope, b.walkCaseClauses(x.Body.List, obj, info))
+		foldConditionalArms(bal, scope, b.walkCaseClauses(x.Body.List, obj, info, index))
 	case *ast.TypeSwitchStmt:
-		foldConditionalArms(bal, scope, b.walkCaseClauses(x.Body.List, obj, info))
+		foldConditionalArms(bal, scope, b.walkCaseClauses(x.Body.List, obj, info, index))
 	case *ast.SelectStmt:
-		foldConditionalArms(bal, scope, b.walkCommClauses(x.Body.List, obj, info))
+		foldConditionalArms(bal, scope, b.walkCommClauses(x.Body.List, obj, info, index))
 	case *ast.LabeledStmt:
-		b.walkGroupBalanceStmt(x.Stmt, obj, info, bal, scope)
+		b.walkGroupBalanceStmt(x.Stmt, obj, info, bal, scope, index)
 	}
 }
 
@@ -5158,7 +5224,7 @@ func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types
 // through to whatever comes after the switch untouched), so an implicit
 // empty arm is added for it -- the switch/type-switch counterpart to an
 // `if` with no `else`.
-func (b *builder) walkCaseClauses(list []ast.Stmt, obj types.Object, info *types.Info) []groupBalance {
+func (b *builder) walkCaseClauses(list []ast.Stmt, obj types.Object, info *types.Info, index *groupBalanceIndex) []groupBalance {
 	var arms []groupBalance
 	hasDefault := false
 	for _, c := range list {
@@ -5166,7 +5232,7 @@ func (b *builder) walkCaseClauses(list []ast.Stmt, obj types.Object, info *types
 		if !ok {
 			continue
 		}
-		arms = append(arms, b.walkGroupBalanceStmts(cc.Body, obj, info))
+		arms = append(arms, b.walkGroupBalanceStmts(cc.Body, obj, info, index))
 		if cc.List == nil { // nil List is how a `default:` clause is represented
 			hasDefault = true
 		}
@@ -5182,14 +5248,14 @@ func (b *builder) walkCaseClauses(list []ast.Stmt, obj types.Object, info *types
 // without a `default:`) always executes exactly one of its own clauses --
 // blocking until one is ready if it has no default -- so there is no
 // "none of them ran" case to add an implicit arm for.
-func (b *builder) walkCommClauses(list []ast.Stmt, obj types.Object, info *types.Info) []groupBalance {
+func (b *builder) walkCommClauses(list []ast.Stmt, obj types.Object, info *types.Info, index *groupBalanceIndex) []groupBalance {
 	var arms []groupBalance
 	for _, c := range list {
 		cc, ok := c.(*ast.CommClause)
 		if !ok {
 			continue
 		}
-		arms = append(arms, b.walkGroupBalanceStmts(cc.Body, obj, info))
+		arms = append(arms, b.walkGroupBalanceStmts(cc.Body, obj, info, index))
 	}
 	if len(arms) == 0 {
 		arms = append(arms, groupBalance{fullyKnown: true})
@@ -5238,13 +5304,13 @@ func noteSpawnedDoneInto(bal *groupBalance, scope *loopScope) {
 // bails all the way out rather than being absorbed into an enclosing
 // loop's own idiom-matching, which would conflate two different loops'
 // iteration counts.
-func (b *builder) foldLoopBody(body *ast.BlockStmt, obj types.Object, info *types.Info, bal *groupBalance) {
+func (b *builder) foldLoopBody(body *ast.BlockStmt, obj types.Object, info *types.Info, bal *groupBalance, index *groupBalanceIndex) {
 	if body == nil {
 		return
 	}
 	inner := &loopScope{}
 	for _, s := range body.List {
-		b.walkGroupBalanceStmt(s, obj, info, bal, inner)
+		b.walkGroupBalanceStmt(s, obj, info, bal, inner, index)
 	}
 	closeLoopScopeInto(bal, inner)
 }
