@@ -10,8 +10,8 @@ flowchart LR
     FE --> CFGB[CFG builder]
     CFGB --> MODEL[Language-neutral lifecycle model]
     FE --> MODEL
-    FE --> SSA[Local SSA-like summary]
-    SSA --> MODEL
+    FE -. debug opt-in .-> SSA[Local SSA-like summary]
+    SSA -.-> MODEL
     MODEL --> ENG[Protocol recognizers]
     ENG --> DIAG[Versioned diagnostics]
     DIAG --> TEXT[Text]
@@ -32,7 +32,7 @@ The dotted edge is deliberate: `-dump cfg` calls `internal/cfg` directly, with n
 | `analyzer` | `go/analysis` adapter, versioned function facts, categories, source-position indexing, and suggested edits. |
 | `internal/standalone` | Package discovery, bounded parallel loading, export-data importer, type checking, flags, exit policy, `-dump cfg`, and `-dump facts`. |
 | `internal/frontend` | Typed Go recognition, lifecycle summaries, nested-function isolation, lowering, and CFG construction (with a trust predicate) for each goroutine body. |
-| `internal/localssa` | Deterministic, narrow SSA-like instruction summary with canonical callees. |
+| `internal/localssa` | Optional deterministic, narrow SSA-like instruction summary with canonical callees; built only when a debug/inspection caller sets `frontend.Input.CollectIR`. |
 | `internal/cfg` | Control-flow graph construction and text/DOT rendering from a typed AST body, given an optional trusted-terminator predicate. See "Control-flow graph" below. |
 | `internal/model` | Parser-independent spans, instructions, lifecycle records, CFG types plus their graph algorithms (`Reachable`, `CanReach`, `SCCs`), and the generic dataflow worklist solver (`Solve`). |
 | `internal/engine` | Rule evaluation (including CFG/SCC-based `LL1002` verdicts, `cfg_verdict.go`), Phase 3 dataflow lattices (`dataflow_lattices.go`), assumptions, bounds, and CI policy matching. |
@@ -67,7 +67,7 @@ For each function within `max_functions`, the frontend performs:
 
 1. one definition pass for context-cancel bindings and join groups;
 2. one combined pass for body lifecycle, ownership uses, and goroutine starts;
-3. one SSA-like instruction pass.
+3. optionally, one SSA-like instruction pass when `frontend.Input.CollectIR` is requested. Production standalone/vet analysis does not request it.
 
 Nested function literals have separate lifecycle boundaries, and `Build` enumerates every literal as an analysis unit (`literalSources`) with a stable identity, so the cancel functions and join groups declared inside one get their own records. The combined pass may traverse them to observe uses of outer values and discover inner goroutine starts, but their loops and exits are excluded from the enclosing body's lifecycle summary.
 

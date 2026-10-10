@@ -29,7 +29,7 @@ Status meanings:
 | Declarative unknown wrappers | Implemented | Context/start/join/stop wrapper lists |
 | Versioned cross-package summaries | Implemented | Fact version 3, object-fact import/export, vet integration fixture |
 | Fixes only when obvious | Implemented | Only blank cancel in short declaration receives an edit |
-| SSA construction | Partial | A deterministic lifecycle-focused SSA-like summary is built and retained; full Go SSA/CFG is intentionally not claimed |
+| SSA construction | Partial | A deterministic lifecycle-focused SSA-like summary is available on explicit inspection/debug builds (`CollectIR`); production diagnostics do not pay for or depend on it. Full Go SSA is intentionally not claimed. |
 | Language-neutral internal model | Implemented | Engine has no AST/types dependency; model uses spans and neutral records |
 | Narrow backend interface/fake backend | Partial | Package boundaries are narrow and model tests are deterministic, but there is no formal pluggable backend interface yet |
 | Content-addressed persistent cache | Not applicable | Lifeline owns no persistent cache in 0.1.1; cache-key requirements are recorded before any cache is added |
@@ -57,7 +57,7 @@ Status meanings:
 | Avoid unrelated source text in reports | Implemented | Locations and concise evidence only |
 | Subprocess argument arrays | Implemented | `exec.CommandContext` with explicit args |
 | M1 local context/channel | Implemented | Rules and examples |
-| M2 WaitGroup/errgroup and SSA | Implemented | Rules, tests, retained SSA-like model |
+| M2 WaitGroup/errgroup and SSA | Implemented | Rules and tests are implemented; the SSA-like model remains available as an explicit opt-in inspection artifact rather than a production dependency. |
 | M3 cross-package facts and wrappers | Implemented in vet mode | Versioned direct-function facts plus all wrapper classes |
 | M4 fixes and corpus evaluation | Implemented at MVP depth | Safe cancel fix and `net/http` smoke evaluation |
 | Polished workflow, examples, semantic boundary | Implemented | README, tutorial, architecture, semantics, limitations |

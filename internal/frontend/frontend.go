@@ -25,6 +25,14 @@ type Input struct {
 	Pkg   *types.Package
 	Info  *types.Info
 
+	// CollectIR opts into the flat local SSA-like instruction summary on
+	// model.Function.IR. Production diagnostics do not consume this IR, so
+	// ordinary analysis leaves it disabled to avoid an otherwise redundant
+	// whole-body traversal and allocation for every function (audit finding
+	// F11). Debug/inspection callers that explicitly need the legacy IR may
+	// enable it.
+	CollectIR bool
+
 	// LookupFunctionSummary provides a version-validated lifecycle summary for
 	// a direct function target whose source body is outside the current package.
 	// The go/analysis adapter backs this with versioned object facts. Standalone
@@ -985,17 +993,19 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 		fn.ParamDoneEffects = nil
 		return fn
 	}
-	ir, err := localssa.BuildContext(b.ctx, name, fd.Body, b.in.Info)
-	if err != nil {
-		b.err = err
-		return fn
-	}
-	fn.IR = make([]model.Instruction, 0, len(ir.Instructions))
-	for _, in := range ir.Instructions {
-		fn.IR = append(fn.IR, model.Instruction{
-			Index: in.Index, Op: string(in.Op), Span: spanPositions(b.in.Fset, in.Pos, in.End),
-			Callee: in.Callee, Defines: append([]string(nil), in.Defines...), Uses: append([]string(nil), in.Uses...),
-		})
+	if b.in.CollectIR {
+		ir, err := localssa.BuildContext(b.ctx, name, fd.Body, b.in.Info)
+		if err != nil {
+			b.err = err
+			return fn
+		}
+		fn.IR = make([]model.Instruction, 0, len(ir.Instructions))
+		for _, in := range ir.Instructions {
+			fn.IR = append(fn.IR, model.Instruction{
+				Index: in.Index, Op: string(in.Op), Span: spanPositions(b.in.Fset, in.Pos, in.End),
+				Callee: in.Callee, Defines: append([]string(nil), in.Defines...), Uses: append([]string(nil), in.Uses...),
+			})
+		}
 	}
 	return fn
 }

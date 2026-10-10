@@ -321,7 +321,7 @@ func Second(){ for {} }
 	}
 	cfg := config.Default()
 	cfg.MaxFunctions = 1
-	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info}, cfg)
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, CollectIR: true}, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,6 +331,39 @@ func Second(){ for {} }
 	diags := engine.Analyze(program, cfg)
 	if len(diags) != 1 || diags[0].RuleID != "LL9001" {
 		t.Fatalf("diagnostics = %#v", diags)
+	}
+}
+
+func TestLocalIRIsOptIn(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", `package p
+func F(){ x := 1; _ = x }
+`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	plain, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain.Functions) != 1 || len(plain.Functions[0].IR) != 0 {
+		t.Fatalf("ordinary analysis unexpectedly retained local IR: %#v", plain.Functions)
+	}
+	debug, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, CollectIR: true}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(debug.Functions) != 1 || len(debug.Functions[0].IR) == 0 {
+		t.Fatalf("CollectIR did not retain local IR: %#v", debug.Functions)
 	}
 }
 

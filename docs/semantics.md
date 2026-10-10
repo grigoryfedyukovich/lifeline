@@ -13,12 +13,12 @@ No diagnostic is a proof that a goroutine leaks or fails to terminate. Evidence 
 
 ## Modeled program
 
-The frontend type-checks build-selected Go files and lowers lifecycle-relevant syntax to a parser-independent model. It also creates a deterministic local SSA-like summary that versions local definitions and records assignments, calls, goroutine starts, defers, loops, selects, returns, and canonical callees.
+The frontend type-checks build-selected Go files and lowers lifecycle-relevant syntax to a parser-independent model. For debugging/inspection only, callers may opt into a deterministic local SSA-like summary that versions local definitions and records assignments, calls, goroutine starts, defers, loops, selects, returns, and canonical callees. Ordinary standalone/vet analysis does not build that extra representation.
 
 The analysis engine receives only:
 
 - source spans;
-- SSA-like neutral instructions;
+- optional SSA-like neutral instructions (only when `frontend.Input.CollectIR` is requested);
 - context factories and ownership observations;
 - goroutine starts and bounded termination evidence;
 - WaitGroup/errgroup starts, joins, and ownership transfers.
@@ -89,4 +89,4 @@ The explicit bounds are:
 - `max_functions` per package;
 - the standalone command timeout.
 
-`max_functions` is applied before lifecycle and SSA-like construction. Direct same-package target inspection cannot bypass it. Every diagnostic repeats the bound values. Reaching the function bound (which counts function literals as well as named functions) or timeout emits `LL9001` and sets `status.incomplete`; the status is independent of whether `LL9001` is displayed, so ignoring the rule hides the notice and not the fact.
+`max_functions` is applied before lifecycle construction and before optional SSA-like construction when requested. Direct same-package target inspection cannot bypass it. Every diagnostic repeats the bound values. Reaching the function bound (which counts function literals as well as named functions) or timeout emits `LL9001` and sets `status.incomplete`; the status is independent of whether `LL9001` is displayed, so ignoring the rule hides the notice and not the fact.

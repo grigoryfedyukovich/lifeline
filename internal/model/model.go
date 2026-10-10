@@ -482,7 +482,10 @@ type Function struct {
 	Goroutines    []Goroutine     `json:"goroutines,omitempty"`
 	Groups        []JoinGroup     `json:"groups,omitempty"`
 	BodyLifecycle Goroutine       `json:"body_lifecycle"`
-	IR            []Instruction   `json:"ir,omitempty"`
+	// IR is an optional flat SSA-like debug/inspection summary. The frontend
+	// populates it only when Input.CollectIR is requested; production rules do
+	// not consume it.
+	IR []Instruction `json:"ir,omitempty"`
 	// ParamEffects records, by parameter position, what this function's own
 	// body does with a cancel-like or group-like parameter, as the explicit
 	// effects of ParamEffect (the fixed-point result of

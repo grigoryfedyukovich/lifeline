@@ -130,8 +130,8 @@ The stop-signal recognition above is function-scoped, not correlated to which sp
 
 - Standalone mode uses `go list -deps -export -json -e`, `go/parser`, and `go/types`.
 - Root packages are analyzed concurrently with a worker count bounded by `GOMAXPROCS`; output remains sorted deterministically.
-- The typed frontend lowers parser objects into `internal/model` records containing spans, lifecycle facts, and SSA-like instructions.
-- `internal/localssa` versions local definitions and records lifecycle-relevant operations and canonical callees.
+- The typed frontend lowers parser objects into `internal/model` records containing spans and lifecycle facts. An optional debug/inspection mode also attaches the legacy flat SSA-like instructions.
+- `internal/localssa` versions local definitions and records lifecycle-relevant operations and canonical callees only when `frontend.Input.CollectIR` is explicitly enabled; production standalone/vet analysis skips this pass.
 - `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. `internal/frontend` attaches one to each goroutine body, and `internal/engine` consumes it for `LL1002`'s verdict (`docs/architecture.md`) via `model.CFG`'s own graph algorithms, without importing `go/ast`/`go/types` itself.
 - `internal/model.Solve` is a generic forward-dataflow worklist solver over a CFG; `internal/engine`'s `StopCapability`/`JoinObligation`/`Ownership` lattices are built on it (`docs/cfg-migration-plan.md` Phase 3, `docs/architecture.md`), dumpable via `-dump facts`. Only `StopCapability` is wired to real goroutines as of this release; no diagnostic rule reads a dataflow result yet.
 - `internal/engine` imports neither `go/ast` nor `go/types`.
@@ -181,7 +181,7 @@ Text, JSON, and SARIF 2.1.0 are supported. JSON bundles and SARIF runs carry a `
 
 ## 11. Bounds and errors
 
-- `max_functions` is applied before function lifecycle and SSA-like construction.
+- `max_functions` is applied before function lifecycle construction and, when explicitly requested, optional SSA-like construction.
 - Same-package direct targets beyond the bound are not inspected through a side path.
 - The standalone overall timeout and vet's per-package frontend timeout produce `LL9001` rather than a success/failure claim. Frontend cancellation is cooperative; parsing/type checking are not hard-interrupted.
 - Syntax and type failures contain source-oriented Go diagnostics and a recovery hint.
