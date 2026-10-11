@@ -375,13 +375,31 @@ func (c Coverage) Recognized() int {
 	return c.CancelBindings + c.Goroutines + c.Groups
 }
 
+// Merge adds other into c in place. It is the preferred aggregation path for
+// run-level coverage: repeated Merge calls append into one accumulator instead
+// of cloning all previously accumulated unsupported targets on every package.
+func (c *Coverage) Merge(other Coverage) {
+	c.CancelBindings += other.CancelBindings
+	c.Goroutines += other.Goroutines
+	c.Groups += other.Groups
+	c.UnsupportedTargets = append(c.UnsupportedTargets, other.UnsupportedTargets...)
+}
+
+// Add returns the sum of two coverage values without mutating either input.
+// Run-level aggregation should use Merge so repeated additions do not copy the
+// already accumulated UnsupportedTargets slice on every step.
 func (c Coverage) Add(other Coverage) Coverage {
-	return Coverage{
-		CancelBindings:     c.CancelBindings + other.CancelBindings,
-		Goroutines:         c.Goroutines + other.Goroutines,
-		Groups:             c.Groups + other.Groups,
-		UnsupportedTargets: append(append([]UnsupportedTarget{}, c.UnsupportedTargets...), other.UnsupportedTargets...),
+	out := Coverage{
+		CancelBindings: c.CancelBindings + other.CancelBindings,
+		Goroutines:     c.Goroutines + other.Goroutines,
+		Groups:         c.Groups + other.Groups,
 	}
+	if n := len(c.UnsupportedTargets) + len(other.UnsupportedTargets); n != 0 {
+		out.UnsupportedTargets = make([]UnsupportedTarget, 0, n)
+		out.UnsupportedTargets = append(out.UnsupportedTargets, c.UnsupportedTargets...)
+		out.UnsupportedTargets = append(out.UnsupportedTargets, other.UnsupportedTargets...)
+	}
+	return out
 }
 
 // Summarize computes Coverage for a single package's model. It reads only

@@ -265,3 +265,54 @@ func TestPolicy(t *testing.T) {
 		t.Fatal("unexpected policy result")
 	}
 }
+
+func TestCoverageMergeReusesAccumulatorStorage(t *testing.T) {
+	base := make([]UnsupportedTarget, 1, 8)
+	base[0].Function = "first"
+	c := Coverage{
+		CancelBindings:     1,
+		UnsupportedTargets: base,
+	}
+	first := &c.UnsupportedTargets[0]
+
+	for i := 0; i < 4; i++ {
+		c.Merge(Coverage{
+			CancelBindings: 1,
+			Goroutines:     2,
+			Groups:         3,
+			UnsupportedTargets: []UnsupportedTarget{{
+				Function: "next",
+			}},
+		})
+	}
+
+	if got, want := c.CancelBindings, 5; got != want {
+		t.Fatalf("CancelBindings = %d, want %d", got, want)
+	}
+	if got, want := c.Goroutines, 8; got != want {
+		t.Fatalf("Goroutines = %d, want %d", got, want)
+	}
+	if got, want := c.Groups, 12; got != want {
+		t.Fatalf("Groups = %d, want %d", got, want)
+	}
+	if got, want := len(c.UnsupportedTargets), 5; got != want {
+		t.Fatalf("len(UnsupportedTargets) = %d, want %d", got, want)
+	}
+	if &c.UnsupportedTargets[0] != first {
+		t.Fatal("Merge reallocated despite sufficient accumulator capacity")
+	}
+}
+
+func TestCoverageAddPreservesValueSemantics(t *testing.T) {
+	left := Coverage{UnsupportedTargets: []UnsupportedTarget{{Function: "left"}}}
+	right := Coverage{UnsupportedTargets: []UnsupportedTarget{{Function: "right"}}}
+	sum := left.Add(right)
+
+	sum.UnsupportedTargets[0].Function = "changed"
+	if left.UnsupportedTargets[0].Function != "left" {
+		t.Fatal("Add result aliases the left input")
+	}
+	if right.UnsupportedTargets[0].Function != "right" {
+		t.Fatal("Add result aliases the right input")
+	}
+}

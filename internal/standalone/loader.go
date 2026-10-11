@@ -148,9 +148,19 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 	var all []engine.Diagnostic
 	var totalCoverage engine.Coverage
 	var totalStatus engine.Status
+	// All package results are available now, so reserve the exact unsupported-
+	// target capacity once. Merge then appends each package into this run-owned
+	// accumulator without repeatedly copying everything accumulated so far.
+	totalUnsupported := 0
+	for i := range results {
+		totalUnsupported += len(results[i].coverage.UnsupportedTargets)
+	}
+	if totalUnsupported != 0 {
+		totalCoverage.UnsupportedTargets = make([]engine.UnsupportedTarget, 0, totalUnsupported)
+	}
 	for i := range results {
 		all = append(all, results[i].diagnostics...)
-		totalCoverage = totalCoverage.Add(results[i].coverage)
+		totalCoverage.Merge(results[i].coverage)
 		totalStatus = totalStatus.Add(results[i].status)
 	}
 	if firstErr != nil {
