@@ -41,7 +41,7 @@ The dotted edge is deliberate: `-dump cfg` calls `internal/cfg` directly, with n
 
 ## Standalone loading
 
-The command invokes `go list -deps -export -json -e` with an argument array, never shell interpolation. Build selection, module replacements, vendoring, and tags are delegated to the Go command. Export files are used by `go/importer`; target package source is parsed and type-checked locally.
+The command invokes `go list -deps -export -json -e` with an argument array, never shell interpolation. Its JSON objects are decoded incrementally from the subprocess stdout pipe; Lifeline does not retain the complete discovery stream in memory, and stderr retention is bounded. Build selection, module replacements, vendoring, and tags are delegated to the Go command. Export files are used by `go/importer`; target package source is parsed and type-checked locally.
 
 Root packages are sorted by import path, analyzed by a worker pool bounded by `GOMAXPROCS`, and reassembled in the original sorted order. The export-file map is immutable during worker execution. A first loading or analysis error cancels remaining work. Timeout paths retain completed diagnostics and label the report incomplete; invalid package/type errors remain hard input failures.
 

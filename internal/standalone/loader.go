@@ -1,7 +1,6 @@
 package standalone
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -172,33 +171,87 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 	return all, totalCoverage, totalStatus, nil
 }
 
-func listPackages(ctx context.Context, patterns []string) ([]listedPackage, error) {
-	args := []string{"list", "-deps", "-export", "-json", "-e"}
-	args = append(args, patterns...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	dec := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
+const maxGoListStderrBytes = 64 << 10
+
+type boundedBuffer struct {
+	buf       []byte
+	limit     int
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := b.limit - len(b.buf)
+	if remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		b.buf = append(b.buf, p[:remaining]...)
+	}
+	if remaining < len(p) {
+		b.truncated = true
+	}
+	return n, nil
+}
+
+func (b *boundedBuffer) String() string {
+	if !b.truncated {
+		return string(b.buf)
+	}
+	return string(b.buf) + "\n... go list stderr truncated"
+}
+
+func decodeListedPackages(r io.Reader) ([]listedPackage, error) {
+	dec := json.NewDecoder(r)
 	var packages []listedPackage
 	for {
 		var p listedPackage
-		if decErr := dec.Decode(&p); decErr != nil {
-			if decErr == io.EOF {
-				break
+		if err := dec.Decode(&p); err != nil {
+			if err == io.EOF {
+				return packages, nil
 			}
-			return nil, fmt.Errorf("decode go list output: %w", decErr)
+			return nil, fmt.Errorf("decode go list output: %w", err)
 		}
 		packages = append(packages, p)
 	}
+}
+
+func listPackages(ctx context.Context, patterns []string) ([]listedPackage, error) {
+	args := []string{"list", "-deps", "-export", "-json", "-e"}
+	args = append(args, patterns...)
+
+	// Decode directly from go list's stdout pipe instead of first retaining the
+	// complete JSON stream in memory. A private child context lets a malformed
+	// stream terminate the subprocess promptly while preserving the caller's
+	// cancellation reason when the outer context expires.
+	cmdCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, "go", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("open go list stdout: %w", err)
+	}
+	stderr := &boundedBuffer{limit: maxGoListStderrBytes}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start go list: %w", err)
+	}
+
+	packages, decodeErr := decodeListedPackages(stdout)
+	if decodeErr != nil {
+		cancel()
+	}
+	waitErr := cmd.Wait()
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	if err != nil {
+	if decodeErr != nil {
+		return nil, decodeErr
+	}
+	if waitErr != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
-			msg = err.Error()
+			msg = waitErr.Error()
 		}
 		return nil, fmt.Errorf("go list failed: %s", msg)
 	}
