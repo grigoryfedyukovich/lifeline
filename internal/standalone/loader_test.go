@@ -3,9 +3,12 @@ package standalone
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -68,5 +71,151 @@ func TestListPackagesHonorsCanceledContext(t *testing.T) {
 	_, err := listPackages(ctx, []string{"."})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("listPackages error = %v, want context.Canceled", err)
+	}
+}
+
+type countingImporter struct {
+	mu       sync.Mutex
+	calls    map[string]int
+	packages map[string]*types.Package
+}
+
+func newCountingImporter() *countingImporter {
+	return &countingImporter{
+		calls:    make(map[string]int),
+		packages: make(map[string]*types.Package),
+	}
+}
+
+func (c *countingImporter) Import(path string) (*types.Package, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls[path]++
+	if pkg := c.packages[path]; pkg != nil {
+		return pkg, nil
+	}
+	name := path
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	pkg := types.NewPackage(path, name)
+	pkg.MarkComplete()
+	c.packages[path] = pkg
+	return pkg, nil
+}
+
+func TestSharedExportImporterCachesAcrossMappedRoots(t *testing.T) {
+	delegate := newCountingImporter()
+	shared := newSharedExportImporter(delegate)
+	left := mappedImporter{shared: shared, importMap: map[string]string{"dep": "example.test/dep"}}
+	right := mappedImporter{shared: shared, importMap: map[string]string{"alias": "example.test/dep"}}
+
+	const n = 16
+	got := make(chan *types.Package, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			imp := left
+			path := "dep"
+			if i%2 != 0 {
+				imp = right
+				path = "alias"
+			}
+			pkg, err := imp.Import(path)
+			if err != nil {
+				t.Errorf("Import(%q): %v", path, err)
+				return
+			}
+			got <- pkg
+		}(i)
+	}
+	wg.Wait()
+	close(got)
+
+	var first *types.Package
+	for pkg := range got {
+		if first == nil {
+			first = pkg
+			continue
+		}
+		if pkg != first {
+			t.Fatalf("mapped roots received different package objects: %p and %p", first, pkg)
+		}
+	}
+	if first == nil || first.Path() != "example.test/dep" {
+		t.Fatalf("imported package = %#v, want example.test/dep", first)
+	}
+	delegate.mu.Lock()
+	calls := delegate.calls["example.test/dep"]
+	delegate.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("delegate imports for example.test/dep = %d, want 1", calls)
+	}
+}
+
+func TestPackageLoaderReusesRunFileSet(t *testing.T) {
+	loader := newPackageLoader(nil)
+	ctx := context.Background()
+	var loaded []*loadedPackage
+	for _, name := range []string{"a", "b"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, name+".go"), []byte("package "+name+"\nfunc F() {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		pkg, err := loader.loadOne(ctx, listedPackage{
+			Dir:        dir,
+			ImportPath: "example.test/" + name,
+			GoFiles:    []string{name + ".go"},
+		}, false)
+		if err != nil {
+			t.Fatalf("load %s: %v", name, err)
+		}
+		loaded = append(loaded, pkg)
+	}
+	if loaded[0].Fset != loaded[1].Fset || loaded[0].Fset != loader.fset {
+		t.Fatal("package loader did not reuse its run-wide token.FileSet")
+	}
+}
+
+func TestPackageLoaderConcurrentRootParsing(t *testing.T) {
+	loader := newPackageLoader(nil)
+	ctx := context.Background()
+	const n = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dir := t.TempDir()
+			name := fmt.Sprintf("p%d", i)
+			fileName := name + ".go"
+			if err := os.WriteFile(filepath.Join(dir, fileName), []byte("package "+name+"\nfunc F() int { return "+fmt.Sprint(i)+" }\n"), 0o644); err != nil {
+				errs <- err
+				return
+			}
+			loaded, err := loader.loadOne(ctx, listedPackage{
+				Dir:        dir,
+				ImportPath: "example.test/" + name,
+				GoFiles:    []string{fileName},
+			}, false)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if loaded.Fset != loader.fset {
+				errs <- fmt.Errorf("%s received a different FileSet", name)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -54,6 +54,106 @@ type loadedPackage struct {
 	Info  *types.Info
 }
 
+// packageLoader owns the run-wide token/file universe and export-data importer.
+// Root packages still receive independent types.Info/maps and are type-checked
+// separately; only immutable dependency packages decoded from compiler export
+// data are shared.
+//
+// go/importer's gc importer keeps a mutable package cache and is not documented
+// as safe for concurrent use. sharedExportImporter serializes cache misses while
+// allowing already-imported packages to be returned without re-decoding their
+// export data.
+type packageLoader struct {
+	fset    *token.FileSet
+	imports *sharedExportImporter
+}
+
+type sharedExportImporter struct {
+	mu       sync.RWMutex
+	delegate types.Importer
+	cache    map[string]*types.Package
+}
+
+func newSharedExportImporter(delegate types.Importer) *sharedExportImporter {
+	return &sharedExportImporter{delegate: delegate, cache: make(map[string]*types.Package)}
+}
+
+func (s *sharedExportImporter) Import(path string) (*types.Package, error) {
+	return s.ImportFrom(path, "", 0)
+}
+
+func (s *sharedExportImporter) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.Package, error) {
+	s.mu.RLock()
+	pkg := s.cache[path]
+	s.mu.RUnlock()
+	if pkg != nil {
+		return pkg, nil
+	}
+
+	// Serialize delegate access: the gc importer mutates its own package map
+	// while recursively decoding export data. Recheck after taking the write
+	// lock so concurrent requests for the same package decode it only once.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pkg := s.cache[path]; pkg != nil {
+		return pkg, nil
+	}
+
+	var (
+		imported *types.Package
+		err      error
+	)
+	if from, ok := s.delegate.(types.ImporterFrom); ok {
+		imported, err = from.ImportFrom(path, srcDir, mode)
+	} else {
+		if mode != 0 {
+			return nil, fmt.Errorf("unsupported import mode %d for %q", mode, path)
+		}
+		imported, err = s.delegate.Import(path)
+	}
+	if err == nil && imported != nil {
+		s.cache[path] = imported
+	}
+	return imported, err
+}
+
+type mappedImporter struct {
+	shared    *sharedExportImporter
+	importMap map[string]string
+}
+
+func (m mappedImporter) resolve(path string) string {
+	if mapped, ok := m.importMap[path]; ok {
+		return mapped
+	}
+	return path
+}
+
+func (m mappedImporter) Import(path string) (*types.Package, error) {
+	return m.shared.Import(m.resolve(path))
+}
+
+func (m mappedImporter) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.Package, error) {
+	// After go list's ImportMap translation the path is canonical. The custom
+	// compiler-export lookup is module-aware and does not use srcDir.
+	return m.shared.ImportFrom(m.resolve(path), "", mode)
+}
+
+func newPackageLoader(exports map[string]string) *packageLoader {
+	fset := token.NewFileSet()
+	lookup := func(path string) (io.ReadCloser, error) {
+		file := exports[path]
+		if file == "" {
+			return nil, fmt.Errorf("no export data for import %q", path)
+		}
+		return os.Open(file)
+	}
+	return &packageLoader{
+		fset:    fset,
+		imports: newSharedExportImporter(importer.ForCompiler(fset, "gc", lookup)),
+	}
+}
+
 func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, engine.Status, error) {
 	cwd, _ := os.Getwd()
 	packages, err := listPackages(ctx, patterns)
@@ -66,6 +166,7 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 			exports[p.ImportPath] = p.Export
 		}
 	}
+	loader := newPackageLoader(exports)
 	var roots []listedPackage
 	for _, p := range packages {
 		if p.DepOnly || p.ForTest != "" {
@@ -119,7 +220,7 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 					return
 				}
 				p := roots[i]
-				loaded, err := loadOne(workCtx, p, exports, cfg.IncludeTests)
+				loaded, err := loader.loadOne(workCtx, p, cfg.IncludeTests)
 				if err != nil {
 					fail(fmt.Errorf("load %s: %w", p.ImportPath, err))
 					return
@@ -259,7 +360,11 @@ func listPackages(ctx context.Context, patterns []string) ([]listedPackage, erro
 }
 
 func loadOne(ctx context.Context, p listedPackage, exports map[string]string, includeTests bool) (*loadedPackage, error) {
-	fset := token.NewFileSet()
+	return newPackageLoader(exports).loadOne(ctx, p, includeTests)
+}
+
+func (l *packageLoader) loadOne(ctx context.Context, p listedPackage, includeTests bool) (*loadedPackage, error) {
+	fset := l.fset
 	names := append([]string{}, p.GoFiles...)
 	names = append(names, p.CgoFiles...)
 	if includeTests {
@@ -277,21 +382,9 @@ func loadOne(ctx context.Context, p listedPackage, exports map[string]string, in
 		}
 		files = append(files, file)
 	}
-	lookup := func(path string) (io.ReadCloser, error) {
-		resolved := path
-		if mapped, ok := p.ImportMap[path]; ok {
-			resolved = mapped
-		}
-		file := exports[resolved]
-		if file == "" {
-			return nil, fmt.Errorf("no export data for import %q", path)
-		}
-		return os.Open(file)
-	}
-	imp := importer.ForCompiler(fset, "gc", lookup)
 	var typeErrors []string
 	conf := types.Config{
-		Importer: imp,
+		Importer: mappedImporter{shared: l.imports, importMap: p.ImportMap},
 		Sizes:    types.SizesFor("gc", runtime.GOARCH),
 		Error: func(err error) {
 			typeErrors = append(typeErrors, err.Error())

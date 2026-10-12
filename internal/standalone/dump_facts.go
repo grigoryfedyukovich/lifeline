@@ -86,6 +86,7 @@ func dumpFacts(ctx context.Context, patterns []string, cfg config.Config, format
 			exports[p.ImportPath] = p.Export
 		}
 	}
+	loader := newPackageLoader(exports)
 	var roots []listedPackage
 	for _, p := range packages {
 		if p.DepOnly || p.ForTest != "" {
@@ -105,7 +106,7 @@ func dumpFacts(ctx context.Context, patterns []string, cfg config.Config, format
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		loaded, err := loadOne(ctx, p, exports, cfg.IncludeTests)
+		loaded, err := loader.loadOne(ctx, p, cfg.IncludeTests)
 		if err != nil {
 			return fmt.Errorf("load %s: %w", p.ImportPath, err)
 		}
