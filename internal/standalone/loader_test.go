@@ -68,7 +68,7 @@ func TestBoundedBufferCapsRetainedOutput(t *testing.T) {
 func TestListPackagesHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := listPackages(ctx, []string{"."})
+	_, err := listPackages(ctx, []string{"."}, false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("listPackages error = %v, want context.Canceled", err)
 	}
@@ -217,5 +217,121 @@ func TestPackageLoaderConcurrentRootParsing(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestSelectAnalysisRootsWithTestsPrefersVariantAndExternalPackage(t *testing.T) {
+	packages := []listedPackage{
+		{ImportPath: "example.test/p", Name: "p", GoFiles: []string{"p.go"}},
+		{ImportPath: "example.test/p [example.test/p.test]", ForTest: "example.test/p", Name: "p", GoFiles: []string{"p.go", "p_test.go"}},
+		{ImportPath: "example.test/p_test [example.test/p.test]", ForTest: "example.test/p", Name: "p_test", GoFiles: []string{"x_test.go"}},
+		{ImportPath: "example.test/p.test", Name: "main", GoFiles: []string{"generated.go"}},
+		{ImportPath: "example.test/dep", Name: "dep", GoFiles: []string{"dep.go"}, DepOnly: true},
+	}
+
+	roots := selectAnalysisRoots(packages, true)
+	if len(roots) != 2 {
+		t.Fatalf("selectAnalysisRoots returned %d roots, want 2: %#v", len(roots), roots)
+	}
+	if roots[0].Name != "p" || roots[0].ForTest != "example.test/p" {
+		t.Fatalf("first root = %#v, want same-package test variant", roots[0])
+	}
+	if roots[1].Name != "p_test" || roots[1].ForTest != "example.test/p" {
+		t.Fatalf("second root = %#v, want external test package", roots[1])
+	}
+	for _, root := range roots {
+		if root.ImportPath == "example.test/p" || root.ImportPath == "example.test/p.test" {
+			t.Fatalf("selected duplicate/base or synthetic test harness: %#v", root)
+		}
+	}
+}
+
+func TestListPackagesWithTestsLoadsTestOnlyDependenciesAndExternalTests(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, contents string) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.test/lifeline_testgraph\n\ngo 1.20\n")
+	write("dep/dep.go", "package dep\nfunc Production() {}\n")
+	write("testdep/testdep.go", "package testdep\nfunc OnlyInTests() {}\n")
+	write("p/p.go", `package p
+import "example.test/lifeline_testgraph/dep"
+func Production() { dep.Production() }
+`)
+	write("p/p_test.go", `package p
+import "example.test/lifeline_testgraph/testdep"
+func samePackageTestHelper() { testdep.OnlyInTests() }
+`)
+	write("p/x_test.go", `package p_test
+import (
+	p "example.test/lifeline_testgraph/p"
+	"example.test/lifeline_testgraph/testdep"
+)
+func externalTestHelper() { p.Production(); testdep.OnlyInTests() }
+`)
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	packages, err := listPackages(context.Background(), []string{"./p"}, true)
+	if err != nil {
+		t.Fatalf("listPackages(-test): %v", err)
+	}
+
+	const testDep = "example.test/lifeline_testgraph/testdep"
+	foundTestDep := false
+	exports := make(map[string]string)
+	for _, p := range packages {
+		if p.ImportPath == testDep {
+			foundTestDep = true
+		}
+		if p.Export != "" {
+			exports[p.ImportPath] = p.Export
+		}
+	}
+	if !foundTestDep {
+		t.Fatalf("go list -test graph omitted test-only dependency %q", testDep)
+	}
+
+	roots := selectAnalysisRoots(packages, true)
+	if len(roots) != 2 {
+		var ids []string
+		for _, p := range roots {
+			ids = append(ids, p.ImportPath)
+		}
+		t.Fatalf("selected roots = %v, want same-package and external test roots", ids)
+	}
+
+	loader := newPackageLoader(exports)
+	seenNames := make(map[string]bool)
+	for _, root := range roots {
+		if strings.HasSuffix(root.ImportPath, ".test") && root.Name == "main" {
+			t.Fatalf("selected synthetic test harness %q", root.ImportPath)
+		}
+		loaded, err := loader.loadOne(context.Background(), root, true)
+		if err != nil {
+			t.Fatalf("load test root %q: %v", root.ImportPath, err)
+		}
+		seenNames[loaded.Pkg.Name()] = true
+	}
+	if !seenNames["p"] || !seenNames["p_test"] {
+		t.Fatalf("loaded package names = %v, want p and p_test", seenNames)
 	}
 }

@@ -156,7 +156,7 @@ func newPackageLoader(exports map[string]string) *packageLoader {
 
 func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, engine.Status, error) {
 	cwd, _ := os.Getwd()
-	packages, err := listPackages(ctx, patterns)
+	packages, err := listPackages(ctx, patterns, cfg.IncludeTests)
 	if err != nil {
 		return nil, engine.Coverage{}, engine.Status{}, err
 	}
@@ -167,20 +167,12 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 		}
 	}
 	loader := newPackageLoader(exports)
-	var roots []listedPackage
-	for _, p := range packages {
-		if p.DepOnly || p.ForTest != "" {
-			continue
-		}
+	roots := selectAnalysisRoots(packages, cfg.IncludeTests)
+	for _, p := range roots {
 		if p.Error != nil {
 			return nil, engine.Coverage{}, engine.Status{}, fmt.Errorf("package %s: %s", p.ImportPath, p.Error.Err)
 		}
-		if len(p.GoFiles)+len(p.CgoFiles) == 0 {
-			continue
-		}
-		roots = append(roots, p)
 	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].ImportPath < roots[j].ImportPath })
 	type packageResult struct {
 		diagnostics []engine.Diagnostic
 		coverage    engine.Coverage
@@ -317,8 +309,90 @@ func decodeListedPackages(r io.Reader) ([]listedPackage, error) {
 	}
 }
 
-func listPackages(ctx context.Context, patterns []string) ([]listedPackage, error) {
-	args := []string{"list", "-deps", "-export", "-json", "-e"}
+// selectAnalysisRoots converts go list's package graph into the source packages
+// Lifeline should analyze. With tests disabled this is the ordinary non-dependency
+// roots. With tests enabled, go list -test emits up to three records per root:
+//
+//   - the ordinary package,
+//   - a same-package test variant (ForTest is set),
+//   - an external package_test variant (ForTest is set),
+//
+// plus a synthetic <pkg>.test main. Prefer the same-package variant over the
+// ordinary package so production files are not diagnosed twice, include the
+// external test package as its own source root, and never analyze the synthetic
+// test harness.
+func selectAnalysisRoots(packages []listedPackage, includeTests bool) []listedPackage {
+	if !includeTests {
+		roots := make([]listedPackage, 0)
+		for _, p := range packages {
+			if p.DepOnly || p.ForTest != "" || len(p.GoFiles)+len(p.CgoFiles) == 0 {
+				continue
+			}
+			roots = append(roots, p)
+		}
+		sort.Slice(roots, func(i, j int) bool { return roots[i].ImportPath < roots[j].ImportPath })
+		return roots
+	}
+
+	baseByPath := make(map[string]listedPackage)
+	sameTestByBase := make(map[string]listedPackage)
+	var externalTests []listedPackage
+	testHarnesses := make(map[string]struct{})
+
+	// First collect ordinary roots. Variants are classified on a second pass so
+	// package names are available even if go list orders records differently.
+	for _, p := range packages {
+		if p.DepOnly {
+			continue
+		}
+		if p.ForTest == "" {
+			baseByPath[p.ImportPath] = p
+			continue
+		}
+		testHarnesses[p.ForTest+".test"] = struct{}{}
+	}
+	for _, p := range packages {
+		if p.DepOnly || p.ForTest == "" || len(p.GoFiles)+len(p.CgoFiles) == 0 {
+			continue
+		}
+		base, ok := baseByPath[p.ForTest]
+		if ok && p.Name == base.Name {
+			sameTestByBase[p.ForTest] = p
+		} else {
+			externalTests = append(externalTests, p)
+		}
+	}
+
+	roots := make([]listedPackage, 0, len(baseByPath)+len(externalTests))
+	for path, base := range baseByPath {
+		if _, synthetic := testHarnesses[path]; synthetic && base.Name == "main" {
+			continue
+		}
+		if len(base.GoFiles)+len(base.CgoFiles) == 0 {
+			continue
+		}
+		if testVariant, ok := sameTestByBase[path]; ok {
+			roots = append(roots, testVariant)
+		} else {
+			roots = append(roots, base)
+		}
+	}
+	roots = append(roots, externalTests...)
+	sort.Slice(roots, func(i, j int) bool { return roots[i].ImportPath < roots[j].ImportPath })
+	return roots
+}
+
+func listPackages(ctx context.Context, patterns []string, includeTests bool) ([]listedPackage, error) {
+	args := []string{"list", "-deps"}
+	if includeTests {
+		// Asking go list for the test graph is essential: same-package tests can
+		// import packages that are absent from the ordinary build, and external
+		// tests are compiled as a distinct package. Merely appending TestGoFiles
+		// after an ordinary go list leaves those dependencies out of the export
+		// map and cannot represent external tests at all.
+		args = append(args, "-test")
+	}
+	args = append(args, "-export", "-json", "-e")
 	args = append(args, patterns...)
 
 	// Decode directly from go list's stdout pipe instead of first retaining the
@@ -367,7 +441,10 @@ func (l *packageLoader) loadOne(ctx context.Context, p listedPackage, includeTes
 	fset := l.fset
 	names := append([]string{}, p.GoFiles...)
 	names = append(names, p.CgoFiles...)
-	if includeTests {
+	if includeTests && p.ForTest == "" {
+		// Test variants returned by go list -test already include same-package
+		// TestGoFiles in GoFiles. Only the ordinary-package fallback needs the
+		// historical append behavior.
 		names = append(names, p.TestGoFiles...)
 	}
 	var files []*ast.File

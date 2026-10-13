@@ -2,7 +2,7 @@
 
 ```mermaid
 flowchart LR
-    CLI[Standalone CLI] --> GL[go list -deps -export]
+    CLI[Standalone CLI] --> GL["go list -deps (-test) -export"]
     GL --> POOL[Bounded package worker pool]
     POOL --> PARSE[go/parser + go/types]
     VET[go vet unitchecker] --> FE[Typed frontend]
@@ -41,13 +41,13 @@ The dotted edge is deliberate: `-dump cfg` calls `internal/cfg` directly, with n
 
 ## Standalone loading
 
-The command invokes `go list -deps -export -json -e` with an argument array, never shell interpolation. Its JSON objects are decoded incrementally from the subprocess stdout pipe; Lifeline does not retain the complete discovery stream in memory, and stderr retention is bounded. Build selection, module replacements, vendoring, and tags are delegated to the Go command. Export files are used by `go/importer`; target package source is parsed and type-checked locally.
+The command invokes `go list -deps -export -json -e` with an argument array, never shell interpolation; with `-tests` it adds `-test` so Go supplies the actual test compilation graph and test-only dependencies. Its JSON objects are decoded incrementally from the subprocess stdout pipe; Lifeline does not retain the complete discovery stream in memory, and stderr retention is bounded. Build selection, module replacements, vendoring, and tags are delegated to the Go command. Export files are used by `go/importer`; target package source is parsed and type-checked locally.
 
 One standalone run owns one token file set and one compiler-export importer cache. Root packages still have independent `types.Info` maps and independent source type-check results, but dependency packages decoded from export data are shared across roots instead of being decoded into a fresh type universe for every root. Per-root `ImportMap` translation happens before the shared canonical import. Cache misses are serialized because the standard gc importer mutates its internal package map; completed imported packages are immutable and reused directly.
 
 Root packages are sorted by import path, analyzed by a worker pool bounded by `GOMAXPROCS`, and reassembled in the original sorted order. The export-file map is immutable during worker execution. A first loading or analysis error cancels remaining work. Timeout paths retain completed diagnostics and label the report incomplete; invalid package/type errors remain hard input failures.
 
-Dependencies are loaded for export data. With `-tests`, same-package test files are appended to the package; external `_test` packages remain a documented limitation.
+Dependencies are loaded for export data. With `-tests`, Lifeline analyzes Go's same-package test variant instead of analyzing the production package twice, also analyzes the distinct external `package_name_test` variant, and skips the synthetic `<package>.test` harness. Test-only dependencies therefore come from the same `go list -test` graph used to compile the tests.
 
 ## Vet mode and facts
 

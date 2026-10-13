@@ -7,7 +7,6 @@ import (
 	"go/token"
 	"go/types"
 	"io"
-	"sort"
 
 	flowgraph "github.com/gfedyukovich/lifeline/internal/cfg"
 	"github.com/gfedyukovich/lifeline/internal/config"
@@ -25,7 +24,7 @@ import (
 // files or apply ignore_paths: someone asking to see a CFG most likely
 // wants to see every function that's there, not a lint-scoped subset.
 func dumpCFGs(ctx context.Context, patterns []string, cfg config.Config, format string, w io.Writer) error {
-	packages, err := listPackages(ctx, patterns)
+	packages, err := listPackages(ctx, patterns, cfg.IncludeTests)
 	if err != nil {
 		return err
 	}
@@ -36,20 +35,12 @@ func dumpCFGs(ctx context.Context, patterns []string, cfg config.Config, format 
 		}
 	}
 	loader := newPackageLoader(exports)
-	var roots []listedPackage
-	for _, p := range packages {
-		if p.DepOnly || p.ForTest != "" {
-			continue
-		}
+	roots := selectAnalysisRoots(packages, cfg.IncludeTests)
+	for _, p := range roots {
 		if p.Error != nil {
 			return fmt.Errorf("package %s: %s", p.ImportPath, p.Error.Err)
 		}
-		if len(p.GoFiles)+len(p.CgoFiles) == 0 {
-			continue
-		}
-		roots = append(roots, p)
 	}
-	sort.Slice(roots, func(i, j int) bool { return roots[i].ImportPath < roots[j].ImportPath })
 
 	for _, p := range roots {
 		if err := ctx.Err(); err != nil {

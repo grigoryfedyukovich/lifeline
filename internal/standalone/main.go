@@ -57,7 +57,7 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	fs.BoolVar(&opts.failUnsupp, "fail-on-unsupported", false, "fail when any part of the input was judged under an approximation (see status.unsupported)")
 	fs.StringVar(&opts.timeout, "timeout", "", "overall analysis timeout")
 	fs.IntVar(&opts.maxFunctions, "max-functions", 0, "maximum functions analyzed per package")
-	fs.BoolVar(&opts.includeTests, "tests", false, "include same-package _test.go files")
+	fs.BoolVar(&opts.includeTests, "tests", false, "include package tests, including external package_test files")
 	fs.BoolVar(&opts.printConfig, "print-config", false, "print effective configuration and exit")
 	fs.BoolVar(&opts.showVersion, "version", false, "print version and exit")
 	fs.StringVar(&opts.dump, "dump", "", "bypass diagnostics and dump an intermediate representation instead: \"cfg\" (control-flow graph, text or dot) or \"facts\" (per-worker lifecycle facts, text or json)")

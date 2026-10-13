@@ -336,7 +336,7 @@ Useful narrower patterns include:
 ./bin/lifeline -tests ./...
 ```
 
-The standalone loader follows Go package selection, build tags, and type checking. Invalid packages and configuration errors use exit code 2.
+The standalone loader follows Go package selection, build tags, and type checking. With `-tests`, it requests Go's test build graph, so dependencies used only by tests are available and both same-package tests and external `package_name_test` packages are analyzed; the generated `<package>.test` harness is not. Invalid packages and configuration errors use exit code 2.
 
 For an initial rollout, prefer reviewing the text report without a failure policy. Record false positives and unsupported ownership conventions, then add wrappers or narrow CI policy only after the findings are understood.
 

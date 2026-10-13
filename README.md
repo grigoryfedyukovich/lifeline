@@ -145,7 +145,7 @@ Under `go vet`, which shows only diagnostics, the same data is available as a re
 -fail-on-unsupported  fail when any part of the input was judged under an approximation
 -timeout DURATION     overall standalone timeout
 -max-functions N      per-package analysis bound
--tests                include same-package _test.go files
+-tests                include package tests, including external package_test files
 -print-config         print effective configuration
 -version              print tool and backend versions
 ```

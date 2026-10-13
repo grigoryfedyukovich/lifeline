@@ -128,7 +128,7 @@ The stop-signal recognition above is function-scoped, not correlated to which sp
 
 ## 8. Architecture and internal boundary
 
-- Standalone mode uses `go list -deps -export -json -e`, `go/parser`, and `go/types`.
+- Standalone mode uses `go list -deps -export -json -e` (adding `-test` when tests are enabled), `go/parser`, and `go/types`. Test mode analyzes Go's same-package and external test variants rather than manually appending `_test.go` files to a production-only dependency graph.
 - Root packages are analyzed concurrently with a worker count bounded by `GOMAXPROCS`; output remains sorted deterministically.
 - The typed frontend lowers parser objects into `internal/model` records containing spans and lifecycle facts. An optional debug/inspection mode also attaches the legacy flat SSA-like instructions.
 - `internal/localssa` versions local definitions and records lifecycle-relevant operations and canonical callees only when `frontend.Input.CollectIR` is explicitly enabled; production standalone/vet analysis skips this pass.
