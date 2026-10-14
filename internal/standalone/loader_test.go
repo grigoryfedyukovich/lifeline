@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/gfedyukovich/lifeline/internal/config"
 )
 
 func TestLoadOneHonorsCanceledContextBeforeParsing(t *testing.T) {
@@ -333,5 +335,79 @@ func externalTestHelper() { p.Production(); testdep.OnlyInTests() }
 	}
 	if !seenNames["p"] || !seenNames["p_test"] {
 		t.Fatalf("loaded package names = %v, want p and p_test", seenNames)
+	}
+}
+
+func TestAnalyzePatternsUsesSameModuleDependencyFacts(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, contents string) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.test/lifeline_facts\n\ngo 1.20\n")
+	write("dep/dep.go", `package dep
+import "context"
+
+// Drop receives ownership-looking input but demonstrably does nothing with it.
+// Without a cross-package effect summary the caller conservatively treats this
+// as an opaque transfer and misses the leak.
+func Drop(cancel context.CancelFunc) { _ = cancel }
+`)
+	write("root/root.go", `package root
+import (
+	"context"
+	"example.test/lifeline_facts/dep"
+)
+
+func Leak(parent context.Context) {
+	_, cancel := context.WithCancel(parent)
+	dep.Drop(cancel)
+}
+`)
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	cfg := config.Default()
+	cfg.Timeout = "30s"
+	diags, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
+	if err != nil {
+		t.Fatalf("analyzePatterns: %v", err)
+	}
+	for _, d := range diags {
+		if d.RuleID == "LL1001" && strings.HasSuffix(d.Function, ".Leak") {
+			return
+		}
+	}
+	t.Fatalf("cross-package no-consume fact did not preserve caller obligation; diagnostics = %#v", diags)
+}
+
+func TestAnalysisLevelsPutDependencyBeforeCaller(t *testing.T) {
+	units := []analysisUnit{
+		{pkg: listedPackage{ImportPath: "example.test/root", Imports: []string{"example.test/dep"}}, rootResult: 0},
+		{pkg: listedPackage{ImportPath: "example.test/dep"}, rootResult: -1},
+	}
+	levels, err := analysisLevels(units)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(levels) != 2 || len(levels[0]) != 1 || len(levels[1]) != 1 || levels[0][0] != 1 || levels[1][0] != 0 {
+		t.Fatalf("analysis levels = %#v, want dep then root", levels)
 	}
 }

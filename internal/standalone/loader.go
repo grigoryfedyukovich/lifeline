@@ -21,6 +21,7 @@ import (
 	"github.com/gfedyukovich/lifeline/internal/config"
 	"github.com/gfedyukovich/lifeline/internal/engine"
 	"github.com/gfedyukovich/lifeline/internal/frontend"
+	"github.com/gfedyukovich/lifeline/internal/model"
 )
 
 type goListError struct {
@@ -41,10 +42,18 @@ type listedPackage struct {
 	DepOnly        bool
 	Standard       bool
 	Export         string
+	Imports        []string
 	ImportMap      map[string]string
 	ForTest        string
+	Module         *listedModule
 	Error          *goListError
 	DepsErrors     []goListError
+}
+
+type listedModule struct {
+	Path string
+	Dir  string
+	Main bool
 }
 
 type loadedPackage struct {
@@ -52,6 +61,154 @@ type loadedPackage struct {
 	Files []*ast.File
 	Pkg   *types.Package
 	Info  *types.Info
+}
+
+// standaloneFact is the source-analysis counterpart of analyzer.FunctionFact.
+// The standalone driver cannot use go/analysis object facts, so it records the
+// same self-contained function effects after analyzing a dependency and exposes
+// them to dependent packages through frontend.Input's Lookup* hooks.
+//
+// Facts are deliberately keyed by package path/name/receiver shape rather than
+// by *types.Func identity: a dependency source package is type-checked in its
+// own root universe while its importer-facing object comes from compiler export
+// data, so the pointers are necessarily different even though they denote the
+// same declared function.
+type standaloneFact struct {
+	lifecycle        model.Goroutine
+	paramEffects     map[int]model.ParamEffect
+	paramDoneEffects map[int]model.ParamEffect
+	returnFieldSites []model.ReturnFieldSite
+}
+
+type standaloneFactStore struct {
+	mu    sync.RWMutex
+	facts map[string]standaloneFact
+}
+
+func newStandaloneFactStore() *standaloneFactStore {
+	return &standaloneFactStore{facts: make(map[string]standaloneFact)}
+}
+
+func qualifierPath(p *types.Package) string {
+	if p == nil {
+		return ""
+	}
+	return p.Path()
+}
+
+func standaloneFactKey(fn *types.Func) string {
+	if fn == nil || fn.Pkg() == nil {
+		return ""
+	}
+	recv := ""
+	if sig, ok := fn.Type().(*types.Signature); ok && sig.Recv() != nil {
+		recv = types.TypeString(sig.Recv().Type(), qualifierPath)
+	}
+	return fn.Pkg().Path() + "\x00" + recv + "\x00" + fn.Name()
+}
+
+func cloneParamEffects(src map[int]model.ParamEffect) map[int]model.ParamEffect {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[int]model.ParamEffect, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func (s *standaloneFactStore) recordPackage(loaded *loadedPackage, program model.Program) {
+	if loaded == nil || loaded.Info == nil {
+		return
+	}
+	byName := make(map[string]model.Function, len(program.Functions))
+	for _, fn := range program.Functions {
+		byName[fn.Name] = fn
+	}
+	pending := make(map[string]standaloneFact)
+	for _, file := range loaded.Files {
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			obj, _ := loaded.Info.Defs[fd.Name].(*types.Func)
+			if obj == nil {
+				continue
+			}
+			fn, ok := byName[obj.FullName()]
+			if !ok { // excluded by max_functions or interrupted before completion
+				continue
+			}
+			body := fn.BodyLifecycle
+			unresolved := engine.UnresolvedLoop(body.CFG)
+			factLifecycle := model.Goroutine{
+				InfiniteLoop:           body.InfiniteLoop,
+				HasReturn:              body.HasReturn,
+				ContextStop:            body.ContextStop,
+				ChannelStop:            body.ChannelStop,
+				ExplicitStop:           body.ExplicitStop,
+				ImportedUnresolvedLoop: &unresolved,
+			}
+			pending[standaloneFactKey(obj)] = standaloneFact{
+				lifecycle:        factLifecycle,
+				paramEffects:     cloneParamEffects(fn.ParamEffects),
+				paramDoneEffects: cloneParamEffects(fn.ParamDoneEffects),
+				returnFieldSites: append([]model.ReturnFieldSite(nil), fn.ReturnFieldSites...),
+			}
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+	s.mu.Lock()
+	for key, fact := range pending {
+		s.facts[key] = fact
+	}
+	s.mu.Unlock()
+}
+
+func (s *standaloneFactStore) lookup(fn *types.Func) (standaloneFact, bool) {
+	key := standaloneFactKey(fn)
+	if key == "" {
+		return standaloneFact{}, false
+	}
+	s.mu.RLock()
+	fact, ok := s.facts[key]
+	s.mu.RUnlock()
+	return fact, ok
+}
+
+func (s *standaloneFactStore) lookupFunctionSummary(fn *types.Func) (model.Goroutine, bool) {
+	fact, ok := s.lookup(fn)
+	return fact.lifecycle, ok
+}
+
+func (s *standaloneFactStore) lookupParamEffects(fn *types.Func, index int) (model.ParamEffect, bool) {
+	fact, ok := s.lookup(fn)
+	if !ok {
+		return 0, false
+	}
+	effect, ok := fact.paramEffects[index]
+	return effect, ok
+}
+
+func (s *standaloneFactStore) lookupParamDoneEffects(fn *types.Func, index int) (model.ParamEffect, bool) {
+	fact, ok := s.lookup(fn)
+	if !ok {
+		return 0, false
+	}
+	effect, ok := fact.paramDoneEffects[index]
+	return effect, ok
+}
+
+func (s *standaloneFactStore) lookupReturnFieldSites(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+	fact, ok := s.lookup(fn)
+	if !ok {
+		return nil, false
+	}
+	return append([]model.ReturnFieldSite(nil), fact.returnFieldSites...), true
 }
 
 // packageLoader owns the run-wide token/file universe and export-data importer.
@@ -154,6 +311,118 @@ func newPackageLoader(exports map[string]string) *packageLoader {
 	}
 }
 
+type analysisUnit struct {
+	pkg        listedPackage
+	rootResult int // -1 for summary-only dependencies
+}
+
+// selectAnalysisUnits adds same-main-module source dependencies to the
+// requested roots as summary-only units. This is the standalone equivalent of
+// go/analysis running dependency packages to make object facts available to a
+// dependent analyzer invocation. Standard-library and third-party dependency
+// source is intentionally not pulled into standalone analysis yet: doing that
+// would turn a narrow command into a source analysis of the entire transitive
+// build graph. Missing external summaries therefore retain the frontend's
+// conservative unknown/transfer behavior.
+func selectAnalysisUnits(packages, roots []listedPackage) []analysisUnit {
+	units := make([]analysisUnit, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for i, root := range roots {
+		units = append(units, analysisUnit{pkg: root, rootResult: i})
+		seen[root.ImportPath] = struct{}{}
+	}
+
+	// go list -test synthesizes a <pkg>.test main. Never add that as a
+	// summary dependency even if go list marks it DepOnly for a particular
+	// invocation shape.
+	harness := make(map[string]struct{})
+	for _, p := range packages {
+		if p.ForTest != "" {
+			harness[p.ForTest+".test"] = struct{}{}
+		}
+	}
+	for _, p := range packages {
+		if !p.DepOnly || p.ForTest != "" || p.Module == nil || !p.Module.Main || len(p.GoFiles)+len(p.CgoFiles) == 0 {
+			continue
+		}
+		if _, synthetic := harness[p.ImportPath]; synthetic {
+			continue
+		}
+		if _, exists := seen[p.ImportPath]; exists {
+			continue
+		}
+		units = append(units, analysisUnit{pkg: p, rootResult: -1})
+		seen[p.ImportPath] = struct{}{}
+	}
+	return units
+}
+
+func resolvedImportPath(p listedPackage, path string) string {
+	if mapped := p.ImportMap[path]; mapped != "" {
+		return mapped
+	}
+	return path
+}
+
+// analysisLevels returns deterministic dependency-first waves. Packages in one
+// wave have no selected dependency on each other and can therefore be analyzed
+// concurrently; every summary needed by a later wave has been committed before
+// that wave starts.
+func analysisLevels(units []analysisUnit) ([][]int, error) {
+	byPath := make(map[string]int, len(units))
+	for i, unit := range units {
+		byPath[unit.pkg.ImportPath] = i
+	}
+	indegree := make([]int, len(units))
+	dependents := make([][]int, len(units))
+	for i, unit := range units {
+		seenDeps := make(map[int]struct{})
+		for _, imported := range unit.pkg.Imports {
+			depPath := resolvedImportPath(unit.pkg, imported)
+			j, ok := byPath[depPath]
+			if !ok || j == i {
+				continue
+			}
+			if _, seen := seenDeps[j]; seen {
+				continue
+			}
+			seenDeps[j] = struct{}{}
+			indegree[i]++
+			dependents[j] = append(dependents[j], i)
+		}
+	}
+
+	var ready []int
+	for i, degree := range indegree {
+		if degree == 0 {
+			ready = append(ready, i)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool { return units[ready[i]].pkg.ImportPath < units[ready[j]].pkg.ImportPath })
+	var levels [][]int
+	processed := 0
+	for len(ready) != 0 {
+		level := append([]int(nil), ready...)
+		levels = append(levels, level)
+		processed += len(level)
+		var next []int
+		for _, i := range level {
+			for _, dependent := range dependents[i] {
+				indegree[dependent]--
+				if indegree[dependent] == 0 {
+					next = append(next, dependent)
+				}
+			}
+		}
+		sort.Slice(next, func(i, j int) bool { return units[next[i]].pkg.ImportPath < units[next[j]].pkg.ImportPath })
+		ready = next
+	}
+	if processed != len(units) {
+		return nil, fmt.Errorf("selected package graph contains an import cycle")
+	}
+	return levels, nil
+}
+
 func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, engine.Status, error) {
 	cwd, _ := os.Getwd()
 	packages, err := listPackages(ctx, patterns, cfg.IncludeTests)
@@ -168,11 +437,18 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 	}
 	loader := newPackageLoader(exports)
 	roots := selectAnalysisRoots(packages, cfg.IncludeTests)
-	for _, p := range roots {
-		if p.Error != nil {
-			return nil, engine.Coverage{}, engine.Status{}, fmt.Errorf("package %s: %s", p.ImportPath, p.Error.Err)
+	units := selectAnalysisUnits(packages, roots)
+	for _, unit := range units {
+		if unit.pkg.Error != nil {
+			return nil, engine.Coverage{}, engine.Status{}, fmt.Errorf("package %s: %s", unit.pkg.ImportPath, unit.pkg.Error.Err)
 		}
 	}
+	levels, err := analysisLevels(units)
+	if err != nil {
+		return nil, engine.Coverage{}, engine.Status{}, err
+	}
+	facts := newStandaloneFactStore()
+
 	type packageResult struct {
 		diagnostics []engine.Diagnostic
 		coverage    engine.Coverage
@@ -181,20 +457,6 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 	results := make([]packageResult, len(roots))
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	jobs := make(chan int, len(roots))
-	for i := range roots {
-		jobs <- i
-	}
-	close(jobs)
-
-	workers := runtime.GOMAXPROCS(0)
-	if workers > len(roots) {
-		workers = len(roots)
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	var wg sync.WaitGroup
 	var firstErr error
 	var errOnce sync.Once
 	fail := func(err error) {
@@ -203,46 +465,94 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 			cancel()
 		})
 	}
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range jobs {
-				if workCtx.Err() != nil {
-					return
-				}
-				p := roots[i]
-				loaded, err := loader.loadOne(workCtx, p, cfg.IncludeTests)
-				if err != nil {
-					fail(fmt.Errorf("load %s: %w", p.ImportPath, err))
-					return
-				}
-				kept := frontend.FilterFiles(loaded.Fset, loaded.Files, cfg, cwd)
-				program, err := frontend.BuildContext(workCtx, frontend.Input{Fset: loaded.Fset, Files: kept, Pkg: loaded.Pkg, Info: loaded.Info, ExcludedFiles: len(loaded.Files) - len(kept)}, cfg)
-				if err != nil {
-					// BuildContext may have completed some functions before a deadline.
-					// Preserve those diagnostics/coverage; main adds the timeout reason to
-					// the run status independently of diagnostic filtering.
-					if program.FunctionCount > 0 || len(program.Functions) > 0 {
-						results[i].diagnostics, results[i].status = engine.AnalyzeWithStatus(program, cfg)
-						results[i].coverage = engine.Summarize(program)
+
+	// Analyze dependency-first waves. This is the standalone substitute for
+	// go/analysis fact scheduling: once a wave completes, its source-derived
+	// function summaries are immutable and visible to every dependent package
+	// in later waves through the Lookup* hooks below.
+	for _, level := range levels {
+		if workCtx.Err() != nil {
+			break
+		}
+		jobs := make(chan int, len(level))
+		for _, unitIndex := range level {
+			jobs <- unitIndex
+		}
+		close(jobs)
+
+		workers := runtime.GOMAXPROCS(0)
+		if workers > len(level) {
+			workers = len(level)
+		}
+		if workers < 1 {
+			workers = 1
+		}
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for unitIndex := range jobs {
+					if workCtx.Err() != nil {
+						return
 					}
-					fail(fmt.Errorf("analyze %s: %w", p.ImportPath, err))
-					return
+					unit := units[unitIndex]
+					p := unit.pkg
+					// A summary-only dependency is compiled as a dependency, not as
+					// a request to run that dependency's own tests. Test variants
+					// selected as actual roots already carry their test files in
+					// GoFiles from go list -test.
+					includePackageTests := cfg.IncludeTests && unit.rootResult >= 0
+					loaded, err := loader.loadOne(workCtx, p, includePackageTests)
+					if err != nil {
+						fail(fmt.Errorf("load %s: %w", p.ImportPath, err))
+						return
+					}
+					kept := frontend.FilterFiles(loaded.Fset, loaded.Files, cfg, cwd)
+					program, buildErr := frontend.BuildContext(workCtx, frontend.Input{
+						Fset:                   loaded.Fset,
+						Files:                  kept,
+						Pkg:                    loaded.Pkg,
+						Info:                   loaded.Info,
+						ExcludedFiles:          len(loaded.Files) - len(kept),
+						LookupFunctionSummary:  facts.lookupFunctionSummary,
+						LookupParamEffects:     facts.lookupParamEffects,
+						LookupParamDoneEffects: facts.lookupParamDoneEffects,
+						LookupReturnFieldSites: facts.lookupReturnFieldSites,
+					}, cfg)
+
+					// Program contains only functions that BuildContext completed far
+					// enough to export. Recording before handling cancellation mirrors
+					// analyzer.exportFunctionFacts: useful completed summaries survive,
+					// while no dependent wave runs after the failure anyway.
+					facts.recordPackage(loaded, program)
+
+					if unit.rootResult >= 0 {
+						r := &results[unit.rootResult]
+						if buildErr == nil || program.FunctionCount > 0 || len(program.Functions) > 0 {
+							r.diagnostics, r.status = engine.AnalyzeWithStatus(program, cfg)
+							r.coverage = engine.Summarize(program)
+						}
+					}
+					if buildErr != nil {
+						fail(fmt.Errorf("analyze %s: %w", p.ImportPath, buildErr))
+						return
+					}
 				}
-				results[i].diagnostics, results[i].status = engine.AnalyzeWithStatus(program, cfg)
-				results[i].coverage = engine.Summarize(program)
-			}
-		}()
+			}()
+		}
+		wg.Wait()
+		if firstErr != nil {
+			break
+		}
 	}
-	wg.Wait()
 
 	var all []engine.Diagnostic
 	var totalCoverage engine.Coverage
 	var totalStatus engine.Status
-	// All package results are available now, so reserve the exact unsupported-
-	// target capacity once. Merge then appends each package into this run-owned
-	// accumulator without repeatedly copying everything accumulated so far.
+	// All requested-root results are available now, so reserve the exact
+	// unsupported-target capacity once. Summary-only dependencies do not
+	// contribute diagnostics/coverage to the user's report.
 	totalUnsupported := 0
 	for i := range results {
 		totalUnsupported += len(results[i].coverage.UnsupportedTargets)

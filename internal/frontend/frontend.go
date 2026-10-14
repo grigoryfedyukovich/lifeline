@@ -36,7 +36,9 @@ type Input struct {
 	// LookupFunctionSummary provides a version-validated lifecycle summary for
 	// a direct function target whose source body is outside the current package.
 	// The go/analysis adapter backs this with versioned object facts. Standalone
-	// mode leaves it nil and reports such targets as unsupported.
+	// mode supplies the equivalent source-derived summary for requested packages
+	// and same-main-module dependencies analyzed earlier in dependency order;
+	// other external targets remain unsupported.
 	LookupFunctionSummary func(*types.Func) (model.Goroutine, bool)
 
 	// LookupParamConsumption is LookupFunctionSummary's counterpart for
@@ -48,9 +50,10 @@ type Input struct {
 	// with the added benefit of the interprocedural fixed point (a fact
 	// is a one-shot snapshot from whenever the callee's own package was
 	// last analyzed, not something this build's own sweep can improve on
-	// by trying again). Standalone mode leaves this nil, same as
-	// LookupFunctionSummary, and argumentConsumed falls back to "assume
-	// transferred" exactly as it does for any other unresolvable callee.
+	// by trying again). Standalone mode backs this through its source-derived
+	// per-function summary store for requested packages and same-main-module
+	// dependencies; an unavailable external summary still falls back to
+	// "assume transferred" exactly as any other unresolvable callee does.
 	//
 	// LookupParamConsumption is the coarse, legacy form of
 	// LookupParamEffects below: a bare "consumed somehow". It is consulted
@@ -69,7 +72,9 @@ type Input struct {
 	// model.ParamEffect set (may / must / returns / opaque), backed the
 	// same way by a versioned object fact (FunctionFact.ParamEffects). A
 	// same-package callee never uses this: b.paramEffects answers it
-	// directly with the same semantics. Standalone mode leaves it nil.
+	// directly with the same semantics. Standalone mode supplies the same
+	// hook from summaries computed dependency-first for source packages it
+	// analyzes itself.
 	LookupParamEffects func(fn *types.Func, paramIndex int) (effect model.ParamEffect, ok bool)
 
 	// LookupParamDoneEffects is calleeDoneEffect's cross-package
@@ -79,9 +84,9 @@ type Input struct {
 	// (model.EffectMay) or on every path (model.EffectMust), to any depth.
 	// An observed Done somewhere is not a guarantee that it happens, let
 	// alone exactly once (audit finding F6); only Must counts a spawned
-	// worker's Done as matched. Standalone mode leaves this nil, same as the
-	// other Lookup* hooks, and calleeDoneEffect then reports no effect for a
-	// cross-package callee.
+	// worker's Done as matched. Standalone mode supplies this from its
+	// dependency-first source summary store where available; otherwise
+	// calleeDoneEffect reports no effect for that cross-package callee.
 	LookupParamDoneEffects func(fn *types.Func, paramIndex int) (effect model.ParamEffect, ok bool)
 
 	// LookupReturnFieldSites is the constructor/field-ownership

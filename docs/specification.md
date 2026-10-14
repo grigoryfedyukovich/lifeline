@@ -105,7 +105,7 @@ A cancel value assigned to `_` is lost immediately. A suggested edit is emitted 
 
 All of the above is reachability over a graph, not a proof: a resolving edge means a recognized escape exists, not that every execution takes it, and delegation/configured-stop edges are trusted rather than verified.
 
-This applies whenever a body was available to build a CFG from. A cross-package goroutine target resolved through a `go vet` fact does not yet have one (facts still carry only flat per-body booleans) and uses the older flat check as a fallback; see `docs/limitations.md`.
+This applies whenever a body was available to build a CFG from. A cross-package target does not carry the body/CFG itself, but its summary carries the exporting package's CFG/SCC-derived `LoopUnresolved` verdict, so vet facts and standalone same-main-module summaries preserve that LL1002 result without rebuilding the callee graph in the caller; see `docs/limitations.md`.
 
 Nested function literals have independent lifecycle summaries and independent CFGs. Their loops and stop paths cannot alter the enclosing goroutine's summary, although nested goroutine start sites are analyzed separately.
 
@@ -129,13 +129,13 @@ The stop-signal recognition above is function-scoped, not correlated to which sp
 ## 8. Architecture and internal boundary
 
 - Standalone mode uses `go list -deps -export -json -e` (adding `-test` when tests are enabled), `go/parser`, and `go/types`. Test mode analyzes Go's same-package and external test variants rather than manually appending `_test.go` files to a production-only dependency graph.
-- Root packages are analyzed concurrently with a worker count bounded by `GOMAXPROCS`; output remains sorted deterministically.
+- Requested roots plus same-main-module summary dependencies are analyzed in deterministic dependency-first waves. Packages within a wave run concurrently with a worker count bounded by `GOMAXPROCS`; only requested roots contribute diagnostics/coverage, and output remains sorted deterministically.
 - The typed frontend lowers parser objects into `internal/model` records containing spans and lifecycle facts. An optional debug/inspection mode also attaches the legacy flat SSA-like instructions.
 - `internal/localssa` versions local definitions and records lifecycle-relevant operations and canonical callees only when `frontend.Input.CollectIR` is explicitly enabled; production standalone/vet analysis skips this pass.
 - `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. `internal/frontend` attaches one to each goroutine body, and `internal/engine` consumes it for `LL1002`'s verdict (`docs/architecture.md`) via `model.CFG`'s own graph algorithms, without importing `go/ast`/`go/types` itself.
 - `internal/model.Solve` is a generic forward-dataflow worklist solver over a CFG; `internal/engine`'s `StopCapability`/`JoinObligation`/`Ownership` lattices are built on it (`docs/cfg-migration-plan.md` Phase 3, `docs/architecture.md`), dumpable via `-dump facts`. Only `StopCapability` is wired to real goroutines as of this release; no diagnostic rule reads a dataflow result yet.
 - `internal/engine` imports neither `go/ast` nor `go/types`.
-- Vet mode exports and imports versioned object facts for named function lifecycle summaries. As of fact schema version 3 (Phase 4, `docs/cfg-migration-plan.md`), the exported fact includes a CFG/SCC-derived `LoopUnresolved` verdict alongside the prior flat booleans, so a cross-package `LL1002` target gets the same precision a same-package or closure target has from `internal/cfg`/`internal/engine`. An incompatible fact version is unavailable, not reinterpreted.
+- Vet mode exports and imports versioned object facts for named function lifecycle summaries. As of fact schema version 3 (Phase 4, `docs/cfg-migration-plan.md`), the exported fact includes a CFG/SCC-derived `LoopUnresolved` verdict alongside the prior flat booleans, so a cross-package `LL1002` target gets the same precision a same-package or closure target has from `internal/cfg`/`internal/engine`. An incompatible fact version is unavailable, not reinterpreted. Standalone mode computes equivalent in-memory summaries for requested packages and same-main-module dependencies, dependency-first, and supplies them through the same frontend `Lookup*` interfaces; external/standard-library packages remain summary-unavailable.
 - Rendering is isolated in `internal/report`.
 
 There is no Lifeline-managed persistent result cache in v0.1.1. If one is introduced, its key must include the tool and fact versions, Go toolchain/build configuration, source and dependency digests, effective configuration, and backend mode.
