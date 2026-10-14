@@ -34,7 +34,10 @@ func dumpCFGs(ctx context.Context, patterns []string, cfg config.Config, format 
 			exports[p.ImportPath] = p.Export
 		}
 	}
-	loader := newPackageLoader(exports)
+	loader, err := newTargetPackageLoader(ctx, exports)
+	if err != nil {
+		return err
+	}
 	roots := selectAnalysisRoots(packages, cfg.IncludeTests)
 	for _, p := range roots {
 		if p.Error != nil {

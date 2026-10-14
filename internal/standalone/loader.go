@@ -221,8 +221,10 @@ func (s *standaloneFactStore) lookupReturnFieldSites(fn *types.Func) ([]model.Re
 // allowing already-imported packages to be returned without re-decoding their
 // export data.
 type packageLoader struct {
-	fset    *token.FileSet
-	imports *sharedExportImporter
+	fset       *token.FileSet
+	imports    *sharedExportImporter
+	targetArch string
+	sizes      types.Sizes
 }
 
 type sharedExportImporter struct {
@@ -297,6 +299,21 @@ func (m mappedImporter) ImportFrom(path, srcDir string, mode types.ImportMode) (
 }
 
 func newPackageLoader(exports map[string]string) *packageLoader {
+	// Compatibility helper for unit tests and callers that do not have a Go
+	// command/build context. Production standalone entry points use
+	// newTargetPackageLoader so cross-compilation follows the target GOARCH.
+	loader, err := newPackageLoaderForArch(exports, runtime.GOARCH)
+	if err != nil {
+		panic(err) // the running Go toolchain must know its own architecture
+	}
+	return loader
+}
+
+func newPackageLoaderForArch(exports map[string]string, arch string) (*packageLoader, error) {
+	sizes := types.SizesFor("gc", arch)
+	if sizes == nil {
+		return nil, fmt.Errorf("unsupported gc target architecture %q", arch)
+	}
 	fset := token.NewFileSet()
 	lookup := func(path string) (io.ReadCloser, error) {
 		file := exports[path]
@@ -306,9 +323,41 @@ func newPackageLoader(exports map[string]string) *packageLoader {
 		return os.Open(file)
 	}
 	return &packageLoader{
-		fset:    fset,
-		imports: newSharedExportImporter(importer.ForCompiler(fset, "gc", lookup)),
+		fset:       fset,
+		imports:    newSharedExportImporter(importer.ForCompiler(fset, "gc", lookup)),
+		targetArch: arch,
+		sizes:      sizes,
+	}, nil
+}
+
+func targetGOARCH(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "go", "env", "GOARCH")
+	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			msg := strings.TrimSpace(string(exitErr.Stderr))
+			if msg != "" {
+				return "", fmt.Errorf("go env GOARCH failed: %s", msg)
+			}
+		}
+		return "", fmt.Errorf("go env GOARCH failed: %w", err)
+	}
+	arch := strings.TrimSpace(string(out))
+	if arch == "" {
+		return "", fmt.Errorf("go env GOARCH returned an empty target architecture")
+	}
+	return arch, nil
+}
+
+func newTargetPackageLoader(ctx context.Context, exports map[string]string) (*packageLoader, error) {
+	arch, err := targetGOARCH(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newPackageLoaderForArch(exports, arch)
 }
 
 type analysisUnit struct {
@@ -435,7 +484,10 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 			exports[p.ImportPath] = p.Export
 		}
 	}
-	loader := newPackageLoader(exports)
+	loader, err := newTargetPackageLoader(ctx, exports)
+	if err != nil {
+		return nil, engine.Coverage{}, engine.Status{}, err
+	}
 	roots := selectAnalysisRoots(packages, cfg.IncludeTests)
 	units := selectAnalysisUnits(packages, roots)
 	for _, unit := range units {
@@ -772,7 +824,7 @@ func (l *packageLoader) loadOne(ctx context.Context, p listedPackage, includeTes
 	var typeErrors []string
 	conf := types.Config{
 		Importer: mappedImporter{shared: l.imports, importMap: p.ImportMap},
-		Sizes:    types.SizesFor("gc", runtime.GOARCH),
+		Sizes:    l.sizes,
 		Error: func(err error) {
 			typeErrors = append(typeErrors, err.Error())
 		},

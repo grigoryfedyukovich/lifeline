@@ -7,6 +7,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -409,5 +410,73 @@ func TestAnalysisLevelsPutDependencyBeforeCaller(t *testing.T) {
 	}
 	if len(levels) != 2 || len(levels[0]) != 1 || len(levels[1]) != 1 || levels[0][0] != 1 || levels[1][0] != 0 {
 		t.Fatalf("analysis levels = %#v, want dep then root", levels)
+	}
+}
+
+func TestPackageLoaderUsesConfiguredTargetSizes(t *testing.T) {
+	hostSizes := types.SizesFor("gc", runtime.GOARCH)
+	if hostSizes == nil {
+		t.Skipf("gc sizes unavailable for host architecture %q", runtime.GOARCH)
+	}
+	hostPtr := hostSizes.Sizeof(types.Typ[types.Uintptr])
+	targetArch := "386"
+	targetPtr := int64(4)
+	if hostPtr == targetPtr {
+		targetArch = "amd64"
+		targetPtr = 8
+	}
+	if hostPtr == targetPtr {
+		t.Skipf("could not choose target with pointer width different from host %q", runtime.GOARCH)
+	}
+
+	dir := t.TempDir()
+	source := fmt.Sprintf(`package p
+import "unsafe"
+var _ [%d]byte = [unsafe.Sizeof(uintptr(0))]byte{}
+`, targetPtr)
+	if err := os.WriteFile(filepath.Join(dir, "p.go"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkg := listedPackage{Dir: dir, ImportPath: "example.test/targetsizes", GoFiles: []string{"p.go"}}
+
+	targetLoader, err := newPackageLoaderForArch(nil, targetArch)
+	if err != nil {
+		t.Fatalf("newPackageLoaderForArch(%q): %v", targetArch, err)
+	}
+	if targetLoader.targetArch != targetArch {
+		t.Fatalf("loader targetArch = %q, want %q", targetLoader.targetArch, targetArch)
+	}
+	if _, err := targetLoader.loadOne(context.Background(), pkg, false); err != nil {
+		t.Fatalf("target %s should type-check target-sized unsafe.Sizeof expression: %v", targetArch, err)
+	}
+
+	hostLoader, err := newPackageLoaderForArch(nil, runtime.GOARCH)
+	if err != nil {
+		t.Fatalf("newPackageLoaderForArch(host %q): %v", runtime.GOARCH, err)
+	}
+	if _, err := hostLoader.loadOne(context.Background(), pkg, false); err == nil {
+		t.Fatalf("host-sized loader unexpectedly accepted source requiring %d-byte uintptr target; host uintptr is %d", targetPtr, hostPtr)
+	}
+}
+
+func TestTargetGOARCHUsesGoBuildEnvironment(t *testing.T) {
+	target := "386"
+	if runtime.GOARCH == target {
+		target = "amd64"
+	}
+	t.Setenv("GOARCH", target)
+	got, err := targetGOARCH(context.Background())
+	if err != nil {
+		t.Fatalf("targetGOARCH: %v", err)
+	}
+	if got != target {
+		t.Fatalf("targetGOARCH = %q, want %q", got, target)
+	}
+	loader, err := newTargetPackageLoader(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("newTargetPackageLoader: %v", err)
+	}
+	if loader.targetArch != target {
+		t.Fatalf("loader targetArch = %q, want go env target %q", loader.targetArch, target)
 	}
 }
