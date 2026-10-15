@@ -544,6 +544,117 @@ func Leak(parent context.Context) {
 	t.Fatalf("cross-package no-consume fact did not preserve caller obligation; diagnostics = %#v", diags)
 }
 
+func TestSelectAnalysisUnitsIncludesThirdPartySourceButNotStandardLibrary(t *testing.T) {
+	roots := []listedPackage{{ImportPath: "example.test/root", GoFiles: []string{"root.go"}}}
+	packages := []listedPackage{
+		{ImportPath: "example.test/root", GoFiles: []string{"root.go"}},
+		{ImportPath: "example.test/localdep", DepOnly: true, GoFiles: []string{"local.go"}, Module: &listedModule{Main: true}},
+		{ImportPath: "third.example/dep", DepOnly: true, GoFiles: []string{"dep.go"}, Module: &listedModule{Path: "third.example/dep"}},
+		{ImportPath: "context", DepOnly: true, Standard: true, GoFiles: []string{"context.go"}},
+	}
+	units := selectAnalysisUnits(packages, roots)
+	got := make(map[string]int)
+	for _, unit := range units {
+		got[unit.pkg.ImportPath] = unit.rootResult
+	}
+	if got["example.test/root"] != 0 {
+		t.Fatalf("root result = %d, want 0", got["example.test/root"])
+	}
+	if got["example.test/localdep"] != -1 {
+		t.Fatalf("same-module dependency result = %d, want summary-only", got["example.test/localdep"])
+	}
+	if got["third.example/dep"] != -1 {
+		t.Fatalf("third-party dependency result = %d, want summary-only", got["third.example/dep"])
+	}
+	if _, ok := got["context"]; ok {
+		t.Fatal("standard-library dependency unexpectedly selected for source summary analysis")
+	}
+}
+
+func TestAnalyzePatternsUsesThirdPartyModuleDependencyFacts(t *testing.T) {
+	workspace := t.TempDir()
+	rootDir := filepath.Join(workspace, "rootmod")
+	depDir := filepath.Join(workspace, "depmod")
+	write := func(path, contents string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(depDir, "go.mod"), "module third.example/dep\n\ngo 1.20\n")
+	write(filepath.Join(depDir, "dep.go"), `package dep
+import "context"
+
+// Drop is intentionally a no-op. The caller must retain its own obligation.
+func Drop(cancel context.CancelFunc) { _ = cancel }
+`)
+	write(filepath.Join(rootDir, "go.mod"), `module example.test/rootmod
+
+go 1.20
+
+require third.example/dep v0.0.0
+replace third.example/dep => ../depmod
+`)
+	write(filepath.Join(rootDir, "root", "root.go"), `package root
+import (
+	"context"
+	"third.example/dep"
+)
+
+func Leak(parent context.Context) {
+	_, cancel := context.WithCancel(parent)
+	dep.Drop(cancel)
+}
+`)
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(rootDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	packages, err := listPackages(context.Background(), []string{"./root"}, false)
+	if err != nil {
+		t.Fatalf("listPackages: %v", err)
+	}
+	var thirdParty listedPackage
+	for _, pkg := range packages {
+		if pkg.ImportPath == "third.example/dep" {
+			thirdParty = pkg
+			break
+		}
+	}
+	if thirdParty.ImportPath == "" {
+		t.Fatal("third-party dependency missing from go list graph")
+	}
+	if thirdParty.Standard || thirdParty.Module == nil || thirdParty.Module.Main {
+		t.Fatalf("third-party package metadata = %#v, want non-standard non-main module", thirdParty)
+	}
+
+	cfg := config.Default()
+	cfg.Timeout = "30s"
+	diags, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
+	if err != nil {
+		t.Fatalf("analyzePatterns: %v", err)
+	}
+	for _, d := range diags {
+		if d.RuleID == "LL1001" && strings.HasSuffix(d.Function, ".Leak") {
+			return
+		}
+	}
+	t.Fatalf("third-party no-consume fact did not preserve caller obligation; diagnostics = %#v", diags)
+}
+
 func TestAnalysisLevelsPutDependencyBeforeCaller(t *testing.T) {
 	units := []analysisUnit{
 		{pkg: listedPackage{ImportPath: "example.test/root", Imports: []string{"example.test/dep"}}, rootResult: 0},

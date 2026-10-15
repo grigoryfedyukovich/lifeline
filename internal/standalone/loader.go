@@ -373,14 +373,15 @@ type analysisUnit struct {
 	rootResult int // -1 for summary-only dependencies
 }
 
-// selectAnalysisUnits adds same-main-module source dependencies to the
-// requested roots as summary-only units. This is the standalone equivalent of
-// go/analysis running dependency packages to make object facts available to a
-// dependent analyzer invocation. Standard-library and third-party dependency
-// source is intentionally not pulled into standalone analysis yet: doing that
-// would turn a narrow command into a source analysis of the entire transitive
-// build graph. Missing external summaries therefore retain the frontend's
-// conservative unknown/transfer behavior.
+// selectAnalysisUnits adds non-standard source dependencies to the requested
+// roots as summary-only units. This is the standalone equivalent of go/analysis
+// running dependency packages to make object facts available to a dependent
+// analyzer invocation. It includes dependencies from the main module and from
+// third-party modules whenever go list exposes Go source for them. Standard
+// library packages remain export-data-only for now: source-analyzing the entire
+// toolchain library would substantially widen every standalone run, so missing
+// standard-library summaries retain the frontend's conservative unknown/transfer
+// behavior.
 func selectAnalysisUnits(packages, roots []listedPackage) []analysisUnit {
 	units := make([]analysisUnit, 0, len(roots))
 	seen := make(map[string]struct{}, len(roots))
@@ -399,7 +400,7 @@ func selectAnalysisUnits(packages, roots []listedPackage) []analysisUnit {
 		}
 	}
 	for _, p := range packages {
-		if !p.DepOnly || p.ForTest != "" || p.Module == nil || !p.Module.Main || len(p.GoFiles)+len(p.CgoFiles) == 0 {
+		if !p.DepOnly || p.ForTest != "" || p.Standard || len(p.GoFiles)+len(p.CgoFiles) == 0 {
 			continue
 		}
 		if _, synthetic := harness[p.ImportPath]; synthetic {
