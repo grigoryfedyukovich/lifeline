@@ -480,6 +480,82 @@ func analysisLevels(units []analysisUnit) ([][]int, error) {
 	return levels, nil
 }
 
+func sourcePathsForAnalysis(p listedPackage, includeTests bool) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		path := name
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(p.Dir, path)
+		}
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		out = append(out, path)
+	}
+	for _, name := range p.GoFiles {
+		add(name)
+	}
+	for _, name := range p.CgoFiles {
+		add(name)
+	}
+	if includeTests && p.ForTest == "" {
+		for _, name := range p.TestGoFiles {
+			add(name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// classifySourceExclusions performs the cheapest safe filtering work before
+// Lifeline parses and type-checks a package. ignore_paths can be decided from
+// the path alone. Generated files need only a package-clause/comment parse;
+// parser.PackageClauseOnly deliberately avoids parsing the function bodies.
+//
+// The returned map is keyed by canonical original source path. loadOneFiltered
+// still type-checks excluded files when any source in the package remains in
+// scope, because declarations from an excluded file may be required by an
+// included file. If every user source is excluded, analyzePatterns can skip
+// Lifeline parsing/type-checking of that package entirely.
+func classifySourceExclusions(ctx context.Context, p listedPackage, includeTests bool, cfg config.Config, cwd string) (map[string]struct{}, int, error) {
+	paths := sourcePathsForAnalysis(p, includeTests)
+	excluded := make(map[string]struct{})
+	for _, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		rel := path
+		if cwd != "" {
+			if r, err := filepath.Rel(cwd, path); err == nil {
+				rel = r
+			}
+		}
+		if cfg.MatchesIgnorePath(rel) {
+			excluded[path] = struct{}{}
+			continue
+		}
+		// A package-clause-only parse is sufficient for the generated-code
+		// convention because the marker must occur before the package clause.
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly|parser.ParseComments)
+		if err != nil {
+			return nil, 0, fmt.Errorf("classify %s: %w", path, err)
+		}
+		if frontend.IsGeneratedFile(file) {
+			excluded[path] = struct{}{}
+		}
+	}
+	return excluded, len(paths), nil
+}
+
 func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, engine.Status, error) {
 	cwd, _ := os.Getwd()
 	packages, err := listPackages(ctx, patterns, cfg.IncludeTests)
@@ -563,18 +639,35 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 					// selected as actual roots already carry their test files in
 					// GoFiles from go list -test.
 					includePackageTests := cfg.IncludeTests && unit.rootResult >= 0
-					loaded, err := loader.loadOne(workCtx, p, includePackageTests)
+					excluded, sourceCount, err := classifySourceExclusions(workCtx, p, includePackageTests, cfg, cwd)
+					if err != nil {
+						fail(fmt.Errorf("classify %s: %w", p.ImportPath, err))
+						return
+					}
+					if sourceCount > 0 && len(excluded) == sourceCount {
+						// No lifecycle source survives. The old path still parsed and
+						// type-checked the entire package before discovering this. Preserve
+						// the same empty semantic result and auditable excluded-file count
+						// without doing Lifeline's own source/type work.
+						if unit.rootResult >= 0 {
+							program := model.Program{PackagePath: p.ImportPath, ExcludedFiles: sourceCount}
+							r := &results[unit.rootResult]
+							r.diagnostics, r.status = engine.AnalyzeWithStatus(program, cfg)
+							r.coverage = engine.Summarize(program)
+						}
+						continue
+					}
+					loaded, err := loader.loadOneFiltered(workCtx, p, includePackageTests, excluded)
 					if err != nil {
 						fail(fmt.Errorf("load %s: %w", p.ImportPath, err))
 						return
 					}
-					kept := frontend.FilterFiles(loaded.Fset, loaded.AnalysisFiles, cfg, cwd)
 					program, buildErr := frontend.BuildContext(workCtx, frontend.Input{
 						Fset:                   loaded.Fset,
-						Files:                  kept,
+						Files:                  loaded.AnalysisFiles,
 						Pkg:                    loaded.Pkg,
 						Info:                   loaded.Info,
-						ExcludedFiles:          len(loaded.AnalysisFiles) - len(kept),
+						ExcludedFiles:          len(excluded),
 						LookupFunctionSummary:  facts.lookupFunctionSummary,
 						LookupParamEffects:     facts.lookupParamEffects,
 						LookupParamDoneEffects: facts.lookupParamDoneEffects,
@@ -835,6 +928,10 @@ func loadOne(ctx context.Context, p listedPackage, exports map[string]string, in
 }
 
 func (l *packageLoader) loadOne(ctx context.Context, p listedPackage, includeTests bool) (*loadedPackage, error) {
+	return l.loadOneFiltered(ctx, p, includeTests, nil)
+}
+
+func (l *packageLoader) loadOneFiltered(ctx context.Context, p listedPackage, includeTests bool, excludedSources map[string]struct{}) (*loadedPackage, error) {
 	fset := l.fset
 	// -compiled makes go list expose the exact Go inputs presented to the
 	// compiler. That distinction matters for cgo: raw CgoFiles still import the
@@ -900,28 +997,42 @@ func (l *packageLoader) loadOne(ctx context.Context, p listedPackage, includeTes
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(p.Dir, path)
 		}
-		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.AllErrors)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w; fix syntax errors and rerun lifeline", path, err)
-		}
-		files = append(files, file)
-		if !usingCompiledInputs || len(p.CgoFiles) == 0 {
-			// Ordinary -compiled inputs are the package's real Go sources. Keep
-			// them all so a user-written //line directive cannot accidentally make
-			// a source file disappear from lifecycle analysis.
-			analysisFiles = append(analysisFiles, file)
-			continue
-		}
 		actual := path
 		if abs, err := filepath.Abs(actual); err == nil {
 			actual = abs
 		}
 		actual = filepath.Clean(actual)
+		parseMode := parser.AllErrors
+		// Type checking never consumes comments. For ordinary source files that
+		// were already excluded by path/generated-marker classification, avoid
+		// allocating their comment AST as well. cgo translated inputs need
+		// comments until their //line mapping identifies the original source.
+		if len(p.CgoFiles) > 0 || usingCompiledInputs && len(excludedSources) == 0 {
+			parseMode |= parser.ParseComments
+		} else if _, excluded := excludedSources[actual]; !excluded {
+			parseMode |= parser.ParseComments
+		}
+		file, err := parser.ParseFile(fset, path, nil, parseMode)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w; fix syntax errors and rerun lifeline", path, err)
+		}
+		files = append(files, file)
+		if !usingCompiledInputs || len(p.CgoFiles) == 0 {
+			// Ordinary -compiled inputs are the package's real Go sources. A
+			// preclassified exclusion still remains in Files for type resolution
+			// but never reaches lifecycle analysis.
+			if _, excluded := excludedSources[actual]; !excluded {
+				analysisFiles = append(analysisFiles, file)
+			}
+			continue
+		}
 		if _, original := sourcePaths[actual]; original {
 			// Non-cgo source files in a package that also uses cgo remain ordinary
 			// compiler inputs; use their actual path rather than their possibly
 			// rewritten token position.
-			analysisFiles = append(analysisFiles, file)
+			if _, excluded := excludedSources[actual]; !excluded {
+				analysisFiles = append(analysisFiles, file)
+			}
 			continue
 		}
 		effective := fset.Position(file.Package).Filename
@@ -930,11 +1041,14 @@ func (l *packageLoader) loadOne(ctx context.Context, p listedPackage, includeTes
 		}
 		effective = filepath.Clean(effective)
 		if _, cgoSource := cgoSourcePaths[effective]; cgoSource {
+			if _, excluded := excludedSources[effective]; excluded {
+				continue
+			}
 			// cmd/cgo labels its translated cgo1 file as generated even though
 			// that AST is the compiler-equivalent form of the user's source. Drop
-			// only cmd/cgo's own marker so frontend.FilterFiles does not discard
-			// the translated source. If the original source itself carried a
-			// generated-code marker, that separate copied comment remains intact.
+			// only cmd/cgo's own marker so the translated user source remains
+			// analyzable. If the original source itself carried a generated-code
+			// marker, preclassification excluded it before this point.
 			stripCgoTranslationMarker(fset, file, effective)
 			analysisFiles = append(analysisFiles, file)
 		}
