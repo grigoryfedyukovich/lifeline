@@ -53,7 +53,7 @@ func dumpCFGs(ctx context.Context, patterns []string, cfg config.Config, format 
 		if err != nil {
 			return fmt.Errorf("load %s: %w", p.ImportPath, err)
 		}
-		for _, file := range loaded.Files {
+		for _, file := range loaded.AnalysisFiles {
 			for _, d := range file.Decls {
 				fd, ok := d.(*ast.FuncDecl)
 				if !ok || fd.Body == nil {

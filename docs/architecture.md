@@ -2,7 +2,7 @@
 
 ```mermaid
 flowchart LR
-    CLI[Standalone CLI] --> GL["go list -deps (-test) -export"]
+    CLI[Standalone CLI] --> GL["go list -deps (-test) -compiled -export"]
     GL --> POOL[Bounded package worker pool]
     POOL --> PARSE[go/parser + go/types]
     VET[go vet unitchecker] --> FE[Typed frontend]
@@ -41,7 +41,7 @@ The dotted edge is deliberate: `-dump cfg` calls `internal/cfg` directly, with n
 
 ## Standalone loading
 
-The command invokes `go list -deps -export -json -e` with an argument array, never shell interpolation; with `-tests` it adds `-test` so Go supplies the actual test compilation graph and test-only dependencies. Its JSON objects are decoded incrementally from the subprocess stdout pipe; Lifeline does not retain the complete discovery stream in memory, and stderr retention is bounded. Build selection, module replacements, vendoring, and tags are delegated to the Go command. Export files are used by `go/importer`; target package source is parsed and type-checked locally. Before creating the run loader, standalone asks the Go command for the active `GOARCH` (`go env GOARCH`) and uses `types.SizesFor("gc", GOARCH)` for every root/source-summary type check. This keeps `unsafe.Sizeof`, array lengths, offsets, and other size-sensitive typing aligned with the selected cross-compilation target rather than the host running Lifeline.
+The command invokes `go list -deps -compiled -export -json -e` with an argument array, never shell interpolation; with `-tests` it adds `-test` so Go supplies the actual test compilation graph and test-only dependencies. Its JSON objects are decoded incrementally from the subprocess stdout pipe; Lifeline does not retain the complete discovery stream in memory, and stderr retention is bounded. Build selection, module replacements, vendoring, and tags are delegated to the Go command. Export files are used by `go/importer`; target package source is parsed and type-checked locally. Before creating the run loader, standalone asks the Go command for the active `GOARCH` (`go env GOARCH`) and uses `types.SizesFor("gc", GOARCH)` for every root/source-summary type check. This keeps `unsafe.Sizeof`, array lengths, offsets, and other size-sensitive typing aligned with the selected cross-compilation target rather than the host running Lifeline. For cgo packages, standalone type-checks `CompiledGoFiles` rather than raw `CgoFiles`, so cmd/cgo has already rewritten the pseudo-import `"C"` into ordinary Go declarations. The generated support files remain part of type checking, while only compiler inputs whose effective `//line` position maps back to one of the package's original Go sources are lifecycle-analyzed; cmd/cgo's own generated marker is stripped from that translated source so the generated-file filter does not discard user code.
 
 One standalone run owns one token file set and one compiler-export importer cache. Root packages still have independent `types.Info` maps and independent source type-check results, but dependency packages decoded from export data are shared across roots instead of being decoded into a fresh type universe for every root. Per-root `ImportMap` translation happens before the shared canonical import. Cache misses are serialized because the standard gc importer mutates its internal package map; completed imported packages are immutable and reused directly.
 

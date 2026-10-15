@@ -105,7 +105,7 @@ func dumpFacts(ctx context.Context, patterns []string, cfg config.Config, format
 		if err != nil {
 			return fmt.Errorf("load %s: %w", p.ImportPath, err)
 		}
-		program, err := frontend.Build(frontend.Input{Fset: loaded.Fset, Files: loaded.Files, Pkg: loaded.Pkg, Info: loaded.Info}, cfg)
+		program, err := frontend.Build(frontend.Input{Fset: loaded.Fset, Files: loaded.AnalysisFiles, Pkg: loaded.Pkg, Info: loaded.Info}, cfg)
 		if err != nil {
 			return fmt.Errorf("build %s: %w", p.ImportPath, err)
 		}
