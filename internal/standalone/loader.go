@@ -373,15 +373,15 @@ type analysisUnit struct {
 	rootResult int // -1 for summary-only dependencies
 }
 
-// selectAnalysisUnits adds non-standard source dependencies to the requested
-// roots as summary-only units. This is the standalone equivalent of go/analysis
-// running dependency packages to make object facts available to a dependent
-// analyzer invocation. It includes dependencies from the main module and from
-// third-party modules whenever go list exposes Go source for them. Standard
-// library packages remain export-data-only for now: source-analyzing the entire
-// toolchain library would substantially widen every standalone run, so missing
-// standard-library summaries retain the frontend's conservative unknown/transfer
-// behavior.
+// selectAnalysisUnits adds source dependencies to the requested roots as
+// summary-only units. This is the standalone equivalent of go/analysis running
+// dependency packages to make object facts available to a dependent analyzer
+// invocation. All non-standard dependencies with source exposed by go list are
+// included. To close the remaining standalone/vet parity gap without
+// source-analyzing the entire toolchain library, standard-library source is
+// included only for packages imported directly by a requested root. Their
+// transitive standard-library dependencies remain export-data-only; any effect
+// that depends on one of those still widens conservatively to unknown/opaque.
 func selectAnalysisUnits(packages, roots []listedPackage) []analysisUnit {
 	units := make([]analysisUnit, 0, len(roots))
 	seen := make(map[string]struct{}, len(roots))
@@ -411,6 +411,30 @@ func selectAnalysisUnits(packages, roots []listedPackage) []analysisUnit {
 		}
 		units = append(units, analysisUnit{pkg: p, rootResult: -1})
 		seen[p.ImportPath] = struct{}{}
+	}
+
+	// Analyze only standard-library packages imported directly by requested
+	// roots. Selecting every standard dependency from go list -deps would turn
+	// even a tiny target into a source analysis of much of GOROOT, undoing the
+	// scalability work in F11. Direct imports cover the standard-library callees
+	// that root source can name while keeping the additional work bounded.
+	byPath := make(map[string]listedPackage, len(packages))
+	for _, p := range packages {
+		byPath[p.ImportPath] = p
+	}
+	for _, root := range roots {
+		for _, imported := range root.Imports {
+			path := resolvedImportPath(root, imported)
+			p, ok := byPath[path]
+			if !ok || !p.Standard || p.ForTest != "" || len(p.GoFiles)+len(p.CgoFiles) == 0 {
+				continue
+			}
+			if _, exists := seen[p.ImportPath]; exists {
+				continue
+			}
+			units = append(units, analysisUnit{pkg: p, rootResult: -1})
+			seen[p.ImportPath] = struct{}{}
+		}
 	}
 	return units
 }

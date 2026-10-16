@@ -544,13 +544,15 @@ func Leak(parent context.Context) {
 	t.Fatalf("cross-package no-consume fact did not preserve caller obligation; diagnostics = %#v", diags)
 }
 
-func TestSelectAnalysisUnitsIncludesThirdPartySourceButNotStandardLibrary(t *testing.T) {
-	roots := []listedPackage{{ImportPath: "example.test/root", GoFiles: []string{"root.go"}}}
+func TestSelectAnalysisUnitsIncludesDirectStandardLibrarySourceOnly(t *testing.T) {
+	roots := []listedPackage{{ImportPath: "example.test/root", GoFiles: []string{"root.go"}, Imports: []string{"context", "example.test/localdep"}}}
 	packages := []listedPackage{
-		{ImportPath: "example.test/root", GoFiles: []string{"root.go"}},
-		{ImportPath: "example.test/localdep", DepOnly: true, GoFiles: []string{"local.go"}, Module: &listedModule{Main: true}},
+		{ImportPath: "example.test/root", GoFiles: []string{"root.go"}, Imports: []string{"context", "example.test/localdep"}},
+		{ImportPath: "example.test/localdep", DepOnly: true, GoFiles: []string{"local.go"}, Module: &listedModule{Main: true}, Imports: []string{"strings"}},
 		{ImportPath: "third.example/dep", DepOnly: true, GoFiles: []string{"dep.go"}, Module: &listedModule{Path: "third.example/dep"}},
-		{ImportPath: "context", DepOnly: true, Standard: true, GoFiles: []string{"context.go"}},
+		{ImportPath: "context", DepOnly: true, Standard: true, GoFiles: []string{"context.go"}, Imports: []string{"sync"}},
+		{ImportPath: "strings", DepOnly: true, Standard: true, GoFiles: []string{"strings.go"}},
+		{ImportPath: "sync", DepOnly: true, Standard: true, GoFiles: []string{"mutex.go"}},
 	}
 	units := selectAnalysisUnits(packages, roots)
 	got := make(map[string]int)
@@ -566,8 +568,14 @@ func TestSelectAnalysisUnitsIncludesThirdPartySourceButNotStandardLibrary(t *tes
 	if got["third.example/dep"] != -1 {
 		t.Fatalf("third-party dependency result = %d, want summary-only", got["third.example/dep"])
 	}
-	if _, ok := got["context"]; ok {
-		t.Fatal("standard-library dependency unexpectedly selected for source summary analysis")
+	if got["context"] != -1 {
+		t.Fatalf("direct standard-library dependency result = %d, want summary-only", got["context"])
+	}
+	if _, ok := got["strings"]; ok {
+		t.Fatal("standard library imported only by a summary dependency should remain export-data-only")
+	}
+	if _, ok := got["sync"]; ok {
+		t.Fatal("transitive standard-library dependency should remain export-data-only")
 	}
 }
 
@@ -653,6 +661,52 @@ func Leak(parent context.Context) {
 		}
 	}
 	t.Fatalf("third-party no-consume fact did not preserve caller obligation; diagnostics = %#v", diags)
+}
+
+func TestAnalyzePatternsUsesDirectStandardLibraryFunctionSummary(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, contents string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.test/stdsummary\n\ngo 1.20\n")
+	write("root.go", `package stdsummary
+import "strings"
+
+func Start() {
+	go strings.Clone("value")
+}
+`)
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	cfg := config.Default()
+	cfg.Timeout = "30s"
+	diags, coverage, _, err := analyzePatterns(context.Background(), []string{"."}, cfg)
+	if err != nil {
+		t.Fatalf("analyzePatterns: %v", err)
+	}
+	if len(diags) != 0 {
+		t.Fatalf("unexpected diagnostics = %#v", diags)
+	}
+	for _, target := range coverage.UnsupportedTargets {
+		if strings.Contains(target.Message, "no compatible fact") || strings.Contains(target.Message, "not locally available") {
+			t.Fatalf("direct standard-library goroutine target remained unsupported: %#v", target)
+		}
+	}
 }
 
 func TestAnalysisLevelsPutDependencyBeforeCaller(t *testing.T) {

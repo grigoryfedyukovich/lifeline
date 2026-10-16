@@ -51,8 +51,9 @@ type Input struct {
 	// is a one-shot snapshot from whenever the callee's own package was
 	// last analyzed, not something this build's own sweep can improve on
 	// by trying again). Standalone mode backs this through its source-derived
-	// per-function summary store for requested packages and same-main-module
-	// dependencies; an unavailable external summary still falls back to
+	// per-function summary store for requested packages, non-standard source
+	// dependencies, and direct standard-library imports selected by the driver;
+	// an unavailable external summary still falls back to
 	// "assume transferred" exactly as any other unresolvable callee does.
 	//
 	// LookupParamConsumption is the coarse, legacy form of

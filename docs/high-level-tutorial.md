@@ -34,7 +34,7 @@ go vet -vettool=$(pwd)/bin/lifeline ./...
 2. **Worker** should have a recognized stop path (select on `ctx.Done()`, channel close, break/return, or configured stop).
 3. **Join** should happen before the owner returns (`Wait`, or ownership transfer).
 
-Lifeline is still deliberately local and incomplete, but cross-package direct calls are no longer restricted to `go vet`: standalone mode computes compact summaries for non-standard source dependencies, including third-party modules, before their callers, while vet mode transports equivalent summaries as object facts. Standard-library bodies and indirect calls can still be unsupported. Opt into CI failure only with `-fail-on` after reviewing the results.
+Lifeline is still deliberately local and incomplete, but cross-package direct calls are no longer restricted to `go vet`: standalone mode computes compact summaries for non-standard source dependencies, including third-party modules, before their callers, and also summarizes standard-library packages imported directly by requested roots; vet mode transports equivalent summaries as object facts. Transitive standard-library bodies and indirect calls can still be unsupported. Opt into CI failure only with `-fail-on` after reviewing the results.
 
 ## Configuration (optional)
 

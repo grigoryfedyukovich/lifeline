@@ -80,7 +80,7 @@ Multi-value assignments are interpreted positionally when mapping a tracked valu
 
 Vet mode exports a versioned fact for each analyzed named function and imports it for direct cross-package lifecycle questions. The summary is deliberately small and contains no source body or opaque score. An incompatible fact version is ignored.
 
-Standalone mode does not persist or import vet facts, but it now computes the equivalent summaries from source for requested packages and non-standard dependencies whose source is exposed by `go list`, including dependencies from third-party modules. Those packages are analyzed dependency-first and their summaries are served through the same frontend lookup interfaces used by vet facts. Standard-library dependencies remain export-data-only, so their cross-package lifecycle behavior stays unavailable/approximate.
+Standalone mode does not persist or import vet facts, but it now computes equivalent summaries from source for requested packages and non-standard dependencies whose source is exposed by `go list`, including dependencies from third-party modules. It also source-summarizes standard-library packages imported directly by requested roots. Those packages are analyzed dependency-first and their summaries are served through the same frontend lookup interfaces used by vet facts. Transitive standard-library packages remain export-data-only, so behavior that depends on deeper stdlib summaries stays unavailable/approximate rather than being guessed.
 
 ## Bounds
 
