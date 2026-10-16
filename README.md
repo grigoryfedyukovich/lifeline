@@ -193,6 +193,7 @@ Every emitted fix is applied to source and type-checked in the test suite (`inte
 ```bash
 go test ./...
 go build ./cmd/lifeline
+make bench
 ```
 
 Dependencies needed by the analyzer driver are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.

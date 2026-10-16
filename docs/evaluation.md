@@ -75,3 +75,27 @@ Cross-building validates compilation, not runtime behavior on a macOS host.
 ## Next corpus work
 
 A broader precision study should sample several server/worker repositories, classify each finding independently, record unsupported targets, and retain minimized regression fixtures. Runtime should be split into package discovery, parse/type-check, model/SSA construction, recognition, and rendering phases.
+
+## Synthetic scaling benchmark harness (added 2026-10-09)
+
+The repository now includes Go benchmarks in `internal/frontend/benchmark_test.go` for three source-derived scaling risks from the deep audit:
+
+- caller-first `context.CancelFunc` delegation chains, which exercise interprocedural parameter-effect propagation;
+- constructor/handle forwarding chains, which exercise returned-obligation propagation and caller instantiation;
+- many independent `sync.WaitGroup` instances in one body, which exercise group indexing/accounting.
+
+Run the reproducible frontend benchmark set with:
+
+```bash
+make bench
+```
+
+or directly with a fixed iteration count when comparing two revisions:
+
+```bash
+go test -run '^$' -bench 'BenchmarkBuild' -benchtime=3x -benchmem ./internal/frontend
+```
+
+Fixture parsing, importing, and `go/types` checking happen once before `b.ResetTimer`, so reported time and allocations measure `frontend.Build` rather than Go compiler/importer setup. Each fixture also has a normal regression (`TestBenchmarkFixturesBuild`) so ordinary tests verify that the benchmark programs remain valid analysis inputs.
+
+No new canonical performance numbers are recorded here yet. This repository targets Go 1.25, and the environment used while adding the harness did not have the supported toolchain available offline. A compatibility run was used only to validate the benchmark code; its timing must not be compared with the historical Go 1.23.2 numbers above. The next evaluation update should record Go 1.25 hardware/toolchain details and retain raw `benchstat`-compatible output for before/after comparisons.

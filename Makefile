@@ -1,4 +1,4 @@
-.PHONY: all build test race check vet demo clean
+.PHONY: all build test race bench check vet demo clean
 
 all: check build
 
@@ -11,6 +11,9 @@ test:
 
 race:
 	go test -race -count=1 ./...
+
+bench:
+	go test -run '^$' -bench 'BenchmarkBuild' -benchmem ./internal/frontend
 
 check: test
 	go vet ./analyzer ./cmd/lifeline ./internal/...
