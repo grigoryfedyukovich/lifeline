@@ -99,3 +99,16 @@ go test -run '^$' -bench 'BenchmarkBuild' -benchtime=3x -benchmem ./internal/fro
 Fixture parsing, importing, and `go/types` checking happen once before `b.ResetTimer`, so reported time and allocations measure `frontend.Build` rather than Go compiler/importer setup. Each fixture also has a normal regression (`TestBenchmarkFixturesBuild`) so ordinary tests verify that the benchmark programs remain valid analysis inputs.
 
 No new canonical performance numbers are recorded here yet. This repository targets Go 1.25, and the environment used while adding the harness did not have the supported toolchain available offline. A compatibility run was used only to validate the benchmark code; its timing must not be compared with the historical Go 1.23.2 numbers above. The next evaluation update should record Go 1.25 hardware/toolchain details and retain raw `benchstat`-compatible output for before/after comparisons.
+
+## Reproducible CI and module state (added 2026-10-09)
+
+The repository now checks in `go.sum` for its direct module dependencies and `.github/workflows/ci.yml` for the supported Go toolchain declared in `go.mod`. CI performs the following gates on `ubuntu-latest`:
+
+1. `make modcheck` (`go mod tidy -diff`) so dependency metadata drift fails without rewriting files;
+2. `make check` for the ordinary test suite plus `go vet`;
+3. `make race`;
+4. a one-iteration `BenchmarkBuild...` smoke run;
+5. `make build` for the standalone executable.
+
+This closes the earlier snapshot-level reproducibility gap where neither a checksum file nor a checked-in workflow was present. It does **not** yet establish performance budgets: the benchmark smoke step proves the fixtures still execute, but it intentionally does not compare `ns/op`, allocations, or RSS against a committed threshold. The next validation tranche should record supported-Go-1.25 benchmark baselines and define regression tolerances before CI begins enforcing performance numbers.
+

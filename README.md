@@ -33,6 +33,22 @@ examples/ignored_context/worker.go:10:2: [LL1002] goroutine has an unconditional
   model: local-ast-types-ssa-summary/v2; max_functions=10000; timeout=5s
 ```
 
+
+## Development verification
+
+The repository pins module checksums in `go.sum` and includes a checked-in GitHub Actions workflow at `.github/workflows/ci.yml`. The CI job uses the Go version declared by `go.mod` and runs module-tidiness verification, tests, `go vet`, the race detector, a one-iteration scaling-benchmark smoke run, and a standalone build.
+
+Run the same core verification locally with:
+
+```bash
+make modcheck
+make check
+make race
+make bench
+```
+
+`make modcheck` uses `go mod tidy -diff`, so it reports stale `go.mod`/`go.sum` state without rewriting either file.
+
 ## Implemented rules
 
 | Rule | Meaning |
