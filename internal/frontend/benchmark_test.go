@@ -51,6 +51,8 @@ func newBenchmarkFixture(tb testing.TB, source string) benchmarkFixture {
 func benchmarkBuild(b *testing.B, source string) {
 	b.Helper()
 	fixture := newBenchmarkFixture(b, source)
+	var stats WorkStats
+	fixture.in.WorkStats = &stats
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -62,6 +64,13 @@ func benchmarkBuild(b *testing.B, source string) {
 			b.Fatal("benchmark fixture unexpectedly hit max_functions")
 		}
 	}
+	// These per-build work metrics are intentionally machine-independent. They
+	// make benchmark output useful even before a hardware-specific ns/op baseline
+	// is established and mirror the hard CI budgets in work_budget_test.go.
+	b.ReportMetric(float64(stats.ParameterEffectEvaluations), "param-evals/build")
+	b.ReportMetric(float64(stats.ConstructorEvaluations), "ctor-evals/build")
+	b.ReportMetric(float64(stats.StructuralCFGBuilds), "struct-cfg/build")
+	b.ReportMetric(float64(stats.GroupBalanceStatementVisits), "group-stmts/build")
 }
 
 func TestBenchmarkFixturesBuild(t *testing.T) {

@@ -1,4 +1,4 @@
-.PHONY: all build test race bench modcheck ci check vet demo clean
+.PHONY: all build test race bench perfcheck modcheck ci check vet demo clean
 
 all: check build
 
@@ -15,10 +15,13 @@ race:
 bench:
 	go test -run '^$' -bench 'BenchmarkBuild' -benchmem ./internal/frontend
 
+perfcheck:
+	go test -count=1 -run '^TestFrontendWorkBudgets$$' ./internal/frontend
+
 modcheck:
 	go mod tidy -diff
 
-ci: modcheck check race
+ci: modcheck check race perfcheck
 	go test -run '^$$' -bench 'BenchmarkBuild' -benchtime=1x ./internal/frontend
 
 check: test

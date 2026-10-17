@@ -107,8 +107,20 @@ The repository now checks in `go.sum` for its direct module dependencies and `.g
 1. `make modcheck` (`go mod tidy -diff`) so dependency metadata drift fails without rewriting files;
 2. `make check` for the ordinary test suite plus `go vet`;
 3. `make race`;
-4. a one-iteration `BenchmarkBuild...` smoke run;
-5. `make build` for the standalone executable.
+4. `make perfcheck` for machine-independent algorithmic scaling budgets;
+5. a one-iteration `BenchmarkBuild...` smoke run;
+6. `make build` for the standalone executable.
 
-This closes the earlier snapshot-level reproducibility gap where neither a checksum file nor a checked-in workflow was present. It does **not** yet establish performance budgets: the benchmark smoke step proves the fixtures still execute, but it intentionally does not compare `ns/op`, allocations, or RSS against a committed threshold. The next validation tranche should record supported-Go-1.25 benchmark baselines and define regression tolerances before CI begins enforcing performance numbers.
+This closes the earlier snapshot-level reproducibility gap where neither a checksum file nor a checked-in workflow was present.
+
+## Machine-independent scaling budgets (added 2026-10-09)
+
+CI now enforces algorithmic work budgets in addition to the benchmark smoke run. `frontend.Input.WorkStats` is an optional instrumentation sink reset for each build; it records parameter/Done fixed-point evaluations, constructor fixed-point evaluations, structural-CFG cache misses, and WaitGroup balance statement visits. `TestFrontendWorkBudgets` checks adversarial synthetic fixtures against linear bounds:
+
+- a caller-first parameter chain may require separate monotone parameter and `Done` propagation waves, but stays within roughly three selected-function evaluations per function;
+- a constructor-forwarding chain stays within roughly two constructor evaluations per selected function;
+- each structural body is built at most once into the structural-CFG cache on the chain fixtures;
+- independent WaitGroups stay within a constant number of semantically visited statements per group rather than reverting to `groups × body-size` rescans.
+
+Run this gate directly with `make perfcheck`. The ordinary benchmark output also reports the same counters as `param-evals/build`, `ctor-evals/build`, `struct-cfg/build`, and `group-stmts/build`, alongside `ns/op` and allocations. These counters are intentionally hardware-independent and therefore suitable for hard CI thresholds now; elapsed-time, allocation, and RSS thresholds remain deferred until a supported-Go-1.25 baseline is recorded on a pinned runner.
 

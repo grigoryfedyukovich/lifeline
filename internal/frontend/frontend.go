@@ -19,6 +19,30 @@ import (
 	"github.com/gfedyukovich/lifeline/internal/model"
 )
 
+// WorkStats records machine-independent frontend work counts for one Build/BuildContext call.
+// It is intentionally separate from model.Program and user-facing reports: these counters
+// are regression instrumentation for algorithmic scaling, not semantic analysis results.
+// When Input.WorkStats is non-nil, BuildContext resets the pointed-to value at the start
+// of the build and fills it as work is performed.
+type WorkStats struct {
+	// ParameterEffectEvaluations counts selected-function evaluations performed by
+	// the dependency-driven parameter/Done fixed point. Re-evaluations happen only
+	// when a callee summary grows.
+	ParameterEffectEvaluations int
+
+	// ConstructorEvaluations counts selected-function evaluations performed by
+	// the dependency-driven returned-field/constructor fixed point.
+	ConstructorEvaluations int
+
+	// StructuralCFGBuilds counts cache misses in structuralCFG. Reuses of the same
+	// function-body graph by later frontend passes do not increment it.
+	StructuralCFGBuilds int
+
+	// GroupBalanceStatementVisits counts statements that survive the per-group skip
+	// index and are semantically visited by WaitGroup balance/round accounting.
+	GroupBalanceStatementVisits int
+}
+
 type Input struct {
 	Fset  *token.FileSet
 	Files []*ast.File
@@ -32,6 +56,11 @@ type Input struct {
 	// F11). Debug/inspection callers that explicitly need the legacy IR may
 	// enable it.
 	CollectIR bool
+
+	// WorkStats is an optional test/benchmark instrumentation sink. BuildContext
+	// resets it before analysis and records machine-independent work counts used by
+	// scaling-regression tests. Production callers normally leave it nil.
+	WorkStats *WorkStats
 
 	// LookupFunctionSummary provides a version-validated lifecycle summary for
 	// a direct function target whose source body is outside the current package.
@@ -141,6 +170,7 @@ type builder struct {
 	err       error
 	in        Input
 	cfg       config.Config
+	stats     *WorkStats
 	funcs     map[*types.Func]*ast.FuncDecl
 	analyzed  map[*types.Func]bool
 	summaries map[*types.Func]model.Goroutine
@@ -331,6 +361,9 @@ func (b *builder) structuralCFG(name string, body *ast.BlockStmt) (*model.CFG, m
 	}
 	if b.structuralCFGs == nil {
 		b.structuralCFGs = map[*ast.BlockStmt]structuralCFG{}
+	}
+	if b.stats != nil {
+		b.stats.StructuralCFGBuilds++
 	}
 	g, sites, err := flowgraph.BuildContext(b.ctx, name, b.in.Fset, body, b.in.Info, nil)
 	if err != nil {
@@ -545,10 +578,14 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if in.WorkStats != nil {
+		*in.WorkStats = WorkStats{}
+	}
 	b := &builder{
 		ctx:                ctx,
 		in:                 in,
 		cfg:                cfg,
+		stats:              in.WorkStats,
 		funcs:              map[*types.Func]*ast.FuncDecl{},
 		analyzed:           map[*types.Func]bool{},
 		summaries:          map[*types.Func]model.Goroutine{},
@@ -1468,6 +1505,9 @@ func (b *builder) computeParameterEffectFixedPoint(sources []funcSource) error {
 		}
 		i := queue[head]
 		queued[i] = false
+		if b.stats != nil {
+			b.stats.ParameterEffectEvaluations++
+		}
 		source := sources[i]
 		changed := b.computeParameterEffects(source.decl)
 		if b.err != nil {
@@ -4486,6 +4526,9 @@ func (b *builder) computeConstructorConsumptionFixedPoint(sources []funcSource) 
 		}
 		i := queue[head]
 		queued[i] = false
+		if b.stats != nil {
+			b.stats.ConstructorEvaluations++
+		}
 		if !b.computeConstructorCallerConsumption(sources[i]) {
 			if b.err != nil {
 				return b.err
@@ -5162,6 +5205,9 @@ func (b *builder) walkGroupBalanceStmts(list []ast.Stmt, obj types.Object, info 
 // sibling arm from ever being treated as balancing each other, the way a
 // single shared running total would.
 func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types.Info, bal *groupBalance, scope *loopScope, index *groupBalanceIndex) {
+	if b.stats != nil {
+		b.stats.GroupBalanceStatementVisits++
+	}
 	if call, ok := groupMethodCall(s, obj, info); ok {
 		switch selectorMethod(call.Fun) {
 		case "Add":
