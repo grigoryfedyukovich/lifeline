@@ -3650,19 +3650,16 @@ func NewHandle(parent context.Context) (*Handle, context.Context) {
 	if len(sites) != 1 || sites[0].ResultIndex != 0 || sites[0].FieldName != "Cancel" || sites[0].Kind != "cancel" {
 		t.Fatalf("expected exactly one return field site {0, Cancel, cancel}, got %#v", sites)
 	}
+	if sites[0].ObligationID == 0 || !sites[0].RequiresCallerDischarge {
+		t.Fatalf("exported constructor fact must carry a stable live caller obligation, got %#v", sites[0])
+	}
 }
 
-// TestFieldOwnership_CrossPackageConstructorFactConsultedSafely confirms
-// the consume half of cross-package constructor-ownership support: the
-// mechanical dependency on a real, same-package types.Object is gone
-// (verifyConstructorCallerField now takes a plain kind string), so
-// Input.LookupReturnFieldSites is actually reached and does not panic or
-// misbehave for a cross-package callee -- and, matching this fact's own
-// documented architectural limit (see Input.LookupReturnFieldSites'
-// doc comment), neither response value changes Start's own diagnostics,
-// since Start has no cancel/group binding of its own for a verdict about
-// someone else's constructor to attach to.
-func TestFieldOwnership_CrossPackageConstructorFactConsultedSafely(t *testing.T) {
+// TestFieldOwnership_CrossPackageConstructorFactProducesCallerFinding
+// confirms the consume half of cross-package constructor ownership: a fact
+// whose constructor leaves a returned cancel obligation live is materialized
+// as a caller-local LL1001 at the importing call site.
+func TestFieldOwnership_CrossPackageConstructorFactProducesCallerFinding(t *testing.T) {
 	source := `package p
 import "fmt"
 func Start() {
@@ -3670,13 +3667,9 @@ func Start() {
 	_ = h
 }
 `
-	// fmt.Println's actual signature doesn't matter for this plumbing
-	// check -- the lookup fires purely off the resolved *types.Func, the
-	// same way the other Lookup* tests use fmt.Println as a stand-in
-	// cross-package callee.
 	printlnSite := func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
 		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "fmt" && fn.Name() == "Println" {
-			return []model.ReturnFieldSite{{ResultIndex: 0, FieldName: "N", Kind: "cancel"}}, true
+			return []model.ReturnFieldSite{{ResultIndex: 0, FieldName: "N", Kind: "cancel", ObligationID: 1, RequiresCallerDischarge: true}}, true
 		}
 		return nil, false
 	}
@@ -3706,8 +3699,160 @@ func Start() {
 	if !called {
 		t.Fatal("expected LookupReturnFieldSites to be consulted for a resolvable cross-package callee")
 	}
+	diags := engine.Analyze(program, cfg)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" || !strings.HasSuffix(diags[0].Function, ".Start") {
+		t.Fatalf("live imported constructor obligation should be attributed to Start, got diagnostics = %#v", diags)
+	}
+}
+
+func TestFieldOwnership_CrossPackageConstructorAlreadyDischargedDoesNotWarn(t *testing.T) {
+	source := `package p
+import "fmt"
+func Start() {
+	h, _ := fmt.Println("x")
+	_ = h
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupReturnFieldSites: func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "fmt" && fn.Name() == "Println" {
+			return []model.ReturnFieldSite{{ResultIndex: 0, FieldName: "N", Kind: "cancel", ObligationID: 1, RequiresCallerDischarge: false}}, true
+		}
+		return nil, false
+	}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if diags := engine.Analyze(program, cfg); len(diags) != 0 {
-		t.Fatalf("Start has no cancel/group binding of its own; a fact about fmt.Println's return shape must not manufacture a finding, got diagnostics = %#v", diags)
+		t.Fatalf("constructor-discharged imported site must not manufacture caller finding, got %#v", diags)
+	}
+}
+
+func TestFieldOwnership_CrossPackageGroupFactProducesCallerFinding(t *testing.T) {
+	source := `package p
+import "fmt"
+func Start() {
+	h, _ := fmt.Println("x")
+	_ = h
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupReturnFieldSites: func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "fmt" && fn.Name() == "Println" {
+			return []model.ReturnFieldSite{{ResultIndex: 0, FieldName: "WG", Kind: "waitgroup", ObligationID: 1, RequiresCallerDischarge: true, GroupStarts: 1}}, true
+		}
+		return nil, false
+	}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diags := engine.Analyze(program, cfg)
+	if len(diags) != 1 || diags[0].RuleID != "LL1003" || !strings.HasSuffix(diags[0].Function, ".Start") {
+		t.Fatalf("live imported group obligation should be attributed to Start, got %#v", diags)
+	}
+}
+
+func TestFieldOwnership_CrossPackageDistinctReturnedObligationsStayDistinct(t *testing.T) {
+	source := `package p
+import "fmt"
+func Start() {
+	a, b := fmt.Println("x")
+	_, _ = a, b
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupReturnFieldSites: func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "fmt" && fn.Name() == "Println" {
+			return []model.ReturnFieldSite{
+				{ResultIndex: 0, FieldName: "A", Kind: "cancel", ObligationID: 1, RequiresCallerDischarge: true},
+				{ResultIndex: 1, FieldName: "B", Kind: "cancel", ObligationID: 2, RequiresCallerDischarge: true},
+			}, true
+		}
+		return nil, false
+	}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diags := engine.Analyze(program, cfg)
+	if len(diags) != 2 || diags[0].RuleID != "LL1001" || diags[1].RuleID != "LL1001" {
+		t.Fatalf("two imported obligation IDs must remain two caller obligations, got %#v", diags)
+	}
+}
+
+func TestFieldOwnership_CrossPackageObligationSurvivesLocalPassThroughWrapper(t *testing.T) {
+	source := `package p
+import "fmt"
+func Middle() (int, error) { return fmt.Println("x") }
+func Start() {
+	h, _ := Middle()
+	_ = h
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "input.go", source, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object), Uses: make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection), Scopes: make(map[ast.Node]*types.Scope), Implicits: make(map[ast.Node]types.Object),
+	}
+	pkg, err := (&types.Config{Importer: importer.Default()}).Check("example.test/input", fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	program, err := Build(Input{Fset: fset, Files: []*ast.File{file}, Pkg: pkg, Info: info, LookupReturnFieldSites: func(fn *types.Func) ([]model.ReturnFieldSite, bool) {
+		if fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "fmt" && fn.Name() == "Println" {
+			return []model.ReturnFieldSite{{ResultIndex: 0, FieldName: "N", Kind: "cancel", ObligationID: 1, RequiresCallerDischarge: true}}, true
+		}
+		return nil, false
+	}}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diags := engine.Analyze(program, cfg)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" || !strings.HasSuffix(diags[0].Function, ".Start") {
+		t.Fatalf("imported obligation should propagate through Middle and be attributed only to Start, got %#v", diags)
 	}
 }
 

@@ -81,15 +81,12 @@ type FunctionFact struct {
 	// judge the `wg.Add(1); go worker(&wg)` idiom across a package boundary
 	// with the same semantics as a same-package worker.
 	ParamDoneEffects map[int]model.ParamEffect
-	// ReturnFieldSites is model.Function.ReturnFieldSites, unchanged: see
-	// its own doc comment, and Input.LookupReturnFieldSites' doc comment
-	// for the architectural limit specific to this one fact (unlike
-	// ParamConsumption/ParamDoneCalled/LoopUnresolved, a positive result
-	// here cannot revise the exporting function's own, already-finalized
-	// diagnostic -- it only lets the caller's own verification run at
-	// all for a cross-package constructor, which previously wasn't
-	// reachable due to verifyConstructorCallerField's dependency on a
-	// real, same-package types.Object).
+	// ReturnFieldSites is model.Function.ReturnFieldSites, unchanged. Fact
+	// version 6 carries not only the returned field shape but also a stable
+	// per-obligation identity and whether the constructor itself left that
+	// obligation for its caller. That is enough for the importing package to
+	// attach LL1001/LL1003 to its own call site without revising the already
+	// analyzed dependency (audit finding F2).
 	ReturnFieldSites []model.ReturnFieldSite
 }
 

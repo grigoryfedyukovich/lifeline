@@ -417,6 +417,23 @@ type ReturnFieldSite struct {
 	ResultIndex int    `json:"result_index"`
 	FieldName   string `json:"field_name"`
 	Kind        string `json:"kind"`
+	// ObligationID identifies one returned runtime obligation within this
+	// function summary. Several fields/results that alias the same underlying
+	// cancel/group binding share an ID; distinct bindings get distinct IDs.
+	// Cross-package callers use it to avoid merging independent handles merely
+	// because they came from the same constructor (audit finding F2).
+	ObligationID int `json:"obligation_id"`
+	// RequiresCallerDischarge is the exporting function's final verdict after
+	// its own cleanup/join ordering has been computed. False means the
+	// constructor already discharged the binding on every supported path, so
+	// ignoring the returned field creates no caller obligation.
+	RequiresCallerDischarge bool `json:"requires_caller_discharge"`
+	// GroupStarts/GroupCountMismatch carry the small amount of group state
+	// needed to construct the same caller-attributed LL1003 evidence across a
+	// package boundary that same-package constructor analysis already emits.
+	// They are zero for cancel obligations.
+	GroupStarts        int  `json:"group_starts,omitempty"`
+	GroupCountMismatch bool `json:"group_count_mismatch,omitempty"`
 }
 
 // ParamEffect is a set of effects a function body has on one of its own
@@ -512,13 +529,12 @@ type Function struct {
 	// ReturnFieldSites records, for a function recognized as a
 	// "constructor" (computeFieldOwnership: it stores a cancel-like or
 	// group-like binding into a named field of a struct literal that is
-	// itself returned), one entry per such field: which result position
-	// carries it, the field's name, and its kind ("cancel", "waitgroup",
-	// or "errgroup"). This is deliberately a plain, self-contained
-	// description -- no object identity -- so it can travel as a fact
-	// across a package boundary the way ParamConsumption/ParamDoneCalled
-	// already do; see Input.LookupReturnFieldSites and
-	// verifyConstructorCallerField's kind parameter.
+	// itself returned), one entry per such field. Besides result/field/kind,
+	// each entry carries a per-function ObligationID and the exporting
+	// function's final caller-discharge verdict. That object-free summary is
+	// sufficient for an importing package to keep distinct returned bindings
+	// distinct and attach LL1001/LL1003 to its own bad call site without
+	// revising the dependency's already-finalized diagnostics (audit F2).
 	ReturnFieldSites []ReturnFieldSite `json:"return_field_sites,omitempty"`
 }
 

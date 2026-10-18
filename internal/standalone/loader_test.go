@@ -544,6 +544,82 @@ func Leak(parent context.Context) {
 	t.Fatalf("cross-package no-consume fact did not preserve caller obligation; diagnostics = %#v", diags)
 }
 
+func TestAnalyzePatternsAttributesCrossPackageConstructorObligationToBadCaller(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, contents string) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.test/ctorfacts\n\ngo 1.20\n")
+	write("dep/dep.go", `package dep
+import "context"
+
+type Handle struct { Cancel context.CancelFunc }
+
+func New(parent context.Context) *Handle {
+	_, cancel := context.WithCancel(parent)
+	return &Handle{Cancel: cancel}
+}
+`)
+	write("root/root.go", `package root
+import (
+	"context"
+	"example.test/ctorfacts/dep"
+)
+
+func Good(parent context.Context) {
+	h := dep.New(parent)
+	h.Cancel()
+}
+
+func Bad(parent context.Context) {
+	h := dep.New(parent)
+	_ = h
+}
+`)
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	}()
+
+	cfg := config.Default()
+	cfg.Timeout = "30s"
+	diags, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
+	if err != nil {
+		t.Fatalf("analyzePatterns: %v", err)
+	}
+	var bad, good int
+	for _, d := range diags {
+		if d.RuleID != "LL1001" {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(d.Function, ".Bad"):
+			bad++
+		case strings.HasSuffix(d.Function, ".Good"):
+			good++
+		}
+	}
+	if bad != 1 || good != 0 {
+		t.Fatalf("cross-package constructor ownership should warn only at Bad: bad=%d good=%d diagnostics=%#v", bad, good, diags)
+	}
+}
+
 func TestSelectAnalysisUnitsIncludesDirectStandardLibrarySourceOnly(t *testing.T) {
 	roots := []listedPackage{{ImportPath: "example.test/root", GoFiles: []string{"root.go"}, Imports: []string{"context", "example.test/localdep"}}}
 	packages := []listedPackage{

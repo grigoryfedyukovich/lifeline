@@ -25,6 +25,12 @@ const (
 	// are not interchangeable: the boolean let a helper that cancels under a
 	// condition, one that cancels always and one that merely hands the value
 	// on all erase the caller's obligation alike (audit finding F6).
-	FactVersion = 5
+	//
+	// FactVersion 6 extends ReturnFieldSite with per-obligation identity and
+	// the exporting constructor's final caller-discharge state. Version 5 can
+	// describe only a field shape; treating its zero-valued new fields as a
+	// real verdict would silently lose cross-package constructor obligations
+	// (audit finding F2), so old facts are rejected.
+	FactVersion = 6
 	Backend     = "local-ast-types-ssa-summary/v2"
 )

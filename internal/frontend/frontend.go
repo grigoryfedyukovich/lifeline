@@ -119,35 +119,19 @@ type Input struct {
 	// calleeDoneEffect reports no effect for that cross-package callee.
 	LookupParamDoneEffects func(fn *types.Func, paramIndex int) (effect model.ParamEffect, ok bool)
 
-	// LookupReturnFieldSites is the constructor/field-ownership
-	// counterpart of LookupParamConsumption and LookupParamDoneCalled:
-	// for a callee outside the current package, describes which of its
-	// result positions carry a cancel-like or group-like value inside a
-	// named struct field (FunctionFact.ReturnFieldSites). Consulted by
-	// computeConstructorCallerConsumption when a call's callee isn't
-	// found among this package's own b.returnFieldInfo.
+	// LookupReturnFieldSites is the constructor/field-ownership counterpart
+	// of the parameter-effect lookups. For a callee outside the current
+	// package it returns the fields/results that carry lifecycle obligations,
+	// plus the exporting function's final "does the caller still owe a
+	// discharge?" state and a per-obligation identity.
 	//
-	// Unlike the other two Lookup* hooks, a positive result here cannot
-	// ever produce a finding the way a same-package verification does:
-	// the per-call-site verdict is recorded into b.callerVerdicts, but
-	// only turned into a caller-attributed finding (recordReturnedField)
-	// for a constructor whose own binding exists in this same build,
-	// i.e. only for a same-package constructor.
-	// A cross-package constructor's package has already been analyzed and
-	// its diagnostics already finalized by the time this package (a
-	// dependent) is analyzed; go/analysis facts flow from a dependency to
-	// its dependents, never backward, so there is no way for a finding
-	// made here to reach back and revise that already-reported verdict.
-	// This hook still lets computeConstructorCallerConsumption run the
-	// same verification against the *caller's* own body (mechanically
-	// removing verifyConstructorCallerField's dependency on a real,
-	// same-package types.Object to distinguish cancel from
-	// waitgroup/errgroup, which used to make this simply unreachable for
-	// a cross-package callee) -- its result is recorded the same way a
-	// same-package verdict is, keyed by the callee's own *types.Func
-	// (there being no local binding object to key it by instead), so it
-	// remains available to any future consumer that queries it directly,
-	// without inventing a new diagnostic location for it today.
+	// That final state makes cross-package constructor ownership
+	// caller-attributable rather than merely observable: a caller that drops
+	// an imported returned handle can receive the same LL1001/LL1003 finding
+	// as a same-package caller, while a constructor that already discharged
+	// its own binding does not manufacture a caller obligation. Distinct
+	// returned bindings remain distinct even when they come from the same
+	// function (audit finding F2).
 	LookupReturnFieldSites func(fn *types.Func) ([]model.ReturnFieldSite, bool)
 }
 
@@ -272,6 +256,14 @@ type builder struct {
 	// recordReturnedField's own lookup into callerVerdicts below
 	// once every function's callers have been checked.
 	returnFieldInfo map[types.Object][]returnFieldSite
+	// Final local obligation state, recorded after cleanup/join ordering.
+	returnObligations map[types.Object]returnObligation
+	// Stable synthetic identities for imported returned obligations.
+	importedReturnBindings map[importedReturnKey]types.Object
+	// importedObligations holds one final imported summary per synthetic
+	// binding. It is resolved only after the constructor fixed point, so
+	// aliases of the same returned obligation can be folded first.
+	importedObligations map[types.Object]returnFieldSite
 	// returnFieldsByFunc is the callee-oriented index of returnFieldInfo.
 	// Constructor caller analysis is driven by calls to a particular
 	// function, so looking up that function directly avoids scanning every
@@ -419,6 +411,27 @@ type returnFieldSite struct {
 	// means that break can't happen regardless of which bindingObj a
 	// given site happens to be keyed under.
 	kind string
+	// obligationKnown is true for a site imported from a completed
+	// cross-package summary (or propagated from one through a local wrapper).
+	// Same-package sites get their final state from returnObligations.
+	obligationKnown         bool
+	requiresCallerDischarge bool
+	groupStarts             int
+	groupCountMismatch      bool
+}
+
+type returnObligation struct {
+	requiresCallerDischarge bool
+	groupStarts             int
+	groupCountMismatch      bool
+}
+
+type importedReturnKey struct {
+	fn           *types.Func
+	obligationID int
+	resultIndex  int
+	fieldName    string
+	kind         string
 }
 
 // returnFieldBindingSite is the callee-indexed view of one
@@ -582,27 +595,30 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 		*in.WorkStats = WorkStats{}
 	}
 	b := &builder{
-		ctx:                ctx,
-		in:                 in,
-		cfg:                cfg,
-		stats:              in.WorkStats,
-		funcs:              map[*types.Func]*ast.FuncDecl{},
-		analyzed:           map[*types.Func]bool{},
-		summaries:          map[*types.Func]model.Goroutine{},
-		fieldGroupObjects:  map[fieldGroupKey]*types.Var{},
-		fieldGroupOwners:   map[*types.Var]fieldGroupKey{},
-		paramEffects:       map[types.Object]model.ParamEffect{},
-		paramDoneEffects:   map[types.Object]model.ParamEffect{},
-		returnFieldInfo:    map[types.Object][]returnFieldSite{},
-		returnFieldsByFunc: map[*types.Func][]returnFieldBindingSite{},
-		structuralCFGs:     map[*ast.BlockStmt]structuralCFG{},
-		callerVerdicts:     map[types.Object]map[callerSiteKey]callerVerdict{},
-		contextInterface:   findContextInterface(in.Pkg),
-		contextFactories:   stringSet(cfg.ContextWrappers),
-		startWrappers:      stringSet(cfg.StartWrappers),
-		joinWrappers:       stringSet(cfg.JoinWrappers),
-		stopWrappers:       stringSet(cfg.StopWrappers),
-		receiverSummaries:  map[types.Object]*receiverSummary{},
+		ctx:                    ctx,
+		in:                     in,
+		cfg:                    cfg,
+		stats:                  in.WorkStats,
+		funcs:                  map[*types.Func]*ast.FuncDecl{},
+		analyzed:               map[*types.Func]bool{},
+		summaries:              map[*types.Func]model.Goroutine{},
+		fieldGroupObjects:      map[fieldGroupKey]*types.Var{},
+		fieldGroupOwners:       map[*types.Var]fieldGroupKey{},
+		paramEffects:           map[types.Object]model.ParamEffect{},
+		paramDoneEffects:       map[types.Object]model.ParamEffect{},
+		returnFieldInfo:        map[types.Object][]returnFieldSite{},
+		returnObligations:      map[types.Object]returnObligation{},
+		importedReturnBindings: map[importedReturnKey]types.Object{},
+		importedObligations:    map[types.Object]returnFieldSite{},
+		returnFieldsByFunc:     map[*types.Func][]returnFieldBindingSite{},
+		structuralCFGs:         map[*ast.BlockStmt]structuralCFG{},
+		callerVerdicts:         map[types.Object]map[callerSiteKey]callerVerdict{},
+		contextInterface:       findContextInterface(in.Pkg),
+		contextFactories:       stringSet(cfg.ContextWrappers),
+		startWrappers:          stringSet(cfg.StartWrappers),
+		joinWrappers:           stringSet(cfg.JoinWrappers),
+		stopWrappers:           stringSet(cfg.StopWrappers),
+		receiverSummaries:      map[types.Object]*receiverSummary{},
 	}
 	var sources []funcSource
 	for _, file := range in.Files {
@@ -692,6 +708,7 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 	if err := b.computeConstructorConsumptionFixedPoint(sources[:limit]); err != nil {
 		return program, err
 	}
+	b.resolveImportedObligations()
 	for _, source := range sources[:limit] {
 		if err := ctx.Err(); err != nil {
 			return program, err
@@ -711,6 +728,12 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 			return program, b.err
 		}
 		program.Functions = append(program.Functions, fn)
+	}
+	// Export returned-obligation facts only after all selected named
+	// functions have reached their final cleanup/join state. This keeps
+	// wrapper facts declaration-order independent.
+	for i, source := range sources[:limit] {
+		program.Functions[i].ReturnFieldSites = b.exportedReturnFieldSites(source.obj)
 	}
 	b.attachCallerFindings(&program)
 	return program, nil
@@ -938,7 +961,6 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	fn := model.Function{Name: name, Span: b.span(fd)}
 	fn.ParamEffects = b.exportedParamEffects(fd)
 	fn.ParamDoneEffects = b.exportedParamDoneEffects(fd)
-	fn.ReturnFieldSites = b.exportedReturnFieldSites(source.obj)
 	contexts := map[types.Object]string{}
 	b.collectContextParams(fd.Type, contexts)
 	states, groups := b.collectBindings(fd, contexts)
@@ -1007,6 +1029,7 @@ func (b *builder) buildFunction(source funcSource) model.Function {
 	if b.cancelled() {
 		return fn
 	}
+	b.recordReturnObligations(states, groups)
 	b.resolveObligations()
 	if source.obj != nil {
 		b.summaries[source.obj] = cloneGoroutine(fn.BodyLifecycle)
@@ -4397,13 +4420,40 @@ func (b *builder) appendReturnFieldSite(bindingObj types.Object, newSite returnF
 // computeParameterConsumption's own scratch model.Function: this call
 // exists only for its side effect on b.returnFieldInfo.
 
-// exportedReturnFieldSites returns, for fnObj, every entry of
-// b.returnFieldInfo whose site.fn is fnObj -- i.e. this function's own
-// recognized "constructor" fields (computeFieldOwnership's work,
-// already fully converged by the time buildFunction runs, same as
-// b.paramConsumption) -- in the plain, object-free shape a fact can
-// carry. This becomes model.Function.ReturnFieldSites; see
-// analyzer.go's fact export and Input.LookupReturnFieldSites.
+// recordReturnObligations captures the final state of locally-created
+// obligations after computeOrdering has established path-sensitive cleanup/join
+// facts. Export happens only after every named function has been built, so a
+// pass-through wrapper can use the same final state regardless of declaration
+// order.
+func (b *builder) recordReturnObligations(cancels []*cancelState, groups []*groupState) {
+	for _, c := range cancels {
+		if c == nil || c.cancelObj == nil {
+			continue
+		}
+		allPaths := c.binding.CalledOnAllPaths == nil || *c.binding.CalledOnAllPaths
+		b.returnObligations[c.cancelObj] = returnObligation{
+			requiresCallerDischarge: !(c.binding.Called && allPaths),
+		}
+	}
+	for _, g := range groups {
+		if g == nil || g.obj == nil {
+			continue
+		}
+		allPaths := g.group.JoinedOnAllPaths == nil || *g.group.JoinedOnAllPaths
+		b.returnObligations[g.obj] = returnObligation{
+			requiresCallerDischarge: g.group.Starts > 0 && !(g.group.Joined && allPaths),
+			groupStarts:             g.group.Starts,
+			groupCountMismatch:      g.group.CountMismatch,
+		}
+	}
+}
+
+// exportedReturnFieldSites returns this function's recognized constructor
+// fields in the object-free form carried by standalone summaries and
+// go/analysis facts. Each distinct underlying binding gets an ObligationID;
+// aliases of that binding share the ID. The final caller-discharge state is
+// taken either from a locally-created binding's completed analysis or, for a
+// local pass-through wrapper, from the imported site it forwards.
 func (b *builder) exportedReturnFieldSites(fnObj *types.Func) []model.ReturnFieldSite {
 	if fnObj == nil {
 		return nil
@@ -4412,15 +4462,84 @@ func (b *builder) exportedReturnFieldSites(fnObj *types.Func) []model.ReturnFiel
 	if len(indexed) == 0 {
 		return nil
 	}
+	ids := map[types.Object]int{}
+	nextID := 1
 	out := make([]model.ReturnFieldSite, 0, len(indexed))
 	for _, entry := range indexed {
 		site := entry.site
 		if site.kind == "" {
 			continue
 		}
-		out = append(out, model.ReturnFieldSite{ResultIndex: site.resultIndex, FieldName: site.fieldName, Kind: site.kind})
+		ob, ok := b.returnObligations[entry.bindingObj]
+		if !ok && site.obligationKnown {
+			ob = returnObligation{
+				requiresCallerDischarge: site.requiresCallerDischarge,
+				groupStarts:             site.groupStarts,
+				groupCountMismatch:      site.groupCountMismatch,
+			}
+			ok = true
+		}
+		if !ok {
+			// A fact without final obligation state would recreate the old
+			// cross-package ambiguity. Keep the local analysis, but do not
+			// export a caller-discharge claim we cannot justify.
+			continue
+		}
+		id := ids[entry.bindingObj]
+		if id == 0 {
+			id = nextID
+			nextID++
+			ids[entry.bindingObj] = id
+		}
+		out = append(out, model.ReturnFieldSite{
+			ResultIndex:             site.resultIndex,
+			FieldName:               site.fieldName,
+			Kind:                    site.kind,
+			ObligationID:            id,
+			RequiresCallerDischarge: ob.requiresCallerDischarge,
+			GroupStarts:             ob.groupStarts,
+			GroupCountMismatch:      ob.groupCountMismatch,
+		})
 	}
 	return out
+}
+
+// importedReturnFieldSite converts one object-free imported site into the
+// frontend's internal representation and returns a stable synthetic binding
+// object for its obligation. ObligationID is the primary identity; the
+// result/field tuple is a defensive fallback for malformed/legacy in-memory
+// summaries (versioned go/analysis facts never mix schemas).
+func (b *builder) importedReturnFieldSite(callee *types.Func, fs model.ReturnFieldSite, siteFn *types.Func) (types.Object, returnFieldSite) {
+	key := importedReturnKey{fn: callee, obligationID: fs.ObligationID}
+	if fs.ObligationID == 0 {
+		key.resultIndex = fs.ResultIndex
+		key.fieldName = fs.FieldName
+		key.kind = fs.Kind
+	}
+	obj := b.importedReturnBindings[key]
+	if obj == nil {
+		name := fmt.Sprintf("$lifeline_return_%d_%d", fs.ObligationID, fs.ResultIndex)
+		var pkg *types.Package
+		if callee != nil {
+			pkg = callee.Pkg()
+		}
+		obj = types.NewVar(token.NoPos, pkg, name, types.Typ[types.Invalid])
+		b.importedReturnBindings[key] = obj
+	}
+	site := returnFieldSite{
+		fieldName:               fs.FieldName,
+		resultIndex:             fs.ResultIndex,
+		fn:                      siteFn,
+		kind:                    fs.Kind,
+		obligationKnown:         true,
+		requiresCallerDischarge: fs.RequiresCallerDischarge,
+		groupStarts:             fs.GroupStarts,
+		groupCountMismatch:      fs.GroupCountMismatch,
+	}
+	if _, exists := b.importedObligations[obj]; !exists {
+		b.importedObligations[obj] = site
+	}
+	return obj, site
 }
 
 func (b *builder) computeFieldOwnership(source funcSource) {
@@ -4640,14 +4759,17 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 				if calleeObj, ok := calledObject(call.Fun, b.in.Info).(*types.Func); ok {
 					for _, entry := range b.returnFieldsByFunc[calleeObj] {
 						site := entry.site
-						if b.appendReturnFieldSite(entry.bindingObj, returnFieldSite{fieldName: site.fieldName, resultIndex: site.resultIndex, fn: source.obj, kind: site.kind}) {
+						nextSite := site
+						nextSite.fn = source.obj
+						if b.appendReturnFieldSite(entry.bindingObj, nextSite) {
 							reportChanged = true
 						}
 					}
 					if b.funcs[calleeObj] == nil && b.in.LookupReturnFieldSites != nil {
 						if factSites, ok := b.in.LookupReturnFieldSites(calleeObj); ok {
 							for _, fs := range factSites {
-								if b.appendReturnFieldSite(calleeObj, returnFieldSite{fieldName: fs.FieldName, resultIndex: fs.ResultIndex, fn: source.obj, kind: fs.Kind}) {
+								bindingObj, importedSite := b.importedReturnFieldSite(calleeObj, fs, source.obj)
+								if b.appendReturnFieldSite(bindingObj, importedSite) {
 									reportChanged = true
 								}
 							}
@@ -4719,7 +4841,8 @@ func (b *builder) computeConstructorCallerConsumption(source funcSource) (report
 					if varObj == nil {
 						continue
 					}
-					if b.verifyConstructorCallerField(fd.Body, calleeObj, fs.Kind, varObj, returnFieldSite{fieldName: fs.FieldName, resultIndex: fs.ResultIndex, fn: calleeObj, kind: fs.Kind}, source.obj, callerCFG, callerCallSites, call, name) {
+					bindingObj, importedSite := b.importedReturnFieldSite(calleeObj, fs, calleeObj)
+					if b.verifyConstructorCallerField(fd.Body, bindingObj, fs.Kind, varObj, importedSite, source.obj, callerCFG, callerCallSites, call, name) {
 						reportChanged = true
 					}
 				}
@@ -4833,12 +4956,59 @@ func (b *builder) verifyConstructorCallerField(callerBody *ast.BlockStmt, bindin
 		// callerFn's own result position idx -- see this function's own
 		// doc comment and computeConstructorCallerConsumption's.
 		if callerFn != nil {
-			reportChanged = b.appendReturnFieldSite(bindingObj, returnFieldSite{fieldName: site.fieldName, resultIndex: idx, fn: callerFn, kind: site.kind})
+			nextSite := site
+			nextSite.resultIndex = idx
+			nextSite.fn = callerFn
+			reportChanged = b.appendReturnFieldSite(bindingObj, nextSite)
 		}
 	default:
 		b.setCallerVerdict(bindingObj, key, callerVerdict{callerName: callerName, constructor: site.fn, kind: kind})
 	}
 	return reportChanged
+}
+
+// resolveImportedObligations turns imported returned-handle summaries into
+// caller-attributed findings after the constructor fixed point has finished.
+// Waiting matters when one obligation is exposed through several alias fields:
+// callerSitesFor folds all field verdicts for the same ObligationID first.
+func (b *builder) resolveImportedObligations() {
+	for bindingObj, site := range b.importedObligations {
+		if !site.obligationKnown || !site.requiresCallerDischarge {
+			continue
+		}
+		for _, cs := range b.callerSitesFor(bindingObj) {
+			if cs.consumed && cs.onAllPaths {
+				continue
+			}
+			span := b.span(cs.call)
+			dedup := fmt.Sprintf("imported|%s|%d|%d|%s|%s", cs.callerName, span.StartOffset, site.resultIndex, site.fieldName, site.kind)
+			switch site.kind {
+			case "cancel":
+				cb := model.CancelBinding{Factory: constructorName(cs.constructor), CancelName: site.fieldName, Span: span, Called: cs.consumed}
+				if cs.consumed {
+					no := false
+					cb.CalledOnAllPaths = &no
+					cb.Evidence = append(cb.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("%s returns a cancellation function in field %q; this caller calls it, but not on every one of its own paths", constructorName(cs.constructor), site.fieldName), Span: ptrSpan(span)})
+				} else {
+					cb.Evidence = append(cb.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("%s returns a cancellation function in field %q; this caller never calls it", constructorName(cs.constructor), site.fieldName), Span: ptrSpan(span)})
+				}
+				b.callerFindings = append(b.callerFindings, callerFinding{key: dedup, callerName: cs.callerName, cancel: &cb})
+			case "waitgroup", "errgroup":
+				if site.groupStarts == 0 {
+					continue
+				}
+				jg := model.JoinGroup{Kind: site.kind, Name: site.fieldName, Span: span, Starts: site.groupStarts, Joined: cs.consumed, CountMismatch: site.groupCountMismatch}
+				if cs.consumed {
+					no := false
+					jg.JoinedOnAllPaths = &no
+					jg.Evidence = append(jg.Evidence, model.Evidence{Kind: "field-consumed", Message: fmt.Sprintf("%s returns a %s in field %q; this caller joins it, but not on every one of its own paths", constructorName(cs.constructor), site.kind, site.fieldName), Span: ptrSpan(span)})
+				} else {
+					jg.Evidence = append(jg.Evidence, model.Evidence{Kind: "field-not-consumed", Message: fmt.Sprintf("%s returns a %s in field %q; this caller never joins it", constructorName(cs.constructor), site.kind, site.fieldName), Span: ptrSpan(span)})
+				}
+				b.callerFindings = append(b.callerFindings, callerFinding{key: dedup, callerName: cs.callerName, group: &jg})
+			}
+		}
+	}
 }
 
 // setCallerVerdict records one call site's own verdict for bindingObj,
