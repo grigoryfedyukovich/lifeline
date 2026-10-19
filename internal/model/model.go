@@ -141,8 +141,9 @@ type JoinGroup struct {
 	// checked".
 	JoinedOnAllPaths *bool `json:"joined_on_all_paths,omitempty"`
 	// StopAfterWait is true iff the owner function also calls a recognized
-	// worker stop signal (a configured stop_wrapper call, or the cancel
-	// function of a tracked context) for its own body, and the CFG proves
+	// worker stop signal (a configured stop_wrapper call, the cancel
+	// function of a tracked context, or a verified close-dependent channel
+	// close) for its own body, and the CFG proves
 	// that call is reachable only by a path that already passed through
 	// one of this group's Wait() calls -- i.e. Wait is provably called
 	// before the signal that would let its workers stop, not after (Phase
@@ -153,11 +154,13 @@ type JoinGroup struct {
 	// proof of the unsafe one.
 	StopAfterWait bool `json:"stop_after_wait"`
 	// StopCorrelation says how StopAfterWait connects the stop signal to
-	// this group's workers: "worker-context" when a worker of this group
-	// demonstrably uses the context whose cancel function is the signal,
+	// this group's workers: "worker-context" when a worker demonstrably uses
+	// the context whose cancel function is the signal, "worker-channel" when
+	// a worker has a close-dependent termination shape on the closed channel,
+	// "worker-signal" when both verified kinds participate, and
 	// "assumed-wrapper" when the signal is a configured stop_wrapper call,
-	// which names no context or worker, so the relation is assumed and not
-	// verified (audit finding F7). Empty when StopAfterWait is false.
+	// which names no context/channel or worker, so the relation is assumed
+	// and not verified (audit finding F7). Empty when StopAfterWait is false.
 	StopCorrelation string `json:"stop_correlation,omitempty"`
 	// UnjoinedRound is true iff a sync.WaitGroup is reused for a further
 	// round of asynchronous work (a `go` statement recognized as a

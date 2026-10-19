@@ -231,3 +231,223 @@ func f() {
 		}
 	}
 }
+
+func TestStopOrder_ContextStoredInLocalStructField(t *testing.T) {
+	const hdr = `package p
+import ("context"; "sync")
+type holder struct { ctx context.Context; other context.Context }
+func fieldWorker(h holder, wg *sync.WaitGroup) { defer wg.Done(); <-h.ctx.Done() }
+func finiteWorker(h holder, wg *sync.WaitGroup) { defer wg.Done(); _ = h }
+`
+	cases := []struct{ name, body, want string }{
+		{"literal worker: late cancel through field", `
+ctx, cancel := context.WithCancel(parent)
+h := holder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-h.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"literal worker: early cancel through field", `
+ctx, cancel := context.WithCancel(parent)
+h := holder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-h.ctx.Done() }()
+cancel(); wg.Wait()`, ""},
+		{"direct field assignment is tracked", `
+ctx, cancel := context.WithCancel(parent)
+var h holder; h.ctx = ctx
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-h.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"unkeyed struct literal is tracked", `
+ctx, cancel := context.WithCancel(parent)
+h := holder{ctx, nil}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-h.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"local whole-value copy preserves context fields", `
+ctx, cancel := context.WithCancel(parent)
+h := holder{ctx: ctx}; h2 := h
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-h2.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"named worker parameter: late cancel", `
+ctx, cancel := context.WithCancel(parent)
+h := holder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go fieldWorker(h, &wg)
+wg.Wait(); cancel()`, "LL1005"},
+		{"named worker parameter: early cancel", `
+ctx, cancel := context.WithCancel(parent)
+h := holder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go fieldWorker(h, &wg)
+cancel(); wg.Wait()`, ""},
+		{"named worker that does not read the context field stays uncorrelated", `
+ctx, cancel := context.WithCancel(parent)
+h := holder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go finiteWorker(h, &wg)
+wg.Wait(); cancel()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f(parent context.Context) {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_ContextStructFieldsStayIndependent(t *testing.T) {
+	src := `package p
+import ("context"; "sync")
+type holder struct { a, b context.Context }
+func f(parent context.Context) {
+	ctx1, cancel1 := context.WithCancel(parent)
+	ctx2, cancel2 := context.WithCancel(parent)
+	h := holder{a: ctx1, b: ctx2}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); <-h.a.Done() }()
+	wg2.Add(1); go func(){ defer wg2.Done(); <-h.b.Done() }()
+	cancel1(); wg1.Wait()
+	wg2.Wait(); cancel2()
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
+func TestStopOrder_ChannelCloseCorrelatesWithWorkerTermination(t *testing.T) {
+	const hdr = `package p
+import "sync"
+func chanWorker(stop <-chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	select { case <-stop: return }
+}
+func rangeWorker(stop <-chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for range stop {}
+}
+`
+	cases := []struct{ name, body, want string }{
+		{"literal select worker: late close", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"literal select worker: early close", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+close(stop); wg.Wait()`, ""},
+		{"named select worker: late close", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go chanWorker(stop, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"named range worker: late close", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go rangeWorker(stop, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"deferred close after plain Wait", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go chanWorker(stop, &wg)
+defer close(stop); wg.Wait()`, "LL1005"},
+		{"deferred close registered after deferred Wait runs first", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go chanWorker(stop, &wg)
+defer wg.Wait(); defer close(stop)`, ""},
+		{"deferred close registered before deferred Wait runs after", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go chanWorker(stop, &wg)
+defer close(stop); defer wg.Wait()`, "LL1005"},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f() {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_ChannelCloseRequiresTerminationShape(t *testing.T) {
+	src := `package p
+import "sync"
+func f() {
+	data := make(chan int, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done(); _ = <-data }()
+	data <- 1
+	wg.Wait()
+	close(data)
+}`
+	if got := rulesOnly(findings(t, src)); got != "" {
+		t.Fatalf("ordinary data receive must not make close(data) a stop signal, got %q", got)
+	}
+}
+
+func TestStopOrder_ChannelSignalsStayIndependent(t *testing.T) {
+	src := `package p
+import "sync"
+func f() {
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); select { case <-stop1: return } }()
+	wg2.Add(1); go func(){ defer wg2.Done(); select { case <-stop2: return } }()
+	close(stop1); wg1.Wait()
+	wg2.Wait(); close(stop2)
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
+func TestStopOrder_ChannelCorrelationIsReported(t *testing.T) {
+	src := `package p
+import "sync"
+func f() {
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+	wg.Wait(); close(stop)
+}`
+	program := buildProgramFor(t, src, nil)
+	for _, fn := range program.Functions {
+		for _, g := range fn.Groups {
+			if g.StopAfterWait {
+				if g.StopCorrelation != "worker-channel" {
+					t.Fatalf("channel-correlated finding records StopCorrelation = %q, want worker-channel", g.StopCorrelation)
+				}
+				return
+			}
+		}
+	}
+	t.Fatal("expected a stop-after-wait group")
+}

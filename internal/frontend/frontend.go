@@ -6622,13 +6622,10 @@ func blockSetOf(sites []flowgraph.CallSite) map[model.BlockID]bool {
 // stopSignal is one call that may send a group's workers their stop signal,
 // with where it sits in the owner's control flow and when it actually runs.
 type stopSignal struct {
-	call     *ast.CallExpr
-	site     flowgraph.CallSite
-	deferred bool
-	// wrapper is true for a configured stop_wrapper call, which is not tied
-	// to any particular context or worker: its connection to the group is an
-	// assumption, not something this analysis observed.
-	wrapper bool
+	call        *ast.CallExpr
+	site        flowgraph.CallSite
+	deferred    bool
+	correlation string
 }
 
 // computeStopOrdering decides whether gr is joined before its workers' own
@@ -6643,7 +6640,8 @@ type stopSignal struct {
 //   - a call to the cancel function of a context some worker of this group
 //     uses, directly or through contexts derived from it (the workers are the
 //     `go` statements, and Go calls, that start this group's accounting);
-//   - a configured stop_wrapper call, which names no context and no worker,
+//   - close(ch), when a worker of this group demonstrably receives from ch;
+//   - a configured stop_wrapper call, which names no channel/context/worker,
 //     so its relation to the group is assumed, and said to be (the group's
 //     StopCorrelation, and the evidence).
 //
@@ -6671,8 +6669,8 @@ type stopSignal struct {
 // (`defer wg.Wait(); defer cancel()` cancels first and is safe;
 // `defer cancel(); defer wg.Wait()` waits first and deadlocks). Registration
 // order is read off the graph, which records a defer at its statement.
-func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) {
-	stops, placeable := b.stopSignalsFor(gr, cancels, wrapperCalls, body, callSites, deferredCalls)
+func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, closeCalls map[types.Object][]*ast.CallExpr, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) {
+	stops, placeable := b.stopSignalsFor(gr, cancels, wrapperCalls, closeCalls, body, callSites, deferredCalls)
 	if len(stops) == 0 || !placeable {
 		return
 	}
@@ -6696,6 +6694,8 @@ func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wr
 
 	allAfter := true
 	assumed := false
+	hasContext := false
+	hasChannel := false
 	for _, st := range stops {
 		after := false
 		switch {
@@ -6716,8 +6716,13 @@ func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wr
 			allAfter = false
 			break
 		}
-		if st.wrapper {
+		switch st.correlation {
+		case "assumed-wrapper":
 			assumed = true
+		case "worker-context":
+			hasContext = true
+		case "worker-channel":
+			hasChannel = true
 		}
 	}
 	if !allAfter {
@@ -6728,9 +6733,15 @@ func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wr
 	case assumed:
 		gr.group.StopCorrelation = "assumed-wrapper"
 		gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "every call to the configured stop wrapper only runs after this Wait; the wrapper is assumed to be what stops this group's workers, which is not verified"})
-	default:
+	case hasChannel && !hasContext:
+		gr.group.StopCorrelation = "worker-channel"
+		gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "a worker of this group receives from a channel that is only ever closed after this Wait: " + describeStopOrder(stops, waits)})
+	case hasContext && !hasChannel:
 		gr.group.StopCorrelation = "worker-context"
 		gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "a worker of this group uses a context whose cancel function is only ever called after this Wait: " + describeStopOrder(stops, waits)})
+	default:
+		gr.group.StopCorrelation = "worker-signal"
+		gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "stop-after-wait", Message: "recognized stop signals used by this group's workers are only ever sent after this Wait: " + describeStopOrder(stops, waits)})
 	}
 }
 
@@ -6771,16 +6782,16 @@ func registeredBefore(g *model.CFG, a, bsite flowgraph.CallSite) bool {
 // computeStopOrdering), placed in the owner's control flow. placeable is
 // false when some candidate has no place there, in which case no claim is
 // made.
-func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, body *ast.BlockStmt, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) (stops []stopSignal, placeable bool) {
+func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, closeCalls map[types.Object][]*ast.CallExpr, body *ast.BlockStmt, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) (stops []stopSignal, placeable bool) {
 	placeable = true
-	add := func(calls []*ast.CallExpr, wrapper bool) {
+	add := func(calls []*ast.CallExpr, correlation string) {
 		for _, call := range calls {
 			site, ok := callSites[call]
 			if !ok {
 				placeable = false
 				continue
 			}
-			stops = append(stops, stopSignal{call: call, site: site, deferred: deferredCalls[call], wrapper: wrapper})
+			stops = append(stops, stopSignal{call: call, site: site, deferred: deferredCalls[call], correlation: correlation})
 		}
 	}
 	used := b.workerContexts(gr, body)
@@ -6798,10 +6809,18 @@ func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapper
 			if !c.binding.Called || c.ctxObj == nil || !derivesFromAny(used, c.ctxObj, parents) {
 				continue
 			}
-			add(c.callSites, false)
+			add(c.callSites, "worker-context")
 		}
 	}
-	add(wrapperCalls, true)
+	usedChannels := b.workerStopChannels(gr, body)
+	if len(usedChannels) > 0 {
+		for obj, calls := range closeCalls {
+			if usedChannels[obj] {
+				add(calls, "worker-channel")
+			}
+		}
+	}
+	add(wrapperCalls, "assumed-wrapper")
 	return stops, placeable
 }
 
@@ -6834,17 +6853,255 @@ func derivesFromAny(used map[types.Object]bool, target types.Object, parents map
 	return false
 }
 
-// workerContexts returns the objects used by gr's workers: the goroutines
-// (`go` statements anywhere in body) and Go calls that start this group's
-// accounting. A worker belongs to the group when it calls Done on it, when
-// it is a function that Done()s the group passed to it, or when it is a
-// function literal handed to the group's own Go method.
+// contextFieldKey identifies one context-typed field of one local value.
+// It is intentionally shallow: F7 only needs to recover contexts stored in
+// ordinary local structs before a worker starts. Multi-selector paths,
+// heap/container aliases, channels and arbitrary callbacks remain explicit
+// limitations rather than being guessed at.
+type contextFieldKey struct {
+	base  types.Object
+	field string
+}
+
+// contextFieldSources records which tracked context variables may have been
+// stored in each one-level context field of a local value. Sources are
+// unioned across assignments: when a field can hold either of two contexts,
+// both cancels become candidate stop signals and LL1005 is emitted only if
+// every candidate is proven late. That is the conservative direction.
+func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]map[types.Object]bool {
+	out := map[contextFieldKey]map[types.Object]bool{}
+	if body == nil {
+		return out
+	}
+	add := func(key contextFieldKey, src types.Object) bool {
+		if key.base == nil || key.field == "" || src == nil || !isContextType(src.Type(), b.contextInterface) {
+			return false
+		}
+		if out[key] == nil {
+			out[key] = map[types.Object]bool{}
+		}
+		if out[key][src] {
+			return false
+		}
+		out[key][src] = true
+		return true
+	}
+	var sources func(ast.Expr) map[types.Object]bool
+	sources = func(expr ast.Expr) map[types.Object]bool {
+		res := map[types.Object]bool{}
+		switch x := unparenExpr(expr).(type) {
+		case *ast.Ident:
+			if obj := b.in.Info.ObjectOf(x); obj != nil && isContextType(obj.Type(), b.contextInterface) {
+				res[obj] = true
+			}
+		case *ast.SelectorExpr:
+			if sel := b.in.Info.Selections[x]; sel != nil && sel.Kind() == types.FieldVal && len(sel.Index()) == 1 && isContextType(sel.Obj().Type(), b.contextInterface) {
+				if base := identObject(x.X, b.in.Info); base != nil {
+					for obj := range out[contextFieldKey{base: base, field: x.Sel.Name}] {
+						res[obj] = true
+					}
+				}
+			}
+		}
+		return res
+	}
+	composite := func(expr ast.Expr) *ast.CompositeLit {
+		e := unparenExpr(expr)
+		if u, ok := e.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			e = unparenExpr(u.X)
+		}
+		lit, _ := e.(*ast.CompositeLit)
+		return lit
+	}
+	fieldNameAt := func(lit *ast.CompositeLit, i int) string {
+		if lit == nil {
+			return ""
+		}
+		t := b.in.Info.TypeOf(lit)
+		if t == nil {
+			return ""
+		}
+		st, _ := deref(t).Underlying().(*types.Struct)
+		if st == nil || i < 0 || i >= st.NumFields() {
+			return ""
+		}
+		return st.Field(i).Name()
+	}
+	// One source-order pass is enough for valid Go: a local value must be
+	// declared/assigned before a later statement can copy or read it. Avoiding
+	// a fixed point is important here because this index is a scaling aid, not a
+	// reason to reintroduce the whole-body rescans removed under F11.
+	b.inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range x.Lhs {
+				if i >= len(x.Rhs) {
+					continue
+				}
+				rhs := x.Rhs[i]
+				if sel, ok := unparenExpr(lhs).(*ast.SelectorExpr); ok {
+					selection := b.in.Info.Selections[sel]
+					if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
+						base := identObject(sel.X, b.in.Info)
+						for src := range sources(rhs) {
+							add(contextFieldKey{base: base, field: sel.Sel.Name}, src)
+						}
+					}
+					continue
+				}
+				base := identObject(lhs, b.in.Info)
+				if base == nil {
+					continue
+				}
+				if lit := composite(rhs); lit != nil {
+					for j, elt := range lit.Elts {
+						field := fieldNameAt(lit, j)
+						value, ok := elt.(ast.Expr)
+						if kv, keyed := elt.(*ast.KeyValueExpr); keyed {
+							if id, ok := kv.Key.(*ast.Ident); ok {
+								field = id.Name
+							}
+							value = kv.Value
+							ok = true
+						}
+						if !ok || field == "" {
+							continue
+						}
+						for src := range sources(value) {
+							add(contextFieldKey{base: base, field: field}, src)
+						}
+					}
+					continue
+				}
+				// Whole-value copies preserve every known context field.
+				if other := identObject(rhs, b.in.Info); other != nil {
+					for key, vals := range out {
+						if key.base != other {
+							continue
+						}
+						for src := range vals {
+							add(contextFieldKey{base: base, field: key.field}, src)
+						}
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for i, name := range x.Names {
+				if i >= len(x.Values) {
+					continue
+				}
+				base := b.in.Info.Defs[name]
+				lit := composite(x.Values[i])
+				if base == nil || lit == nil {
+					continue
+				}
+				for j, elt := range lit.Elts {
+					field := fieldNameAt(lit, j)
+					value, ok := elt.(ast.Expr)
+					if kv, keyed := elt.(*ast.KeyValueExpr); keyed {
+						if id, ok := kv.Key.(*ast.Ident); ok {
+							field = id.Name
+						}
+						value = kv.Value
+						ok = true
+					}
+					if !ok || field == "" {
+						continue
+					}
+					for src := range sources(value) {
+						add(contextFieldKey{base: base, field: field}, src)
+					}
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+func unparenExpr(expr ast.Expr) ast.Expr {
+	for {
+		p, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = p.X
+	}
+}
+
+// contextFieldsUsedByParam returns the one-level context fields read through
+// parameter index by a visible same-package worker body. It deliberately does
+// not infer through arbitrary helper calls; unresolved shapes simply withhold
+// LL1005 rather than inventing a worker/stop relation.
+func (b *builder) contextFieldsUsedByParam(fn *types.Func, index int) map[string]bool {
+	out := map[string]bool{}
+	decl := b.funcs[fn]
+	if decl == nil || decl.Body == nil {
+		return out
+	}
+	param := paramObjectAtIndex(b.in.Info, decl, index)
+	if param == nil {
+		return out
+	}
+	b.inspect(decl.Body, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok || identObject(sel.X, b.in.Info) != param {
+			return true
+		}
+		selection := b.in.Info.Selections[sel]
+		if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
+			out[sel.Sel.Name] = true
+		}
+		return true
+	})
+	return out
+}
+
+// workerContexts returns the context objects used by gr's workers: the
+// goroutines (`go` statements anywhere in body) and Go calls that start this
+// group's accounting. Besides direct context variables, it resolves one-level
+// context fields of local structs so `h := holder{ctx: ctx}; go func(){
+// <-h.ctx.Done() }()` is related to ctx's cancel function (audit finding F7).
 func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.Object]bool {
 	used := map[types.Object]bool{}
-	addLit := func(lit *ast.FuncLit) {
-		for o := range objectsUsed(lit.Body, b.in.Info, false) {
-			used[o] = true
+	fields := b.contextFieldSources(body)
+	addExpr := func(expr ast.Node) {
+		for obj := range objectsUsed(expr, b.in.Info, true) {
+			if isContextType(obj.Type(), b.contextInterface) {
+				used[obj] = true
+			}
 		}
+		b.inspect(expr, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			selection := b.in.Info.Selections[sel]
+			if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 || !isContextType(selection.Obj().Type(), b.contextInterface) {
+				return true
+			}
+			if base := identObject(sel.X, b.in.Info); base != nil {
+				for src := range fields[contextFieldKey{base: base, field: sel.Sel.Name}] {
+					used[src] = true
+				}
+			}
+			return true
+		})
+	}
+	addLit := func(lit *ast.FuncLit) {
+		addExpr(lit.Body)
 	}
 	b.inspect(body, func(n ast.Node) bool {
 		gs, ok := n.(*ast.GoStmt)
@@ -6858,8 +7115,21 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 			return true
 		}
 		if b.calleeDoneEffect(gs.Call, gr.obj).Has(model.EffectMay) {
-			for o := range objectsUsedInExpressions(gs.Call.Args, b.in.Info, true) {
-				used[o] = true
+			fn, _ := calledObject(gs.Call.Fun, b.in.Info).(*types.Func)
+			for i, arg := range gs.Call.Args {
+				addExpr(arg)
+				if fn == nil {
+					continue
+				}
+				base := identObject(arg, b.in.Info)
+				if base == nil {
+					continue
+				}
+				for field := range b.contextFieldsUsedByParam(fn, i) {
+					for src := range fields[contextFieldKey{base: base, field: field}] {
+						used[src] = true
+					}
+				}
 			}
 		}
 		return true
@@ -6875,6 +7145,160 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 		}
 	}
 	return used
+}
+
+// workerStopChannels returns channel objects that this group's workers
+// demonstrably depend on closing to terminate. Closing such a channel is a
+// recognized stop signal for LL1005. Merely passing, sending, or doing an
+// ordinary data receive does not establish the relation: the worker must range
+// over the channel or return from a select receive branch, or a visible
+// same-package named worker must do the same through the corresponding channel
+// parameter.
+func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt) map[types.Object]bool {
+	used := map[types.Object]bool{}
+	addReceives := func(root ast.Node) {
+		b.inspect(root, func(n ast.Node) bool {
+			if n == nil {
+				return true
+			}
+			if lit, ok := n.(*ast.FuncLit); ok && lit != root {
+				return false
+			}
+			switch x := n.(type) {
+			case *ast.RangeStmt:
+				if obj := identObject(x.X, b.in.Info); isRecvChannelObject(obj) {
+					used[obj] = true
+				}
+			case *ast.CommClause:
+				if x.Comm == nil || !statementsContainReturn(x.Body) {
+					return true
+				}
+				if expr := receivedExpr(x.Comm); expr != nil {
+					if obj := identObject(expr, b.in.Info); isRecvChannelObject(obj) {
+						used[obj] = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	b.inspect(body, func(n ast.Node) bool {
+		gs, ok := n.(*ast.GoStmt)
+		if !ok {
+			return true
+		}
+		if lit, ok := gs.Call.Fun.(*ast.FuncLit); ok {
+			if bodyCallsMethodOn(lit.Body, gr.obj, "Done", b.in.Info) {
+				addReceives(lit.Body)
+			}
+			return true
+		}
+		if b.calleeDoneEffect(gs.Call, gr.obj).Has(model.EffectMay) {
+			fn, _ := calledObject(gs.Call.Fun, b.in.Info).(*types.Func)
+			if fn == nil {
+				return true
+			}
+			for i, arg := range gs.Call.Args {
+				if !b.channelParamIsReceived(fn, i) {
+					continue
+				}
+				if obj := identObject(arg, b.in.Info); isRecvChannelObject(obj) {
+					used[obj] = true
+				}
+			}
+		}
+		return true
+	})
+	for _, call := range gr.startCalls {
+		if selectorMethod(call.Fun) != "Go" {
+			continue
+		}
+		for _, arg := range call.Args {
+			if lit, ok := arg.(*ast.FuncLit); ok {
+				addReceives(lit.Body)
+			}
+		}
+	}
+	return used
+}
+
+func isRecvChannelObject(obj types.Object) bool {
+	if obj == nil || obj.Type() == nil {
+		return false
+	}
+	ch, ok := obj.Type().Underlying().(*types.Chan)
+	return ok && ch.Dir() != types.SendOnly
+}
+
+// channelParamIsReceived reports whether a visible same-package worker body
+// has a close-dependent termination shape on parameter index: a range over
+// the channel, or a select receive whose clause returns. Helper-mediated
+// receives and channel-valued fields are intentionally not guessed at.
+func (b *builder) channelParamIsReceived(fn *types.Func, index int) bool {
+	decl := b.funcs[fn]
+	if decl == nil || decl.Body == nil {
+		return false
+	}
+	param := paramObjectAtIndex(b.in.Info, decl, index)
+	if !isRecvChannelObject(param) {
+		return false
+	}
+	found := false
+	b.inspect(decl.Body, func(n ast.Node) bool {
+		if found || n == nil {
+			return false
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.RangeStmt:
+			if identObject(x.X, b.in.Info) == param {
+				found = true
+			}
+		case *ast.CommClause:
+			if x.Comm != nil && statementsContainReturn(x.Body) {
+				if expr := receivedExpr(x.Comm); expr != nil && identObject(expr, b.in.Info) == param {
+					found = true
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// closeCallsByChannel indexes direct builtin close(ch) calls in the owner
+// body. Calls nested inside function literals are excluded because they do not
+// have the owner's execution semantics/call-site placement unless invocation
+// effects are modeled separately.
+func (b *builder) closeCallsByChannel(body *ast.BlockStmt) map[types.Object][]*ast.CallExpr {
+	out := map[types.Object][]*ast.CallExpr{}
+	b.inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		builtin, ok := b.in.Info.ObjectOf(id).(*types.Builtin)
+		if !ok || builtin.Name() != "close" {
+			return true
+		}
+		if obj := identObject(call.Args[0], b.in.Info); isRecvChannelObject(obj) {
+			out[obj] = append(out[obj], call)
+		}
+		return true
+	})
+	return out
 }
 
 // stopProvenAfterWait reports whether stop is guaranteed to be reached, on
@@ -6923,58 +7347,22 @@ func stopProvenAfterWait(g *model.CFG, waitSites []flowgraph.CallSite, waitBlock
 // via followHandleMethod/followHandleArgument), since all of them record
 // the crediting call's own node in this function's own body.
 //
-// A candidate "stop signal" is any call to a configured stop_wrapper
-// (unconditionally trusted, the same way internal/cfg's own trusted-stop
-// edges already trust one), or a call to the cancel function of a tracked
-// context that is both actually called (binding.Called) and actually
-// observed to be captured by some goroutine started in this same function
-// (binding.UsedByChild) -- requiring UsedByChild specifically excludes an
-// unrelated cancel() call whose context no goroutine here even looks at,
-// which meaningfully narrows, though does not eliminate, the residual risk
-// of crediting a stop signal that happens to belong to a *different*
-// worker group than the one being checked when a function manages more
-// than one. That narrower per-group correlation is not attempted here;
-// see docs/limitations.md.
-//
-// A cancel binding whose *every* call site is a deferred one
-// (allCallsDeferred) is handled separately from stopProvenAfterWait's
-// ordinary block/index comparison: since such a signal never actually
-// fires until the enclosing function is already returning, it is
-// unconditionally sent after any Wait() call that already ran earlier in
-// the same invocation, regardless of where internal/cfg happened to
-// record the defer statement's own call site. This is deliberately an
-// all-or-nothing test on the *binding*, not a per-call one: a binding
-// that has at least one non-deferred call site (e.g. `defer cancel()` as
-// a panic/early-return safety net alongside an explicit `cancel()` right
-// before Wait(), as in examples/stop_before_wait) already has a real
-// escape hatch that may independently prove the signal is sent before
-// Wait(), so it is left to the ordinary per-call-site loop below rather
-// than short-circuited here -- folding a defer-only binding into that
-// same loop would make its (misleadingly early) recorded position count
-// as "not proven after," silently defeating the very check this exists
-// to fix. As with the stop-signal candidacy check above, this is decided
-// per binding, not per group; see docs/limitations.md.
-//
-// The identical all-or-nothing test also applies to configured
-// stop_wrapper calls (collectStopWrapperCalls), treated as one flat
-// group the same way the rest of this function already treats them
-// (undifferentiated by which specific wrapper function produced each
-// call, matching the existing per-group correlation limitation noted
-// above): a stop_wrapper is exactly as capable of being called only via
-// `defer stopFn()` as a cancel function is, and internal/cfg's defer
-// mispositioning is not specific to context.CancelFunc values -- it
-// applies to any deferred call. This was originally missed when the
-// cancel-binding case above was fixed: confirmed concretely,
-// `defer Shutdown()` (Shutdown configured as a stop_wrapper) at the top
-// of a function, with no other call to it, deadlocks exactly like the
-// equivalent `defer cancel()` case, for the identical reason, but was
-// not caught until this was specifically checked for.
+// StopAfterWait is delegated to computeStopOrdering, which relates each group
+// to its own worker stop dependencies and stop calls rather than using a
+// function-wide pool (audit finding F7). Direct context uses, contexts derived
+// through known factories, one-level local context fields, and direct channel
+// close for clear close-dependent worker termination shapes are supported.
+// Deferred calls are compared by execution order at function return, not by
+// the lexical point at which their defer statement was registered. Unknown
+// correlation or a stop that cannot be placed in this function's CFG withholds
+// LL1005 rather than guessing.
 func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite) {
 	if g == nil || (len(groups) == 0 && len(cancels) == 0) {
 		return
 	}
 	deferredCalls := deferredCallSet(body)
 	stopWrapperCalls := b.collectStopWrapperCalls(body)
+	closeCalls := b.closeCallsByChannel(body)
 
 	for _, c := range cancels {
 		if !c.binding.Called {
@@ -7052,7 +7440,7 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		if len(waitSites) == 0 {
 			continue
 		}
-		b.computeStopOrdering(gr, cancels, stopWrapperCalls, body, g, callSites, deferredCalls)
+		b.computeStopOrdering(gr, cancels, stopWrapperCalls, closeCalls, body, g, callSites, deferredCalls)
 	}
 }
 
