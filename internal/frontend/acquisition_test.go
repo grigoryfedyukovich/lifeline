@@ -203,7 +203,7 @@ func TestAcquisition_Group(t *testing.T) {
 		wg.Wait()
 	}
 }`, "LL1003"},
-		{"start inside a closure cannot be placed, so no path verdict is invented",
+		{"start inside an invoked closure is placed at the invocation site",
 			`func f(c bool) {
 	var wg sync.WaitGroup
 	func() {
@@ -211,7 +211,7 @@ func TestAcquisition_Group(t *testing.T) {
 		go func() { defer wg.Done() }()
 	}()
 	if c { wg.Wait() }
-}`, ""},
+}`, "LL1003"},
 	}
 	for _, c := range cases {
 		if got := rulesOf(t, wgHeader+c.body); got != c.want {

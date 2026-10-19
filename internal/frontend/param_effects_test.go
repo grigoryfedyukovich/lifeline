@@ -86,10 +86,10 @@ func pong(c context.CancelFunc, n int) { ping(c, n-1) }`, `pong(cancel, 3)`, ""}
 		{"cycle with no consumer anywhere", `func ping(c context.CancelFunc, n int) { if n < 9 { pong(c, n+1) } }
 func pong(c context.CancelFunc, n int) { if n < 9 { ping(c, n+1) } }`, `ping(cancel, 0)`, "LL1001"},
 
-		// Hand-offs stay permissive, as before: ownership may have moved.
+		// Hand-offs stay permissive; directly invoked literals are real call-site effects.
 		{"stored in a package variable", `func h(cancel context.CancelFunc) { sink = cancel }`, `h(cancel)`, ""},
 		{"returned to the caller", `func h(cancel context.CancelFunc) context.CancelFunc { return cancel }`, `h(cancel)`, ""},
-		{"used inside a literal that may run", `func h(cancel context.CancelFunc) { func() { cancel() }() }`, `h(cancel)`, ""},
+		{"invoked literal always cancels", `func h(cancel context.CancelFunc) { func() { cancel() }() }`, `h(cancel)`, ""},
 	}
 	for _, c := range cases {
 		src := effHeader + c.helper + "\n" + cancelOwner(c.call)
@@ -164,7 +164,7 @@ func TestParamEffects_ExportedValues(t *testing.T) {
 		{"stored", `func h(cancel context.CancelFunc) { sink = cancel }`, model.EffectOpaque},
 		{"returned", `func h(cancel context.CancelFunc) context.CancelFunc { return cancel }`, model.EffectReturns},
 		{"called and stored", `func h(cancel context.CancelFunc) { cancel(); sink = cancel }`, model.EffectMay | model.EffectMust | model.EffectOpaque},
-		{"live closure", `func h(cancel context.CancelFunc) { func() { cancel() }() }`, model.EffectOpaque},
+		{"invoked closure", `func h(cancel context.CancelFunc) { func() { cancel() }() }`, model.EffectMay | model.EffectMust},
 	}
 	for _, c := range cases {
 		got, ok := effectsOf(t, effHeader+c.helper+"\n", "h")[0]

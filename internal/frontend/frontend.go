@@ -885,10 +885,12 @@ func (b *builder) inDeadLiteral(pos token.Pos) bool {
 // captured cancel function called inside it, say) must not discharge any
 // outer obligation (audit finding F5).
 //
-// Deliberately narrow: a literal stored in a variable that is called,
-// passed along, returned or captured elsewhere is "transferred", and keeps
-// being credited permissively as before, because whether and when it runs
-// is not visible here.
+// This helper is deliberately only the cheap "definitely never runs"
+// classifier used by a few pre-passes.  The main owner walk no longer treats
+// every other literal as if its body executed: synchronous IIFEs and
+// single-assignment stored calls are summarized at their actual invocation
+// call sites, while a callback passed elsewhere is an ownership hand-off and
+// an uninvoked local literal discharges nothing (audit finding F5).
 func (b *builder) deadFuncLits(body *ast.BlockStmt) []posRange {
 	if body == nil {
 		return nil
@@ -1368,8 +1370,382 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 	return states, groups
 }
 
+// closureCallTarget resolves a call of a function literal either directly
+// (`func(){...}()`) or through the same narrow, single-assignment local
+// variable shape used elsewhere in the frontend (`f := func(){...}; f()`).
+// It intentionally does not follow arbitrary aliases or function-valued
+// fields: those remain ownership transfers/unknowns rather than invented
+// invocations (audit finding F5).
+func closureValueTarget(expr ast.Expr, info *types.Info, singleAssign map[types.Object]ast.Expr) *ast.FuncLit {
+	if expr == nil {
+		return nil
+	}
+	if lit, ok := ast.Unparen(expr).(*ast.FuncLit); ok {
+		return lit
+	}
+	id, ok := ast.Unparen(expr).(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	obj := info.ObjectOf(id)
+	if obj == nil {
+		return nil
+	}
+	lit, _ := ast.Unparen(singleAssign[obj]).(*ast.FuncLit)
+	return lit
+}
+
+func closureCallTarget(call *ast.CallExpr, info *types.Info, singleAssign map[types.Object]ast.Expr) *ast.FuncLit {
+	if call == nil {
+		return nil
+	}
+	return closureValueTarget(call.Fun, info, singleAssign)
+}
+
+// goCallSet records the calls launched asynchronously by go statements.
+// A closure body reached through one of these calls is definitely started,
+// but its cleanup is not ordered before the owner function returns.  For a
+// captured cancel value that is an ownership transfer, not an all-path
+// discharge; for a captured join group it is not a join at all.
+func goCallSet(body *ast.BlockStmt) map[*ast.CallExpr]bool {
+	out := map[*ast.CallExpr]bool{}
+	if body == nil {
+		return out
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if g, ok := n.(*ast.GoStmt); ok && g.Call != nil {
+			out[g.Call] = true
+		}
+		return true
+	})
+	return out
+}
+
+// objectReferencedInLiteral reports whether lit closes over obj.  It does
+// not treat a declaration of a same-named inner object as a capture because
+// identity comes from go/types rather than spelling.
+func objectReferencedInLiteral(lit *ast.FuncLit, obj types.Object, info *types.Info) bool {
+	if lit == nil || obj == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if nested, ok := n.(*ast.FuncLit); ok && nested != lit {
+			// A nested closure is a further transfer unless its invocation is
+			// separately modeled inside this literal.  The summary below marks
+			// such a reference opaque, so there is no need to descend here.
+			return false
+		}
+		if id, ok := n.(*ast.Ident); ok && info.Uses[id] == obj {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// argumentEffectsWithTargets is argumentEffects with an explicit local
+// single-assignment environment.  Closure summaries need the assignments
+// from the literal body, while the enclosing function's normal walk keeps
+// its own environment in b.singleAssignTargets.
+func (b *builder) argumentEffectsWithTargets(call *ast.CallExpr, obj types.Object, singleAssign map[types.Object]ast.Expr) (effect model.ParamEffect, verified, pending bool) {
+	funcObj := b.resolveCalleeFuncWithTargets(call.Fun, singleAssign)
+	if funcObj == nil {
+		return 0, false, false
+	}
+	index := argumentIndexOf(call, obj, funcObj, b.in.Info, singleAssign)
+	if index == -1 {
+		return 0, false, false
+	}
+	if decl := b.funcs[funcObj]; decl != nil {
+		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
+		if paramObj == nil {
+			return 0, false, false
+		}
+		paramEffect, known := b.paramEffects[paramObj]
+		return paramEffect, known, !known
+	}
+	if b.in.LookupParamEffects != nil {
+		if paramEffect, known := b.in.LookupParamEffects(funcObj, index); known {
+			return paramEffect, true, false
+		}
+	}
+	if b.in.LookupParamConsumption != nil {
+		if consumed, known := b.in.LookupParamConsumption(funcObj, index); known {
+			if consumed {
+				return model.EffectOpaque, true, false
+			}
+			return 0, true, false
+		}
+	}
+	return 0, false, false
+}
+
+// resolveCalleeFuncWithTargets is resolveCalleeFunc parameterized by the
+// single-assignment environment used for a particular body.
+func (b *builder) resolveCalleeFuncWithTargets(fun ast.Expr, singleAssign map[types.Object]ast.Expr) *types.Func {
+	if fn, ok := calledObject(fun, b.in.Info).(*types.Func); ok {
+		return fn
+	}
+	id, ok := ast.Unparen(fun).(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	obj := b.in.Info.ObjectOf(id)
+	if obj == nil {
+		return nil
+	}
+	target, ok := ast.Unparen(singleAssign[obj]).(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	fn, _ := b.in.Info.ObjectOf(target).(*types.Func)
+	return fn
+}
+
+// closureCaptureEffect summarizes what one invocation of lit does to a
+// captured outer lifecycle object.  Calls are interpreted in the literal's
+// own structural CFG; the resulting effect is later applied at the OUTER
+// invocation call site.  This is the essential F5 distinction: defining a
+// closure, or merely finding cleanup text inside it, is not an event in the
+// owner's control flow.
+//
+// kind is "cancel" for a context.CancelFunc-like value or a group kind for
+// WaitGroup/errgroup.  The summary deliberately follows only direct calls
+// and the same parameter-effect contracts already supported for ordinary
+// helpers.  Nested closure capture or an unresolvable hand-off widens to
+// EffectOpaque rather than pretending cleanup happened.
+func (b *builder) closureCaptureEffect(lit *ast.FuncLit, obj types.Object, kind string) model.ParamEffect {
+	if lit == nil || lit.Body == nil || obj == nil || !objectReferencedInLiteral(lit, obj, b.in.Info) {
+		return 0
+	}
+	g, sites, err := b.structuralCFG("closure-capture", lit.Body)
+	if err != nil {
+		b.err = err
+		return 0
+	}
+	localAssign := singleAssignmentTargets(lit.Body, b.in.Info)
+	deferred := deferredCallSet(lit.Body)
+	var discharge, may []*ast.CallExpr
+	opaque := false
+
+	var walk func(ast.Node)
+	walk = func(root ast.Node) {
+		if root == nil || b.cancelled() {
+			return
+		}
+		ast.Inspect(root, func(n ast.Node) bool {
+			if n == nil || b.cancelled() {
+				return false
+			}
+			if nested, ok := n.(*ast.FuncLit); ok && nested != lit {
+				if objectReferencedInLiteral(nested, obj, b.in.Info) {
+					opaque = true
+				}
+				return false
+			}
+			switch x := n.(type) {
+			case *ast.CallExpr:
+				if kind == "cancel" {
+					if calledObject(x.Fun, b.in.Info) == obj {
+						discharge = append(discharge, x)
+						return true
+					}
+				} else if b.resolveGroupReceiver(x.Fun) == obj && selectorMethod(x.Fun) == "Wait" {
+					discharge = append(discharge, x)
+					return true
+				}
+				args := objectsUsedInExpressions(x.Args, b.in.Info, true)
+				if hasObject(args, obj) || spreadArgumentContains(x, obj, b.in.Info, localAssign) {
+					if eff, verified, _ := b.argumentEffectsWithTargets(x, obj, localAssign); verified {
+						switch {
+						case eff.Has(model.EffectMust):
+							discharge = append(discharge, x)
+						case eff.Has(model.EffectMay):
+							may = append(may, x)
+						}
+						if eff.Hands() {
+							opaque = true
+						}
+					} else {
+						opaque = true
+					}
+				}
+			case *ast.ReturnStmt:
+				if hasObject(objectsUsedInExpressions(x.Results, b.in.Info, true), obj) {
+					opaque = true
+				}
+			case *ast.SendStmt:
+				if hasObject(objectsUsedInExpressions([]ast.Expr{x.Value}, b.in.Info, true), obj) {
+					opaque = true
+				}
+			}
+			return true
+		})
+	}
+	walk(lit.Body)
+
+	var effect model.ParamEffect
+	reach := g.Reachable(g.Entry)
+	live := make([]*ast.CallExpr, 0, len(discharge))
+	for _, c := range discharge {
+		if site, ok := sites[c]; ok && reach[site.Block] {
+			live = append(live, c)
+		}
+	}
+	liveMay := false
+	for _, c := range may {
+		if site, ok := sites[c]; ok && reach[site.Block] {
+			liveMay = true
+			break
+		}
+	}
+	if len(live) > 0 || liveMay {
+		effect |= model.EffectMay
+	}
+	if len(live) > 0 {
+		plain, deferredSites := splitDeferred(live, deferred, sites)
+		origin := []flowgraph.CallSite{{Block: g.Entry, Index: -1}}
+		if bypassed, known := liveExitReachable(g, origin, plain, deferredSites, nil); known && !bypassed {
+			effect |= model.EffectMust
+		}
+	}
+	if opaque {
+		effect |= model.EffectOpaque
+	}
+	return effect
+}
+
+// closureGroupStarts counts directly visible worker-start operations on a
+// captured group in one literal invocation.  It deliberately does not descend
+// into nested literals: those have their own invocation semantics.  Mapping
+// these starts to the outer invocation site preserves the pre-F5 ability to
+// notice a group started inside a goroutine literal without pretending the
+// inner Add/Go node itself belongs to the owner's CFG.
+func (b *builder) closureGroupStarts(lit *ast.FuncLit, obj types.Object) int {
+	if lit == nil || lit.Body == nil || obj == nil {
+		return 0
+	}
+	starts := 0
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		if n == nil {
+			return false
+		}
+		if nested, ok := n.(*ast.FuncLit); ok && nested != lit {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok || b.resolveGroupReceiver(call.Fun) != obj {
+			return true
+		}
+		switch selectorMethod(call.Fun) {
+		case "Add", "Go":
+			starts++
+		}
+		return true
+	})
+	return starts
+}
+
+// observeClosureArgumentTransfers records ownership movement when a closure
+// value capturing a cancel function is passed to another call.  We do not
+// claim the callback ran; we only stop attributing the captured cleanup to
+// the current owner.  This preserves the analyzer's conservative hand-off
+// semantics while fixing the old, stronger (and incorrect) claim that text
+// inside the callback was an observed cancel call.
+func (b *builder) observeClosureArgumentTransfers(call *ast.CallExpr, cancels []*cancelState) {
+	for _, arg := range call.Args {
+		lit := closureValueTarget(arg, b.in.Info, b.singleAssignTargets)
+		if lit == nil {
+			continue
+		}
+		for _, c := range cancels {
+			if c.cancelObj == nil || !objectReferencedInLiteral(lit, c.cancelObj, b.in.Info) {
+				continue
+			}
+			c.binding.Escapes = true
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "closure-transfer", Message: "a closure capturing the cleanup value is passed to another call; ownership is transferred without claiming the callback was invoked", Span: ptrSpan(b.span(call))})
+		}
+	}
+}
+
+// applyClosureInvocation applies a literal's capture effects at the call
+// expression that actually invokes it.  This makes the owner's existing
+// acquisition-relative/all-path machinery reason about the invocation's
+// true position rather than an unreachable inner call node.
+func (b *builder) applyClosureInvocation(call *ast.CallExpr, lit *ast.FuncLit, async bool, cancels []*cancelState, groups []*groupState) {
+	for _, c := range cancels {
+		if c.cancelObj == nil {
+			continue
+		}
+		eff := b.closureCaptureEffect(lit, c.cancelObj, "cancel")
+		if eff == 0 {
+			continue
+		}
+		if async {
+			// A started goroutine owns the captured cleanup; do not claim the
+			// call happened before the owner returned.
+			c.binding.Escapes = true
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "closure-transfer", Message: "cleanup is captured by an asynchronously started closure; ownership is transferred, not treated as a call in this function", Span: ptrSpan(b.span(call))})
+			continue
+		}
+		if eff.Hands() {
+			c.binding.Escapes = true
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "closure-transfer", Message: "an invoked closure hands the cleanup value onward; ownership is transferred rather than treated as discharged here", Span: ptrSpan(b.span(call))})
+		}
+		switch {
+		case eff.Has(model.EffectMust):
+			c.binding.Called = true
+			c.callSites = append(c.callSites, call)
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "closure-consumes", Message: "the invoked closure calls the cleanup value on every path", Span: ptrSpan(b.span(call))})
+		case eff.Has(model.EffectMay):
+			c.binding.Called = true
+			c.mayCalls = append(c.mayCalls, call)
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "closure-may-consume", Message: "the invoked closure calls the cleanup value only on some of its paths", Span: ptrSpan(b.span(call))})
+		}
+	}
+	for _, gr := range groups {
+		if gr.obj == nil {
+			continue
+		}
+		if starts := b.closureGroupStarts(lit, gr.obj); starts > 0 {
+			gr.group.Starts += starts
+			gr.startCalls = append(gr.startCalls, call)
+			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "closure-worker-start", Message: "the invoked closure starts worker accounting for this captured group", Span: ptrSpan(b.span(call))})
+		}
+		if async {
+			continue // an async Wait does not join before the owner returns
+		}
+		eff := b.closureCaptureEffect(lit, gr.obj, gr.group.Kind)
+		if eff == 0 {
+			continue
+		}
+		switch {
+		case eff.Has(model.EffectMust):
+			gr.group.Joined = true
+			gr.helperJoinCalls = append(gr.helperJoinCalls, call)
+			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "closure-joins", Message: "the invoked closure joins the group on every path", Span: ptrSpan(b.span(call))})
+		case eff.Has(model.EffectMay):
+			gr.group.Joined = true
+			gr.mayJoinCalls = append(gr.mayJoinCalls, call)
+			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "closure-may-join", Message: "the invoked closure joins the group only on some of its paths", Span: ptrSpan(b.span(call))})
+		case eff.Hands():
+			// Preserve literal count/ordering diagnostics exactly as the
+			// ordinary parameter hand-off path does: this is not a verified
+			// Wait, but ownership may have moved.
+			gr.group.Joined = true
+			gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "closure-transfer", Message: "the invoked closure hands the group onward; treated as transferred without a verified join", Span: ptrSpan(b.span(call))})
+		}
+	}
+}
+
 func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Object]string, cancels []*cancelState, groups []*groupState, fn *model.Function, fnObj *types.Func) {
 	b.singleAssignTargets = singleAssignmentTargets(body, b.in.Info)
+	asyncClosureCalls := goCallSet(body)
 	// Field/constructor ownership tracking (docs/roadmap.md item 3): find
 	// every "stored struct" or "constructor" field-capture shape in body
 	// up front, before the main traversal below runs, so the generic
@@ -1428,9 +1804,28 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		if b.inDeadLiteral(n.Pos()) {
 			return true // a literal that never runs has no effects (see deadFuncLits)
 		}
+		// Nested literal bodies are separate control-flow units.  Keep
+		// descending so nested goroutines are still attributed to the
+		// enclosing declaration, but never let ordinary calls/returns/
+		// assignments inside the literal directly mutate the OUTER
+		// obligation state.  A real invocation is summarized and applied at
+		// its call site below (audit finding F5).
+		if funcDepth > 0 {
+			if x, ok := n.(*ast.GoStmt); ok {
+				g := b.buildGoroutine(x, x.Call, contexts, "go")
+				fn.Goroutines = append(fn.Goroutines, g)
+				b.markChildUses(x.Call, cancels)
+			}
+			return true
+		}
 		switch x := n.(type) {
 		case *ast.CallExpr:
-			b.observeCall(x, cancels, groups)
+			if lit := closureCallTarget(x, b.in.Info, b.singleAssignTargets); lit != nil {
+				b.applyClosureInvocation(x, lit, asyncClosureCalls[x], cancels, groups)
+			} else {
+				b.observeClosureArgumentTransfers(x, cancels)
+				b.observeCall(x, cancels, groups)
+			}
 			if b.isConfigured(x, b.startWrappers) {
 				if target := firstStartTarget(x.Args, b.in.Info); target != nil {
 					g := b.buildGoroutine(x, &ast.CallExpr{Fun: target}, contexts, "configured-start")
@@ -1742,10 +2137,11 @@ func (b *builder) computeParameterEffects(fd *ast.FuncDecl) (reportChanged bool)
 // every path that registered it).
 //
 // Anything else that happens to the value is an opaque hand-off, with two
-// refinements: being returned is its own effect, and a use inside a
-// function literal that may run is opaque, because the literal's own
-// control flow is not part of this function's graph (the closure might be
-// the very thing that cancels, later, so nothing is claimed).
+// refinements: being returned is its own effect, and a capture by a literal
+// whose invocation cannot be mapped to a direct call site is opaque. Direct
+// IIFEs and single-assignment stored calls are summarized at their invocation
+// sites, so their may/must cleanup is part of this function's own CFG question
+// instead of being flattened into an unplaced closure use (audit finding F5).
 func (b *builder) paramEffectOf(body *ast.BlockStmt, g *model.CFG, sites map[*ast.CallExpr]flowgraph.CallSite, deferred map[*ast.CallExpr]bool, obj types.Object, discharges, mayCalls, recCalls []*ast.CallExpr, escapes, returned bool) model.ParamEffect {
 	var effect model.ParamEffect
 	reach := g.Reachable(g.Entry)
@@ -1782,7 +2178,7 @@ func (b *builder) paramEffectOf(body *ast.BlockStmt, g *model.CFG, sites map[*as
 	} else if escapes {
 		effect |= model.EffectOpaque
 	}
-	if b.usedInLiveLiteral(body, obj) {
+	if b.usedInUnresolvedLiteral(body, obj) {
 		effect |= model.EffectOpaque
 	}
 	return effect
@@ -1844,12 +2240,28 @@ func (b *builder) reaches(from, to *types.Func) bool {
 	return walk(from)
 }
 
-// usedInLiveLiteral reports whether obj is referenced inside a function
-// literal of body that is not provably dead (see deadFuncLits).
-func (b *builder) usedInLiveLiteral(body *ast.BlockStmt, obj types.Object) bool {
+// usedInUnresolvedLiteral reports whether obj is captured by a function
+// literal whose execution is not represented by a direct invocation call
+// site in body.  Direct IIFEs and single-assignment locals called as
+// `f()` are modeled at those call sites by applyClosureInvocation, so they
+// are not opaque merely because a literal exists.  A literal that is only
+// stored/passed/returned remains an ownership hand-off (EffectOpaque).
+func (b *builder) usedInUnresolvedLiteral(body *ast.BlockStmt, obj types.Object) bool {
 	if body == nil || obj == nil {
 		return false
 	}
+	single := singleAssignmentTargets(body, b.in.Info)
+	invoked := map[*ast.FuncLit]bool{}
+	b.inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if lit := closureCallTarget(call, b.in.Info, single); lit != nil {
+			invoked[lit] = true
+		}
+		return true
+	})
 	found := false
 	b.inspect(body, func(n ast.Node) bool {
 		if found {
@@ -1862,12 +2274,9 @@ func (b *builder) usedInLiveLiteral(body *ast.BlockStmt, obj types.Object) bool 
 		if b.inDeadLiteral(lit.Pos()) {
 			return false
 		}
-		b.inspect(lit.Body, func(m ast.Node) bool {
-			if id, ok := m.(*ast.Ident); ok && b.in.Info.Uses[id] == obj {
-				found = true
-			}
-			return !found
-		})
+		if objectReferencedInLiteral(lit, obj, b.in.Info) && !invoked[lit] {
+			found = true
+		}
 		return false
 	})
 	return found
@@ -1936,36 +2345,7 @@ func (b *builder) recordParamEffects(obj types.Object, next model.ParamEffect) b
 //     back) on the spot -- there is no sweep to wait for, since this
 //     build has no way to ever compute that package's own result itself.
 func (b *builder) argumentEffects(call *ast.CallExpr, obj types.Object) (effect model.ParamEffect, verified, pending bool) {
-	funcObj := b.resolveCalleeFunc(call.Fun)
-	if funcObj == nil {
-		return 0, false, false
-	}
-	index := argumentIndexOf(call, obj, funcObj, b.in.Info, b.singleAssignTargets)
-	if index == -1 {
-		return 0, false, false
-	}
-	if decl := b.funcs[funcObj]; decl != nil {
-		paramObj := paramObjectAtIndex(b.in.Info, decl, index)
-		if paramObj == nil {
-			return 0, false, false
-		}
-		paramEffect, known := b.paramEffects[paramObj]
-		return paramEffect, known, !known
-	}
-	if b.in.LookupParamEffects != nil {
-		if paramEffect, known := b.in.LookupParamEffects(funcObj, index); known {
-			return paramEffect, true, false
-		}
-	}
-	if b.in.LookupParamConsumption != nil {
-		if consumed, known := b.in.LookupParamConsumption(funcObj, index); known {
-			if consumed {
-				return model.EffectOpaque, true, false
-			}
-			return 0, true, false
-		}
-	}
-	return 0, false, false
+	return b.argumentEffectsWithTargets(call, obj, b.singleAssignTargets)
 }
 
 // resolveCalleeFunc resolves call's callee to a *types.Func for
@@ -1983,23 +2363,7 @@ func (b *builder) argumentEffects(call *ast.CallExpr, obj types.Object) (effect 
 // behavior for a local variable of function type; see firstStartTarget's
 // doc comment for why that one stays as is).
 func (b *builder) resolveCalleeFunc(fun ast.Expr) *types.Func {
-	if fn, ok := calledObject(fun, b.in.Info).(*types.Func); ok {
-		return fn
-	}
-	id, ok := fun.(*ast.Ident)
-	if !ok {
-		return nil
-	}
-	obj := b.in.Info.ObjectOf(id)
-	if obj == nil {
-		return nil
-	}
-	target, ok := b.singleAssignTargets[obj].(*ast.Ident)
-	if !ok {
-		return nil
-	}
-	fn, _ := b.in.Info.ObjectOf(target).(*types.Func)
-	return fn
+	return b.resolveCalleeFuncWithTargets(fun, b.singleAssignTargets)
 }
 
 // argumentIndexOf returns the parameter index obj is passed at: either a

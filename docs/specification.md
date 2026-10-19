@@ -107,7 +107,7 @@ All of the above is reachability over a graph, not a proof: a resolving edge mea
 
 This applies whenever a body was available to build a CFG from. A cross-package target does not carry the body/CFG itself, but its summary carries the exporting package's CFG/SCC-derived `LoopUnresolved` verdict, so vet facts and standalone source-derived dependency summaries preserve that LL1002 result without rebuilding the callee graph in the caller; see `docs/limitations.md`.
 
-Nested function literals have independent lifecycle summaries and independent CFGs. Their loops and stop paths cannot alter the enclosing goroutine's summary, although nested goroutine start sites are analyzed separately.
+Nested function literals have independent lifecycle summaries and independent CFGs. Their loops and stop paths cannot alter the enclosing goroutine's summary, although nested goroutine start sites are analyzed separately. For lifecycle values captured from the enclosing function, literal-body calls are not copied into the owner's evidence directly: a supported synchronous invocation (an IIFE or a single-assignment local literal called later) contributes its may/must capture effect at the invocation call site in the owner's CFG; callback/go capture is a transfer rather than proof that cleanup occurred before owner return.
 
 ### Join protocol
 

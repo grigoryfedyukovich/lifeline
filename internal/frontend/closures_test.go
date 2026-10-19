@@ -134,6 +134,66 @@ func TestClosures_ADefinedButNeverInvokedLiteralDischargesNothing(t *testing.T) 
 	}
 }
 
+func TestClosures_CapturedCleanupUsesInvocationControlFlow(t *testing.T) {
+	cases := []struct {
+		name, body, want string
+	}{
+		{"unconditional IIFE", `func() { cancel() }()`, ""},
+		{"conditional IIFE", `if c { func() { cancel() }() }`, "LL1001"},
+		{"stored unconditional call", `f := func() { cancel() }; f()`, ""},
+		{"stored conditional call", `f := func() { cancel() }; if c { f() }`, "LL1001"},
+		{"closure condition", `func() { if c { cancel() } }()`, "LL1001"},
+		{"deferred closure", `defer func() { cancel() }()`, ""},
+		{"stored but never invoked despite nonblank use", `f := func() { cancel() }; fs := []func(){f}; _ = fs`, "LL1001"},
+	}
+	for _, cse := range cases {
+		src := closureHeader + "func f(parent context.Context, c bool) {\n\t_, cancel := context.WithCancel(parent)\n\t" + cse.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != cse.want {
+			t.Errorf("%s: rules = %q, want %q", cse.name, got, cse.want)
+		}
+	}
+}
+
+func TestClosures_AsyncWaitDoesNotJoinOwnerGroup(t *testing.T) {
+	src := closureHeader + `func f() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done() }()
+	go func() { wg.Wait() }()
+}
+`
+	if got := rulesOnly(findings(t, src)); got != "LL1003" {
+		t.Fatalf("rules = %q, want LL1003: an async Wait is not an owner-side join", got)
+	}
+}
+
+func TestClosures_CallbackTransferDoesNotPretendInvocation(t *testing.T) {
+	src := closureHeader + `func hold(f func()) { _ = f }
+func f(parent context.Context) {
+	_, cancel := context.WithCancel(parent)
+	hold(func() { cancel() })
+}
+`
+	program := buildProgramFor(t, src, nil)
+	var found *model.CancelBinding
+	for i := range program.Functions {
+		fn := &program.Functions[i]
+		if !strings.HasSuffix(fn.Name, ".f") || len(fn.Cancels) == 0 {
+			continue
+		}
+		found = &fn.Cancels[0]
+	}
+	if found == nil {
+		t.Fatal("cancel binding for f not found")
+	}
+	if found.Called {
+		t.Fatalf("callback transfer set Called=true; defining/passing a closure is not invocation: %#v", *found)
+	}
+	if !found.Escapes {
+		t.Fatalf("callback transfer should preserve conservative ownership hand-off: %#v", *found)
+	}
+}
+
 func TestClosures_ADefinedButNeverInvokedLiteralDoesNotJoinAGroup(t *testing.T) {
 	cases := []struct{ name, body, want string }{
 		{"blank literal waiting", `_ = func() { wg.Wait() }`, "LL1003"},
