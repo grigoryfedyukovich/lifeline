@@ -75,6 +75,8 @@ Vet mode follows the normal `go vet` diagnostic exit convention.
 | `LL1003` | `WARNING` | A local `sync.WaitGroup` records worker starts but isn't fully, verifiably joined before the owner returns: no `Wait`/ownership transfer observed at all, a `Wait` observed but not on every return path, or a `Wait` on every path with a literal `Add`/`Done` count that still doesn't balance. |
 | `LL1004` | `WARNING` | The same three conditions as `LL1003`, for a local `errgroup.Group` (the count-mismatch condition never applies: `errgroup.Group` manages its own `Add`/`Done`-equivalent bookkeeping internally). |
 | `LL1005` | `WARNING` | A `sync.WaitGroup`/`errgroup.Group` is joined before its workers' own recognized stop signal (a context cancel, a verified close-dependent channel close, or an assumed `stop_wrapper`) is guaranteed to have been sent, proven via CFG reachability and deferred-call order rather than merely unproven the other way. |
+
+For verified channel-close correlation, Lifeline follows direct local channel variables, simple local aliases, and one-level local struct fields on both the worker receive and owner `close(...)` sides. It does not treat ordinary data receives as termination evidence, and unsupported alias/helper shapes withhold `LL1005` rather than guessing.
 | `LL9001` | `UNKNOWN` | `max_functions` or the standalone timeout makes analysis incomplete. Hiding it does not change `status.incomplete`. |
 
 An unsupported direct target is retained as `unsupported` model evidence and is never interpreted as a successful termination proof. Version 0.1.1 does not emit a separate user-visible unsupported diagnostic; this remaining specification gap is tracked in the roadmap.

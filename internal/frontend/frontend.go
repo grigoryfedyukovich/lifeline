@@ -6669,8 +6669,8 @@ type stopSignal struct {
 // (`defer wg.Wait(); defer cancel()` cancels first and is safe;
 // `defer cancel(); defer wg.Wait()` waits first and deadlocks). Registration
 // order is read off the graph, which records a defer at its statement.
-func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, closeCalls map[types.Object][]*ast.CallExpr, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) {
-	stops, placeable := b.stopSignalsFor(gr, cancels, wrapperCalls, closeCalls, body, callSites, deferredCalls)
+func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, closeCalls map[channelSource][]*ast.CallExpr, channels *channelSourceIndex, body *ast.BlockStmt, g *model.CFG, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) {
+	stops, placeable := b.stopSignalsFor(gr, cancels, wrapperCalls, closeCalls, channels, body, callSites, deferredCalls)
 	if len(stops) == 0 || !placeable {
 		return
 	}
@@ -6782,7 +6782,7 @@ func registeredBefore(g *model.CFG, a, bsite flowgraph.CallSite) bool {
 // computeStopOrdering), placed in the owner's control flow. placeable is
 // false when some candidate has no place there, in which case no claim is
 // made.
-func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, closeCalls map[types.Object][]*ast.CallExpr, body *ast.BlockStmt, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) (stops []stopSignal, placeable bool) {
+func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapperCalls []*ast.CallExpr, closeCalls map[channelSource][]*ast.CallExpr, channels *channelSourceIndex, body *ast.BlockStmt, callSites map[*ast.CallExpr]flowgraph.CallSite, deferredCalls map[*ast.CallExpr]bool) (stops []stopSignal, placeable bool) {
 	placeable = true
 	add := func(calls []*ast.CallExpr, correlation string) {
 		for _, call := range calls {
@@ -6812,7 +6812,7 @@ func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapper
 			add(c.callSites, "worker-context")
 		}
 	}
-	usedChannels := b.workerStopChannels(gr, body)
+	usedChannels := b.workerStopChannels(gr, body, channels)
 	if len(usedChannels) > 0 {
 		for obj, calls := range closeCalls {
 			if usedChannels[obj] {
@@ -7147,15 +7147,344 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 	return used
 }
 
+// channelSource identifies one local channel value for stop-signal correlation.
+// A direct channel variable uses obj. A one-level struct field uses base+field.
+// Field identities are instance-sensitive: two local holders with the same Go
+// struct type do not collapse to the same stop source.
+type channelSource struct {
+	obj   types.Object
+	base  types.Object
+	field string
+}
+
+type channelFieldKey struct {
+	base  types.Object
+	field string
+}
+
+// channelSourceIndex conservatively relates simple local aliases and one-level
+// struct fields to the channel values they may hold. Assignments union sources:
+// if a variable/field may refer to more than one channel, all of those channels
+// remain candidates and LL1005 is emitted only when every candidate stop is
+// proven late. This is deliberately shallow; heap/container aliases and nested
+// selector paths remain unsupported instead of being guessed at.
+type channelSourceIndex struct {
+	vars   map[types.Object]map[channelSource]bool
+	fields map[channelFieldKey]map[channelSource]bool
+}
+
+func newChannelSourceIndex() *channelSourceIndex {
+	return &channelSourceIndex{
+		vars:   map[types.Object]map[channelSource]bool{},
+		fields: map[channelFieldKey]map[channelSource]bool{},
+	}
+}
+
+func copyChannelSources(in map[channelSource]bool) map[channelSource]bool {
+	out := map[channelSource]bool{}
+	for src := range in {
+		out[src] = true
+	}
+	return out
+}
+
+func (idx *channelSourceIndex) addVar(obj types.Object, srcs map[channelSource]bool) {
+	if obj == nil || obj.Type() == nil {
+		return
+	}
+	if _, ok := obj.Type().Underlying().(*types.Chan); !ok {
+		return
+	}
+	if idx.vars[obj] == nil {
+		idx.vars[obj] = map[channelSource]bool{}
+	}
+	for src := range srcs {
+		idx.vars[obj][src] = true
+	}
+}
+
+func (idx *channelSourceIndex) addField(key channelFieldKey, srcs map[channelSource]bool) {
+	if key.base == nil || key.field == "" {
+		return
+	}
+	if idx.fields[key] == nil {
+		idx.fields[key] = map[channelSource]bool{}
+	}
+	for src := range srcs {
+		idx.fields[key][src] = true
+	}
+}
+
+func (idx *channelSourceIndex) sourcesForField(base types.Object, field string) map[channelSource]bool {
+	if base == nil || field == "" {
+		return nil
+	}
+	key := channelFieldKey{base: base, field: field}
+	if srcs := idx.fields[key]; len(srcs) > 0 {
+		return copyChannelSources(srcs)
+	}
+	return map[channelSource]bool{{base: base, field: field}: true}
+}
+
+// sourcesForExpr resolves the channel value denoted by a simple identifier or
+// one-level field selector. Unknown/complex expressions return no source, which
+// withholds LL1005 rather than manufacturing a correlation.
+func (idx *channelSourceIndex) sourcesForExpr(expr ast.Expr, info *types.Info) map[channelSource]bool {
+	switch x := unparenExpr(expr).(type) {
+	case *ast.Ident:
+		obj := info.ObjectOf(x)
+		if obj == nil || obj.Type() == nil {
+			return nil
+		}
+		if _, ok := obj.Type().Underlying().(*types.Chan); !ok {
+			return nil
+		}
+		if srcs := idx.vars[obj]; len(srcs) > 0 {
+			return copyChannelSources(srcs)
+		}
+		return map[channelSource]bool{{obj: obj}: true}
+	case *ast.SelectorExpr:
+		sel := info.Selections[x]
+		if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
+			return nil
+		}
+		if _, ok := sel.Obj().Type().Underlying().(*types.Chan); !ok {
+			return nil
+		}
+		base := identObject(x.X, info)
+		if base == nil {
+			return nil
+		}
+		return idx.sourcesForField(base, x.Sel.Name)
+	default:
+		return nil
+	}
+}
+
+func channelFieldNameAt(info *types.Info, lit *ast.CompositeLit, i int) string {
+	if lit == nil {
+		return ""
+	}
+	t := info.TypeOf(lit)
+	if t == nil {
+		return ""
+	}
+	st, _ := deref(t).Underlying().(*types.Struct)
+	if st == nil || i < 0 || i >= st.NumFields() {
+		return ""
+	}
+	return st.Field(i).Name()
+}
+
+// buildChannelSourceIndex performs one source-order pass over the owner body.
+// It tracks aliases such as alias := stop, field stores such as h.stop = stop,
+// keyed/unkeyed literals, and whole-value local struct copies.
+func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceIndex {
+	idx := newChannelSourceIndex()
+	if body == nil {
+		return idx
+	}
+	composite := func(expr ast.Expr) *ast.CompositeLit {
+		e := unparenExpr(expr)
+		if u, ok := e.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			e = unparenExpr(u.X)
+		}
+		lit, _ := e.(*ast.CompositeLit)
+		return lit
+	}
+	seedVar := func(obj types.Object, rhs ast.Expr) {
+		if obj == nil || obj.Type() == nil {
+			return
+		}
+		if _, ok := obj.Type().Underlying().(*types.Chan); !ok {
+			return
+		}
+		srcs := idx.sourcesForExpr(rhs, b.in.Info)
+		if len(srcs) == 0 {
+			// make(chan T), receive expressions, or another unsupported producer:
+			// the local binding itself is still a stable source identity.
+			srcs = map[channelSource]bool{{obj: obj}: true}
+		}
+		idx.addVar(obj, srcs)
+	}
+	seedField := func(base types.Object, field string, rhs ast.Expr) {
+		if base == nil || field == "" {
+			return
+		}
+		srcs := idx.sourcesForExpr(rhs, b.in.Info)
+		if len(srcs) == 0 {
+			srcs = map[channelSource]bool{{base: base, field: field}: true}
+		}
+		idx.addField(channelFieldKey{base: base, field: field}, srcs)
+	}
+	seedComposite := func(base types.Object, lit *ast.CompositeLit) {
+		if base == nil || lit == nil {
+			return
+		}
+		for i, elt := range lit.Elts {
+			field := channelFieldNameAt(b.in.Info, lit, i)
+			var value ast.Expr
+			switch e := elt.(type) {
+			case *ast.KeyValueExpr:
+				id, _ := e.Key.(*ast.Ident)
+				if id != nil {
+					field = id.Name
+				}
+				value = e.Value
+			case ast.Expr:
+				value = e
+			}
+			if value == nil || field == "" {
+				continue
+			}
+			selectionType := b.in.Info.TypeOf(value)
+			if selectionType == nil {
+				continue
+			}
+			if _, ok := selectionType.Underlying().(*types.Chan); !ok {
+				continue
+			}
+			seedField(base, field, value)
+		}
+	}
+	copyStruct := func(dst, src types.Object) {
+		if dst == nil || src == nil {
+			return
+		}
+		for key, vals := range idx.fields {
+			if key.base != src {
+				continue
+			}
+			idx.addField(channelFieldKey{base: dst, field: key.field}, vals)
+		}
+	}
+
+	b.inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range x.Lhs {
+				if i >= len(x.Rhs) {
+					continue
+				}
+				rhs := x.Rhs[i]
+				if sel, ok := unparenExpr(lhs).(*ast.SelectorExpr); ok {
+					selection := b.in.Info.Selections[sel]
+					if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 {
+						if _, ok := selection.Obj().Type().Underlying().(*types.Chan); ok {
+							seedField(identObject(sel.X, b.in.Info), sel.Sel.Name, rhs)
+						}
+					}
+					continue
+				}
+				base := identObject(lhs, b.in.Info)
+				if base == nil {
+					continue
+				}
+				if _, ok := base.Type().Underlying().(*types.Chan); ok {
+					seedVar(base, rhs)
+					continue
+				}
+				if lit := composite(rhs); lit != nil {
+					seedComposite(base, lit)
+					continue
+				}
+				copyStruct(base, identObject(rhs, b.in.Info))
+			}
+		case *ast.ValueSpec:
+			for i, name := range x.Names {
+				if i >= len(x.Values) {
+					continue
+				}
+				base := b.in.Info.Defs[name]
+				if base == nil {
+					continue
+				}
+				rhs := x.Values[i]
+				if _, ok := base.Type().Underlying().(*types.Chan); ok {
+					seedVar(base, rhs)
+					continue
+				}
+				if lit := composite(rhs); lit != nil {
+					seedComposite(base, lit)
+					continue
+				}
+				copyStruct(base, identObject(rhs, b.in.Info))
+			}
+		}
+		return true
+	})
+	return idx
+}
+
+// channelFieldsUsedByParam reports one-level channel fields of a visible
+// same-package worker parameter that participate in a close-dependent
+// termination shape.
+func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string]bool {
+	out := map[string]bool{}
+	decl := b.funcs[fn]
+	if decl == nil || decl.Body == nil {
+		return out
+	}
+	param := paramObjectAtIndex(b.in.Info, decl, index)
+	if param == nil {
+		return out
+	}
+	fieldOf := func(expr ast.Expr) string {
+		sel, ok := unparenExpr(expr).(*ast.SelectorExpr)
+		if !ok || identObject(sel.X, b.in.Info) != param {
+			return ""
+		}
+		selection := b.in.Info.Selections[sel]
+		if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 {
+			return ""
+		}
+		ch, ok := selection.Obj().Type().Underlying().(*types.Chan)
+		if !ok || ch.Dir() == types.SendOnly {
+			return ""
+		}
+		return sel.Sel.Name
+	}
+	b.inspect(decl.Body, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.RangeStmt:
+			if field := fieldOf(x.X); field != "" {
+				out[field] = true
+			}
+		case *ast.CommClause:
+			if x.Comm != nil && statementsContainReturn(x.Body) {
+				if expr := receivedExpr(x.Comm); expr != nil {
+					if field := fieldOf(expr); field != "" {
+						out[field] = true
+					}
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
 // workerStopChannels returns channel objects that this group's workers
 // demonstrably depend on closing to terminate. Closing such a channel is a
 // recognized stop signal for LL1005. Merely passing, sending, or doing an
 // ordinary data receive does not establish the relation: the worker must range
 // over the channel or return from a select receive branch, or a visible
 // same-package named worker must do the same through the corresponding channel
-// parameter.
-func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt) map[types.Object]bool {
-	used := map[types.Object]bool{}
+// parameter or one-level channel field.
+func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt, channels *channelSourceIndex) map[channelSource]bool {
+	used := map[channelSource]bool{}
 	addReceives := func(root ast.Node) {
 		b.inspect(root, func(n ast.Node) bool {
 			if n == nil {
@@ -7166,16 +7495,16 @@ func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt) map[ty
 			}
 			switch x := n.(type) {
 			case *ast.RangeStmt:
-				if obj := identObject(x.X, b.in.Info); isRecvChannelObject(obj) {
-					used[obj] = true
+				for src := range channels.sourcesForExpr(x.X, b.in.Info) {
+					used[src] = true
 				}
 			case *ast.CommClause:
 				if x.Comm == nil || !statementsContainReturn(x.Body) {
 					return true
 				}
 				if expr := receivedExpr(x.Comm); expr != nil {
-					if obj := identObject(expr, b.in.Info); isRecvChannelObject(obj) {
-						used[obj] = true
+					for src := range channels.sourcesForExpr(expr, b.in.Info) {
+						used[src] = true
 					}
 				}
 			}
@@ -7199,11 +7528,19 @@ func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt) map[ty
 				return true
 			}
 			for i, arg := range gs.Call.Args {
-				if !b.channelParamIsReceived(fn, i) {
+				if b.channelParamIsReceived(fn, i) {
+					for src := range channels.sourcesForExpr(arg, b.in.Info) {
+						used[src] = true
+					}
+				}
+				base := identObject(arg, b.in.Info)
+				if base == nil {
 					continue
 				}
-				if obj := identObject(arg, b.in.Info); isRecvChannelObject(obj) {
-					used[obj] = true
+				for field := range b.channelFieldsUsedByParam(fn, i) {
+					for src := range channels.sourcesForField(base, field) {
+						used[src] = true
+					}
 				}
 			}
 		}
@@ -7233,7 +7570,7 @@ func isRecvChannelObject(obj types.Object) bool {
 // channelParamIsReceived reports whether a visible same-package worker body
 // has a close-dependent termination shape on parameter index: a range over
 // the channel, or a select receive whose clause returns. Helper-mediated
-// receives and channel-valued fields are intentionally not guessed at.
+// receives through helpers are intentionally not guessed at.
 func (b *builder) channelParamIsReceived(fn *types.Func, index int) bool {
 	decl := b.funcs[fn]
 	if decl == nil || decl.Body == nil {
@@ -7272,8 +7609,8 @@ func (b *builder) channelParamIsReceived(fn *types.Func, index int) bool {
 // body. Calls nested inside function literals are excluded because they do not
 // have the owner's execution semantics/call-site placement unless invocation
 // effects are modeled separately.
-func (b *builder) closeCallsByChannel(body *ast.BlockStmt) map[types.Object][]*ast.CallExpr {
-	out := map[types.Object][]*ast.CallExpr{}
+func (b *builder) closeCallsByChannel(body *ast.BlockStmt, channels *channelSourceIndex) map[channelSource][]*ast.CallExpr {
+	out := map[channelSource][]*ast.CallExpr{}
 	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			return true
@@ -7293,8 +7630,8 @@ func (b *builder) closeCallsByChannel(body *ast.BlockStmt) map[types.Object][]*a
 		if !ok || builtin.Name() != "close" {
 			return true
 		}
-		if obj := identObject(call.Args[0], b.in.Info); isRecvChannelObject(obj) {
-			out[obj] = append(out[obj], call)
+		for src := range channels.sourcesForExpr(call.Args[0], b.in.Info) {
+			out[src] = append(out[src], call)
 		}
 		return true
 	})
@@ -7362,7 +7699,8 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 	}
 	deferredCalls := deferredCallSet(body)
 	stopWrapperCalls := b.collectStopWrapperCalls(body)
-	closeCalls := b.closeCallsByChannel(body)
+	channels := b.buildChannelSourceIndex(body)
+	closeCalls := b.closeCallsByChannel(body, channels)
 
 	for _, c := range cancels {
 		if !c.binding.Called {
@@ -7440,7 +7778,7 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		if len(waitSites) == 0 {
 			continue
 		}
-		b.computeStopOrdering(gr, cancels, stopWrapperCalls, closeCalls, body, g, callSites, deferredCalls)
+		b.computeStopOrdering(gr, cancels, stopWrapperCalls, closeCalls, channels, body, g, callSites, deferredCalls)
 	}
 }
 

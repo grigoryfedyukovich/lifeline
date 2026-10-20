@@ -451,3 +451,95 @@ func f() {
 	}
 	t.Fatal("expected a stop-after-wait group")
 }
+
+func TestStopOrder_ChannelAliasesAndFieldsCorrelate(t *testing.T) {
+	const hdr = `package p
+import "sync"
+type holder struct { stop chan struct{} }
+func holderWorker(h holder, wg *sync.WaitGroup) {
+	defer wg.Done()
+	select { case <-h.stop: return }
+}
+`
+	cases := []struct{ name, body, want string }{
+		{"worker alias, close original", `
+stop := make(chan struct{})
+alias := stop
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-alias: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"worker original, close alias", `
+stop := make(chan struct{})
+alias := stop
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+wg.Wait(); close(alias)`, "LL1005"},
+		{"literal reads field, close original", `
+stop := make(chan struct{})
+h := holder{stop: stop}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-h.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"literal reads field, close field", `
+h := holder{stop: make(chan struct{})}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-h.stop: return } }()
+wg.Wait(); close(h.stop)`, "LL1005"},
+		{"named worker reads field", `
+stop := make(chan struct{})
+h := holder{stop: stop}
+var wg sync.WaitGroup
+wg.Add(1); go holderWorker(h, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"struct copy preserves field source", `
+stop := make(chan struct{})
+h1 := holder{stop: stop}
+h2 := h1
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-h2.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"early close through alias is safe", `
+stop := make(chan struct{})
+alias := stop
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+close(alias); wg.Wait()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f() {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_ChannelFieldSignalsStayIndependent(t *testing.T) {
+	src := `package p
+import "sync"
+type holder struct { stop chan struct{} }
+func f() {
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+	h1 := holder{stop: stop1}
+	h2 := holder{stop: stop2}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); select { case <-h1.stop: return } }()
+	wg2.Add(1); go func(){ defer wg2.Done(); select { case <-h2.stop: return } }()
+	close(h1.stop); wg1.Wait()
+	wg2.Wait(); close(h2.stop)
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
