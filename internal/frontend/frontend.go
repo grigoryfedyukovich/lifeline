@@ -6853,18 +6853,59 @@ func derivesFromAny(used map[types.Object]bool, target types.Object, parents map
 	return false
 }
 
-// contextFieldKey identifies one context-typed field of one local value.
-// It is intentionally shallow: F7 only needs to recover contexts stored in
-// ordinary local structs before a worker starts. Multi-selector paths,
-// heap/container aliases, channels and arbitrary callbacks remain explicit
-// limitations rather than being guessed at.
+// contextFieldKey identifies one context-typed local field path. field is a
+// dot-separated selector path rooted at base (for example "worker.ctx").
+// The path is instance-sensitive: two local roots with identical Go types do
+// not collapse to one stop source.
 type contextFieldKey struct {
 	base  types.Object
 	field string
 }
 
+func joinFieldPath(prefix, field string) string {
+	if prefix == "" {
+		return field
+	}
+	if field == "" {
+		return prefix
+	}
+	return prefix + "." + field
+}
+
+// localFieldPath resolves an explicit local selector path such as h.stop or
+// svc.worker.stop to its root object and dot-separated field path. It accepts
+// pointer/address wrappers around the local root, but deliberately rejects
+// package selectors, method selections, promoted-field shortcuts and other
+// expressions whose identity would require alias analysis.
+func localFieldPath(expr ast.Expr, info *types.Info) (types.Object, string, bool) {
+	switch x := unparenExpr(expr).(type) {
+	case *ast.Ident:
+		obj := info.ObjectOf(x)
+		return obj, "", obj != nil
+	case *ast.UnaryExpr:
+		if x.Op != token.AND {
+			return nil, "", false
+		}
+		return localFieldPath(x.X, info)
+	case *ast.StarExpr:
+		return localFieldPath(x.X, info)
+	case *ast.SelectorExpr:
+		sel := info.Selections[x]
+		if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
+			return nil, "", false
+		}
+		base, prefix, ok := localFieldPath(x.X, info)
+		if !ok || base == nil {
+			return nil, "", false
+		}
+		return base, joinFieldPath(prefix, x.Sel.Name), true
+	default:
+		return nil, "", false
+	}
+}
+
 // contextFieldSources records which tracked context variables may have been
-// stored in each one-level context field of a local value. Sources are
+// stored in each explicit local context-field path. Sources are
 // unioned across assignments: when a field can hold either of two contexts,
 // both cancels become candidate stop signals and LL1005 is emitted only if
 // every candidate is proven late. That is the conservative direction.
@@ -6896,8 +6937,8 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 			}
 		case *ast.SelectorExpr:
 			if sel := b.in.Info.Selections[x]; sel != nil && sel.Kind() == types.FieldVal && len(sel.Index()) == 1 && isContextType(sel.Obj().Type(), b.contextInterface) {
-				if base := identObject(x.X, b.in.Info); base != nil {
-					for obj := range out[contextFieldKey{base: base, field: x.Sel.Name}] {
+				if base, path, ok := localFieldPath(x, b.in.Info); ok && path != "" {
+					for obj := range out[contextFieldKey{base: base, field: path}] {
 						res[obj] = true
 					}
 				}
@@ -6927,6 +6968,33 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 		}
 		return st.Field(i).Name()
 	}
+	var seedComposite func(base types.Object, prefix string, lit *ast.CompositeLit)
+	seedComposite = func(base types.Object, prefix string, lit *ast.CompositeLit) {
+		if base == nil || lit == nil {
+			return
+		}
+		for j, elt := range lit.Elts {
+			field := fieldNameAt(lit, j)
+			value, ok := elt.(ast.Expr)
+			if kv, keyed := elt.(*ast.KeyValueExpr); keyed {
+				if id, ok := kv.Key.(*ast.Ident); ok {
+					field = id.Name
+				}
+				value = kv.Value
+				ok = true
+			}
+			if !ok || field == "" || value == nil {
+				continue
+			}
+			path := joinFieldPath(prefix, field)
+			for src := range sources(value) {
+				add(contextFieldKey{base: base, field: path}, src)
+			}
+			if nested := composite(value); nested != nil {
+				seedComposite(base, path, nested)
+			}
+		}
+	}
 	// One source-order pass is enough for valid Go: a local value must be
 	// declared/assigned before a later statement can copy or read it. Avoiding
 	// a fixed point is important here because this index is a scaling aid, not a
@@ -6948,9 +7016,10 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 				if sel, ok := unparenExpr(lhs).(*ast.SelectorExpr); ok {
 					selection := b.in.Info.Selections[sel]
 					if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
-						base := identObject(sel.X, b.in.Info)
-						for src := range sources(rhs) {
-							add(contextFieldKey{base: base, field: sel.Sel.Name}, src)
+						if base, path, ok := localFieldPath(sel, b.in.Info); ok && path != "" {
+							for src := range sources(rhs) {
+								add(contextFieldKey{base: base, field: path}, src)
+							}
 						}
 					}
 					continue
@@ -6960,23 +7029,7 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 					continue
 				}
 				if lit := composite(rhs); lit != nil {
-					for j, elt := range lit.Elts {
-						field := fieldNameAt(lit, j)
-						value, ok := elt.(ast.Expr)
-						if kv, keyed := elt.(*ast.KeyValueExpr); keyed {
-							if id, ok := kv.Key.(*ast.Ident); ok {
-								field = id.Name
-							}
-							value = kv.Value
-							ok = true
-						}
-						if !ok || field == "" {
-							continue
-						}
-						for src := range sources(value) {
-							add(contextFieldKey{base: base, field: field}, src)
-						}
-					}
+					seedComposite(base, "", lit)
 					continue
 				}
 				// Whole-value copies preserve every known context field.
@@ -6997,25 +7050,22 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 					continue
 				}
 				base := b.in.Info.Defs[name]
-				lit := composite(x.Values[i])
-				if base == nil || lit == nil {
+				if base == nil {
 					continue
 				}
-				for j, elt := range lit.Elts {
-					field := fieldNameAt(lit, j)
-					value, ok := elt.(ast.Expr)
-					if kv, keyed := elt.(*ast.KeyValueExpr); keyed {
-						if id, ok := kv.Key.(*ast.Ident); ok {
-							field = id.Name
+				rhs := x.Values[i]
+				if lit := composite(rhs); lit != nil {
+					seedComposite(base, "", lit)
+					continue
+				}
+				if other := identObject(rhs, b.in.Info); other != nil {
+					for key, vals := range out {
+						if key.base != other {
+							continue
 						}
-						value = kv.Value
-						ok = true
-					}
-					if !ok || field == "" {
-						continue
-					}
-					for src := range sources(value) {
-						add(contextFieldKey{base: base, field: field}, src)
+						for src := range vals {
+							add(contextFieldKey{base: base, field: key.field}, src)
+						}
 					}
 				}
 			}
@@ -7035,7 +7085,7 @@ func unparenExpr(expr ast.Expr) ast.Expr {
 	}
 }
 
-// contextFieldsUsedByParam returns the one-level context fields read through
+// contextFieldsUsedByParam returns explicit context-field paths read through
 // parameter index by a visible same-package worker body. It deliberately does
 // not infer through arbitrary helper calls; unresolved shapes simply withhold
 // LL1005 rather than inventing a worker/stop relation.
@@ -7057,12 +7107,14 @@ func (b *builder) contextFieldsUsedByParam(fn *types.Func, index int) map[string
 			return false
 		}
 		sel, ok := n.(*ast.SelectorExpr)
-		if !ok || identObject(sel.X, b.in.Info) != param {
+		if !ok {
 			return true
 		}
 		selection := b.in.Info.Selections[sel]
 		if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
-			out[sel.Sel.Name] = true
+			if base, path, ok := localFieldPath(sel, b.in.Info); ok && base == param && path != "" {
+				out[path] = true
+			}
 		}
 		return true
 	})
@@ -7071,9 +7123,10 @@ func (b *builder) contextFieldsUsedByParam(fn *types.Func, index int) map[string
 
 // workerContexts returns the context objects used by gr's workers: the
 // goroutines (`go` statements anywhere in body) and Go calls that start this
-// group's accounting. Besides direct context variables, it resolves one-level
-// context fields of local structs so `h := holder{ctx: ctx}; go func(){
-// <-h.ctx.Done() }()` is related to ctx's cancel function (audit finding F7).
+// group's accounting. Besides direct context variables, it resolves explicit
+// local context-field paths so `s := service{worker: worker{ctx: ctx}}; go
+// func(){ <-s.worker.ctx.Done() }()` is related to ctx's cancel function
+// (audit finding F7).
 func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.Object]bool {
 	used := map[types.Object]bool{}
 	fields := b.contextFieldSources(body)
@@ -7092,8 +7145,8 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 			if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 || !isContextType(selection.Obj().Type(), b.contextInterface) {
 				return true
 			}
-			if base := identObject(sel.X, b.in.Info); base != nil {
-				for src := range fields[contextFieldKey{base: base, field: sel.Sel.Name}] {
+			if base, path, ok := localFieldPath(sel, b.in.Info); ok && path != "" {
+				for src := range fields[contextFieldKey{base: base, field: path}] {
 					used[src] = true
 				}
 			}
@@ -7121,12 +7174,13 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 				if fn == nil {
 					continue
 				}
-				base := identObject(arg, b.in.Info)
-				if base == nil {
+				base, prefix, ok := localFieldPath(arg, b.in.Info)
+				if !ok || base == nil {
 					continue
 				}
 				for field := range b.contextFieldsUsedByParam(fn, i) {
-					for src := range fields[contextFieldKey{base: base, field: field}] {
+					path := joinFieldPath(prefix, field)
+					for src := range fields[contextFieldKey{base: base, field: path}] {
 						used[src] = true
 					}
 				}
@@ -7148,9 +7202,10 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 }
 
 // channelSource identifies one local channel value for stop-signal correlation.
-// A direct channel variable uses obj. A one-level struct field uses base+field.
-// Field identities are instance-sensitive: two local holders with the same Go
-// struct type do not collapse to the same stop source.
+// A direct channel variable uses obj. A struct-field channel uses base+field,
+// where field may be an explicit dot-separated selector path such as
+// "worker.stop". Field identities are instance-sensitive: two local holders
+// with the same Go struct type do not collapse to the same stop source.
 type channelSource struct {
 	obj   types.Object
 	base  types.Object
@@ -7162,12 +7217,12 @@ type channelFieldKey struct {
 	field string
 }
 
-// channelSourceIndex conservatively relates simple local aliases and one-level
-// struct fields to the channel values they may hold. Assignments union sources:
+// channelSourceIndex conservatively relates simple local aliases and explicit
+// local struct-field paths to the channel values they may hold. Assignments union sources:
 // if a variable/field may refer to more than one channel, all of those channels
 // remain candidates and LL1005 is emitted only when every candidate stop is
-// proven late. This is deliberately shallow; heap/container aliases and nested
-// selector paths remain unsupported instead of being guessed at.
+// proven late. Heap/container aliases and promoted/implicit selector paths
+// remain unsupported instead of being guessed at.
 type channelSourceIndex struct {
 	vars   map[types.Object]map[channelSource]bool
 	fields map[channelFieldKey]map[channelSource]bool
@@ -7227,8 +7282,8 @@ func (idx *channelSourceIndex) sourcesForField(base types.Object, field string) 
 }
 
 // sourcesForExpr resolves the channel value denoted by a simple identifier or
-// one-level field selector. Unknown/complex expressions return no source, which
-// withholds LL1005 rather than manufacturing a correlation.
+// explicit local field-selector path. Unknown/complex expressions return no
+// source, which withholds LL1005 rather than manufacturing a correlation.
 func (idx *channelSourceIndex) sourcesForExpr(expr ast.Expr, info *types.Info) map[channelSource]bool {
 	switch x := unparenExpr(expr).(type) {
 	case *ast.Ident:
@@ -7251,11 +7306,11 @@ func (idx *channelSourceIndex) sourcesForExpr(expr ast.Expr, info *types.Info) m
 		if _, ok := sel.Obj().Type().Underlying().(*types.Chan); !ok {
 			return nil
 		}
-		base := identObject(x.X, info)
-		if base == nil {
+		base, path, ok := localFieldPath(x, info)
+		if !ok || base == nil || path == "" {
 			return nil
 		}
-		return idx.sourcesForField(base, x.Sel.Name)
+		return idx.sourcesForField(base, path)
 	default:
 		return nil
 	}
@@ -7277,8 +7332,9 @@ func channelFieldNameAt(info *types.Info, lit *ast.CompositeLit, i int) string {
 }
 
 // buildChannelSourceIndex performs one source-order pass over the owner body.
-// It tracks aliases such as alias := stop, field stores such as h.stop = stop,
-// keyed/unkeyed literals, and whole-value local struct copies.
+// It tracks aliases such as alias := stop, explicit field stores such as
+// svc.worker.stop = stop, keyed/unkeyed nested literals, and whole-value local
+// struct copies.
 func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceIndex {
 	idx := newChannelSourceIndex()
 	if body == nil {
@@ -7317,7 +7373,8 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 		}
 		idx.addField(channelFieldKey{base: base, field: field}, srcs)
 	}
-	seedComposite := func(base types.Object, lit *ast.CompositeLit) {
+	var seedComposite func(base types.Object, prefix string, lit *ast.CompositeLit)
+	seedComposite = func(base types.Object, prefix string, lit *ast.CompositeLit) {
 		if base == nil || lit == nil {
 			return
 		}
@@ -7337,14 +7394,16 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 			if value == nil || field == "" {
 				continue
 			}
+			path := joinFieldPath(prefix, field)
 			selectionType := b.in.Info.TypeOf(value)
-			if selectionType == nil {
-				continue
+			if selectionType != nil {
+				if _, ok := selectionType.Underlying().(*types.Chan); ok {
+					seedField(base, path, value)
+				}
 			}
-			if _, ok := selectionType.Underlying().(*types.Chan); !ok {
-				continue
+			if nested := composite(value); nested != nil {
+				seedComposite(base, path, nested)
 			}
-			seedField(base, field, value)
 		}
 	}
 	copyStruct := func(dst, src types.Object) {
@@ -7377,7 +7436,9 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 					selection := b.in.Info.Selections[sel]
 					if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 {
 						if _, ok := selection.Obj().Type().Underlying().(*types.Chan); ok {
-							seedField(identObject(sel.X, b.in.Info), sel.Sel.Name, rhs)
+							if base, path, ok := localFieldPath(sel, b.in.Info); ok && path != "" {
+								seedField(base, path, rhs)
+							}
 						}
 					}
 					continue
@@ -7391,7 +7452,7 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 					continue
 				}
 				if lit := composite(rhs); lit != nil {
-					seedComposite(base, lit)
+					seedComposite(base, "", lit)
 					continue
 				}
 				copyStruct(base, identObject(rhs, b.in.Info))
@@ -7411,7 +7472,7 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 					continue
 				}
 				if lit := composite(rhs); lit != nil {
-					seedComposite(base, lit)
+					seedComposite(base, "", lit)
 					continue
 				}
 				copyStruct(base, identObject(rhs, b.in.Info))
@@ -7422,7 +7483,7 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 	return idx
 }
 
-// channelFieldsUsedByParam reports one-level channel fields of a visible
+// channelFieldsUsedByParam reports explicit channel-field paths of a visible
 // same-package worker parameter that participate in a close-dependent
 // termination shape.
 func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string]bool {
@@ -7437,7 +7498,7 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 	}
 	fieldOf := func(expr ast.Expr) string {
 		sel, ok := unparenExpr(expr).(*ast.SelectorExpr)
-		if !ok || identObject(sel.X, b.in.Info) != param {
+		if !ok {
 			return ""
 		}
 		selection := b.in.Info.Selections[sel]
@@ -7448,7 +7509,11 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 		if !ok || ch.Dir() == types.SendOnly {
 			return ""
 		}
-		return sel.Sel.Name
+		base, path, ok := localFieldPath(sel, b.in.Info)
+		if !ok || base != param || path == "" {
+			return ""
+		}
+		return path
 	}
 	b.inspect(decl.Body, func(n ast.Node) bool {
 		if n == nil {
@@ -7482,7 +7547,7 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 // ordinary data receive does not establish the relation: the worker must range
 // over the channel or return from a select receive branch, or a visible
 // same-package named worker must do the same through the corresponding channel
-// parameter or one-level channel field.
+// parameter or explicit local channel-field path.
 func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt, channels *channelSourceIndex) map[channelSource]bool {
 	used := map[channelSource]bool{}
 	addReceives := func(root ast.Node) {
@@ -7533,12 +7598,12 @@ func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt, channe
 						used[src] = true
 					}
 				}
-				base := identObject(arg, b.in.Info)
-				if base == nil {
+				base, prefix, ok := localFieldPath(arg, b.in.Info)
+				if !ok || base == nil {
 					continue
 				}
 				for field := range b.channelFieldsUsedByParam(fn, i) {
-					for src := range channels.sourcesForField(base, field) {
+					for src := range channels.sourcesForField(base, joinFieldPath(prefix, field)) {
 						used[src] = true
 					}
 				}
@@ -7687,8 +7752,8 @@ func stopProvenAfterWait(g *model.CFG, waitSites []flowgraph.CallSite, waitBlock
 // StopAfterWait is delegated to computeStopOrdering, which relates each group
 // to its own worker stop dependencies and stop calls rather than using a
 // function-wide pool (audit finding F7). Direct context uses, contexts derived
-// through known factories, one-level local context fields, and direct channel
-// close for clear close-dependent worker termination shapes are supported.
+// through known factories, explicit nested local context-field paths, and
+// direct channel close for clear close-dependent worker termination shapes are supported.
 // Deferred calls are compared by execution order at function return, not by
 // the lexical point at which their defer statement was registered. Unknown
 // correlation or a stop that cannot be placed in this function's CFG withholds

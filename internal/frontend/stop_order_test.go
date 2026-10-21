@@ -327,6 +327,97 @@ func f(parent context.Context) {
 	}
 }
 
+func TestStopOrder_NestedContextFieldPathsCorrelate(t *testing.T) {
+	const hdr = `package p
+import ("context"; "sync")
+type nestedHolder struct { ctx context.Context }
+type service struct { worker nestedHolder }
+func nestedContextWorker(s service, wg *sync.WaitGroup) { defer wg.Done(); <-s.worker.ctx.Done() }
+func holderContextWorker(h nestedHolder, wg *sync.WaitGroup) { defer wg.Done(); <-h.ctx.Done() }
+`
+	cases := []struct{ name, body, want string }{
+		{"nested literal worker: late cancel", `
+ctx, cancel := context.WithCancel(parent)
+s := service{worker: nestedHolder{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-s.worker.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"nested direct field assignment", `
+ctx, cancel := context.WithCancel(parent)
+var s service; s.worker.ctx = ctx
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-s.worker.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"nested unkeyed composite", `
+ctx, cancel := context.WithCancel(parent)
+s := service{nestedHolder{ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-s.worker.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"nested whole-value copy", `
+ctx, cancel := context.WithCancel(parent)
+s1 := service{worker: nestedHolder{ctx: ctx}}; s2 := s1
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-s2.worker.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"named worker reads nested path", `
+ctx, cancel := context.WithCancel(parent)
+s := service{worker: nestedHolder{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go nestedContextWorker(s, &wg)
+wg.Wait(); cancel()`, "LL1005"},
+		{"nested argument prefix composes with worker field", `
+ctx, cancel := context.WithCancel(parent)
+s := service{worker: nestedHolder{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go holderContextWorker(s.worker, &wg)
+wg.Wait(); cancel()`, "LL1005"},
+		{"early cancel stays safe", `
+ctx, cancel := context.WithCancel(parent)
+s := service{worker: nestedHolder{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go nestedContextWorker(s, &wg)
+cancel(); wg.Wait()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f(parent context.Context) {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_NestedContextFieldPathsStayIndependent(t *testing.T) {
+	src := `package p
+import ("context"; "sync")
+type nestedHolder struct { ctx context.Context }
+type service struct { a, b nestedHolder }
+func f(parent context.Context) {
+	ctx1, cancel1 := context.WithCancel(parent)
+	ctx2, cancel2 := context.WithCancel(parent)
+	s := service{a: nestedHolder{ctx: ctx1}, b: nestedHolder{ctx: ctx2}}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); <-s.a.ctx.Done() }()
+	wg2.Add(1); go func(){ defer wg2.Done(); <-s.b.ctx.Done() }()
+	cancel1(); wg1.Wait()
+	wg2.Wait(); cancel2()
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
 func TestStopOrder_ChannelCloseCorrelatesWithWorkerTermination(t *testing.T) {
 	const hdr = `package p
 import "sync"
@@ -527,6 +618,108 @@ func f() {
 	wg2.Add(1); go func(){ defer wg2.Done(); select { case <-h2.stop: return } }()
 	close(h1.stop); wg1.Wait()
 	wg2.Wait(); close(h2.stop)
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
+func TestStopOrder_NestedChannelFieldPathsCorrelate(t *testing.T) {
+	const hdr = `package p
+import "sync"
+type nestedStopHolder struct { stop chan struct{} }
+type stopService struct { worker nestedStopHolder }
+func nestedChannelWorker(s stopService, wg *sync.WaitGroup) {
+	defer wg.Done()
+	select { case <-s.worker.stop: return }
+}
+func holderChannelWorker(h nestedStopHolder, wg *sync.WaitGroup) {
+	defer wg.Done()
+	select { case <-h.stop: return }
+}
+`
+	cases := []struct{ name, body, want string }{
+		{"nested literal worker, close original", `
+stop := make(chan struct{})
+s := stopService{worker: nestedStopHolder{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s.worker.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"nested literal worker, close nested field", `
+s := stopService{worker: nestedStopHolder{stop: make(chan struct{})}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s.worker.stop: return } }()
+wg.Wait(); close(s.worker.stop)`, "LL1005"},
+		{"nested direct field assignment", `
+stop := make(chan struct{})
+var s stopService; s.worker.stop = stop
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s.worker.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"nested unkeyed composite", `
+stop := make(chan struct{})
+s := stopService{nestedStopHolder{stop}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s.worker.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"nested whole-value copy", `
+stop := make(chan struct{})
+s1 := stopService{worker: nestedStopHolder{stop: stop}}; s2 := s1
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s2.worker.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"named worker reads nested path", `
+stop := make(chan struct{})
+s := stopService{worker: nestedStopHolder{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go nestedChannelWorker(s, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"nested argument prefix composes with worker field", `
+stop := make(chan struct{})
+s := stopService{worker: nestedStopHolder{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go holderChannelWorker(s.worker, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"early close stays safe", `
+stop := make(chan struct{})
+s := stopService{worker: nestedStopHolder{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go nestedChannelWorker(s, &wg)
+close(s.worker.stop); wg.Wait()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f() {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_NestedChannelFieldPathsStayIndependent(t *testing.T) {
+	src := `package p
+import "sync"
+type nestedStopHolder struct { stop chan struct{} }
+type stopService struct { a, b nestedStopHolder }
+func f() {
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+	s := stopService{a: nestedStopHolder{stop: stop1}, b: nestedStopHolder{stop: stop2}}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); select { case <-s.a.stop: return } }()
+	wg2.Add(1); go func(){ defer wg2.Done(); select { case <-s.b.stop: return } }()
+	close(s.a.stop); wg1.Wait()
+	wg2.Wait(); close(s.b.stop)
 }`
 	var got []string
 	for _, d := range analyzeSource(t, src) {
