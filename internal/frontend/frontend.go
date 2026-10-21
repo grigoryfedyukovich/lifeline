@@ -6882,6 +6882,82 @@ func joinFieldPath(prefix, field string) string {
 	return prefix + "." + field
 }
 
+func joinIndexPath(prefix string, index int64) string {
+	part := fmt.Sprintf("[%d]", index)
+	if prefix == "" {
+		return part
+	}
+	return prefix + part
+}
+
+func joinStoragePath(prefix, suffix string) string {
+	if prefix == "" {
+		return suffix
+	}
+	if suffix == "" {
+		return prefix
+	}
+	if strings.HasPrefix(suffix, "[") {
+		return prefix + suffix
+	}
+	return prefix + "." + suffix
+}
+
+// constantArrayIndex returns a non-negative, compile-time integer index for
+// expr. Dynamic indices deliberately remain unsupported for stop-correlation
+// identities: collapsing a[i] to one guessed element would be less sound than
+// withholding LL1005.
+func constantArrayIndex(expr ast.Expr, info *types.Info) (int64, bool) {
+	tv, ok := info.Types[unparenExpr(expr)]
+	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
+		return 0, false
+	}
+	v, exact := constant.Int64Val(tv.Value)
+	if !exact || v < 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// localStoragePath extends localFieldPath with constant indexing into local
+// fixed-size arrays (including pointers to arrays). This is intentionally not
+// a general container/alias resolver: slices and maps have shared/dynamic
+// storage semantics that need separate alias reasoning. A path may therefore
+// look like "worker.stops[0]".
+func localStoragePath(expr ast.Expr, info *types.Info) (types.Object, string, bool) {
+	switch x := unparenExpr(expr).(type) {
+	case *ast.IndexExpr:
+		t := info.TypeOf(x.X)
+		if t == nil {
+			return nil, "", false
+		}
+		if _, ok := deref(t).Underlying().(*types.Array); !ok {
+			return nil, "", false
+		}
+		idx, ok := constantArrayIndex(x.Index, info)
+		if !ok {
+			return nil, "", false
+		}
+		base, prefix, ok := localStoragePath(x.X, info)
+		if !ok || base == nil {
+			return nil, "", false
+		}
+		return base, joinIndexPath(prefix, idx), true
+	case *ast.SelectorExpr:
+		sel := info.Selections[x]
+		if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
+			return nil, "", false
+		}
+		base, prefix, ok := localStoragePath(x.X, info)
+		if !ok || base == nil {
+			return nil, "", false
+		}
+		return base, joinFieldPath(prefix, x.Sel.Name), true
+	default:
+		return localFieldPath(expr, info)
+	}
+}
+
 // localFieldPath resolves an explicit local selector path such as h.stop or
 // svc.worker.stop to its root object and dot-separated field path. It accepts
 // pointer/address wrappers around the local root, but deliberately rejects
@@ -7212,10 +7288,10 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 }
 
 // channelSource identifies one local channel value for stop-signal correlation.
-// A direct channel variable uses obj. A struct-field channel uses base+field,
-// where field may be an explicit dot-separated selector path such as
-// "worker.stop". Field identities are instance-sensitive: two local holders
-// with the same Go struct type do not collapse to the same stop source.
+// A direct channel variable uses obj. A structured local channel uses
+// base+field, where field is an explicit storage path such as "worker.stop" or
+// "worker.stops[0]". Structured identities are instance-sensitive: two local
+// holders/arrays with the same Go type do not collapse to the same stop source.
 type channelSource struct {
 	obj   types.Object
 	base  types.Object
@@ -7233,11 +7309,11 @@ type channelFieldKey struct {
 }
 
 // channelSourceIndex conservatively relates simple local aliases and explicit
-// local struct-field paths to the channel values they may hold. Assignments union sources:
+// local struct-field / constant-array-index paths to the channel values they may hold. Assignments union sources:
 // if a variable/field may refer to more than one channel, all of those channels
 // remain candidates and LL1005 is emitted only when every candidate stop is
-// proven late. Heap/container aliases and promoted/implicit selector paths
-// remain unsupported instead of being guessed at.
+// proven late. Dynamic slice/map/container aliases and promoted/implicit selector
+// paths remain unsupported instead of being guessed at.
 type channelSourceIndex struct {
 	vars   map[types.Object]map[channelSource]bool
 	fields map[channelFieldKey]map[channelSource]bool
@@ -7296,9 +7372,10 @@ func (idx *channelSourceIndex) sourcesForField(base types.Object, field string) 
 	return map[channelSource]bool{{base: base, field: field}: true}
 }
 
-// sourcesForExpr resolves the channel value denoted by a simple identifier or
-// explicit local field-selector path. Unknown/complex expressions return no
-// source, which withholds LL1005 rather than manufacturing a correlation.
+// sourcesForExpr resolves the channel value denoted by a simple identifier,
+// explicit local field-selector path, or constant index into a local fixed-size
+// array. Unknown/complex expressions return no source, which withholds LL1005
+// rather than manufacturing a correlation.
 func (idx *channelSourceIndex) sourcesForExpr(expr ast.Expr, info *types.Info) map[channelSource]bool {
 	switch x := unparenExpr(expr).(type) {
 	case *ast.Ident:
@@ -7321,7 +7398,20 @@ func (idx *channelSourceIndex) sourcesForExpr(expr ast.Expr, info *types.Info) m
 		if _, ok := sel.Obj().Type().Underlying().(*types.Chan); !ok {
 			return nil
 		}
-		base, path, ok := localFieldPath(x, info)
+		base, path, ok := localStoragePath(x, info)
+		if !ok || base == nil || path == "" {
+			return nil
+		}
+		return idx.sourcesForField(base, path)
+	case *ast.IndexExpr:
+		t := info.TypeOf(x)
+		if t == nil {
+			return nil
+		}
+		if _, ok := t.Underlying().(*types.Chan); !ok {
+			return nil
+		}
+		base, path, ok := localStoragePath(x, info)
 		if !ok || base == nil || path == "" {
 			return nil
 		}
@@ -7347,9 +7437,9 @@ func channelFieldNameAt(info *types.Info, lit *ast.CompositeLit, i int) string {
 }
 
 // buildChannelSourceIndex performs one source-order pass over the owner body.
-// It tracks aliases such as alias := stop, explicit field stores such as
-// svc.worker.stop = stop, keyed/unkeyed nested literals, and whole-value local
-// struct copies.
+// It tracks aliases such as alias := stop, explicit field/array-element stores
+// such as svc.worker.stop = stop or stops[0] = stop, keyed/unkeyed nested
+// literals, and whole-value local struct/fixed-array copies.
 func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceIndex {
 	idx := newChannelSourceIndex()
 	if body == nil {
@@ -7393,23 +7483,54 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 		if base == nil || lit == nil {
 			return
 		}
+		t := b.in.Info.TypeOf(lit)
+		if t == nil {
+			return
+		}
+		under := deref(t).Underlying()
 		for i, elt := range lit.Elts {
-			field := channelFieldNameAt(b.in.Info, lit, i)
+			field := ""
+			arrayIndex := int64(i)
 			var value ast.Expr
 			switch e := elt.(type) {
 			case *ast.KeyValueExpr:
-				id, _ := e.Key.(*ast.Ident)
-				if id != nil {
-					field = id.Name
+				switch under.(type) {
+				case *types.Struct:
+					id, _ := e.Key.(*ast.Ident)
+					if id != nil {
+						field = id.Name
+					}
+				case *types.Array:
+					idx, ok := constantArrayIndex(e.Key, b.in.Info)
+					if !ok {
+						continue
+					}
+					arrayIndex = idx
 				}
 				value = e.Value
 			case ast.Expr:
 				value = e
 			}
-			if value == nil || field == "" {
+			if value == nil {
 				continue
 			}
-			path := joinFieldPath(prefix, field)
+			var path string
+			switch under.(type) {
+			case *types.Struct:
+				if field == "" {
+					field = channelFieldNameAt(b.in.Info, lit, i)
+				}
+				if field == "" {
+					continue
+				}
+				path = joinFieldPath(prefix, field)
+			case *types.Array:
+				path = joinIndexPath(prefix, arrayIndex)
+			default:
+				// Slices/maps deliberately remain outside this bounded local
+				// storage model because their aliasing semantics are dynamic.
+				continue
+			}
 			selectionType := b.in.Info.TypeOf(value)
 			if selectionType != nil {
 				if _, ok := selectionType.Underlying().(*types.Chan); ok {
@@ -7421,7 +7542,7 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 			}
 		}
 	}
-	copyStruct := func(dst, src types.Object) {
+	copyStructured := func(dst, src types.Object) {
 		if dst == nil || src == nil {
 			return
 		}
@@ -7447,15 +7568,15 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 					continue
 				}
 				rhs := x.Rhs[i]
-				if sel, ok := unparenExpr(lhs).(*ast.SelectorExpr); ok {
-					selection := b.in.Info.Selections[sel]
-					if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 {
-						if _, ok := selection.Obj().Type().Underlying().(*types.Chan); ok {
-							if base, path, ok := localFieldPath(sel, b.in.Info); ok && path != "" {
-								seedField(base, path, rhs)
-							}
+				if lt := b.in.Info.TypeOf(lhs); lt != nil {
+					if _, ok := lt.Underlying().(*types.Chan); ok {
+						if base, path, ok := localStoragePath(lhs, b.in.Info); ok && path != "" {
+							seedField(base, path, rhs)
+							continue
 						}
 					}
+				}
+				if _, ok := unparenExpr(lhs).(*ast.SelectorExpr); ok {
 					continue
 				}
 				base := identObject(lhs, b.in.Info)
@@ -7470,7 +7591,7 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 					seedComposite(base, "", lit)
 					continue
 				}
-				copyStruct(base, identObject(rhs, b.in.Info))
+				copyStructured(base, identObject(rhs, b.in.Info))
 			}
 		case *ast.ValueSpec:
 			for i, name := range x.Names {
@@ -7490,7 +7611,7 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 					seedComposite(base, "", lit)
 					continue
 				}
-				copyStruct(base, identObject(rhs, b.in.Info))
+				copyStructured(base, identObject(rhs, b.in.Info))
 			}
 		}
 		return true
@@ -7498,9 +7619,10 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 	return idx
 }
 
-// channelFieldsUsedByParam reports explicit channel-field paths of a visible
+// channelFieldsUsedByParam reports explicit channel storage paths of a visible
 // same-package worker parameter that participate in a close-dependent
-// termination shape.
+// termination shape. Paths may contain field selectors and constant indices
+// into fixed-size arrays.
 func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string]bool {
 	out := map[string]bool{}
 	decl := b.funcs[fn]
@@ -7512,19 +7634,15 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 		return out
 	}
 	fieldOf := func(expr ast.Expr) string {
-		sel, ok := unparenExpr(expr).(*ast.SelectorExpr)
-		if !ok {
+		t := b.in.Info.TypeOf(expr)
+		if t == nil {
 			return ""
 		}
-		selection := b.in.Info.Selections[sel]
-		if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 {
-			return ""
-		}
-		ch, ok := selection.Obj().Type().Underlying().(*types.Chan)
+		ch, ok := t.Underlying().(*types.Chan)
 		if !ok || ch.Dir() == types.SendOnly {
 			return ""
 		}
-		base, path, ok := localFieldPath(sel, b.in.Info)
+		base, path, ok := localStoragePath(expr, b.in.Info)
 		if !ok || base != param || path == "" {
 			return ""
 		}
@@ -7644,7 +7762,7 @@ func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt, channe
 					continue
 				}
 				for field := range b.channelFieldsUsedByParam(fn, i) {
-					for src := range channels.sourcesForField(base, joinFieldPath(prefix, field)) {
+					for src := range channels.sourcesForField(base, joinStoragePath(prefix, field)) {
 						used[src] = true
 					}
 				}

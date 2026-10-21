@@ -794,3 +794,143 @@ wg.Wait(); maybeClose(stop, false)`, ""},
 		}
 	}
 }
+
+func TestStopOrder_ConstantArrayChannelPathsCorrelate(t *testing.T) {
+	const hdr = `package p
+import "sync"
+type arrayHolder struct { stops [2]chan struct{} }
+func arrayWorker(stops [2]chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	select { case <-stops[0]: return }
+}
+func holderArrayWorker(h arrayHolder, wg *sync.WaitGroup) {
+	defer wg.Done()
+	select { case <-h.stops[0]: return }
+}
+`
+	cases := []struct{ name, body, want string }{
+		{"array composite worker, close original", `
+stop := make(chan struct{})
+stops := [2]chan struct{}{stop, nil}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stops[0]: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"array element assignment", `
+stop := make(chan struct{})
+var stops [2]chan struct{}; stops[0] = stop
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stops[0]: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"close through array element", `
+stop := make(chan struct{})
+stops := [2]chan struct{}{stop, nil}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+wg.Wait(); close(stops[0])`, "LL1005"},
+		{"array copy preserves element source", `
+stop := make(chan struct{})
+stops1 := [2]chan struct{}{stop, nil}; stops2 := stops1
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stops2[0]: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"pointer to local array preserves element source", `
+stop := make(chan struct{})
+stops := [2]chan struct{}{stop, nil}; p := &stops
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-p[0]: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"nested array field", `
+stop := make(chan struct{})
+h := arrayHolder{stops: [2]chan struct{}{stop, nil}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-h.stops[0]: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"named worker reads constant array element", `
+stop := make(chan struct{})
+stops := [2]chan struct{}{stop, nil}
+var wg sync.WaitGroup
+wg.Add(1); go arrayWorker(stops, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"named worker reads nested array field", `
+stop := make(chan struct{})
+h := arrayHolder{stops: [2]chan struct{}{stop, nil}}
+var wg sync.WaitGroup
+wg.Add(1); go holderArrayWorker(h, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"array-valued argument prefix composes with worker index", `
+stop := make(chan struct{})
+h := arrayHolder{stops: [2]chan struct{}{stop, nil}}
+var wg sync.WaitGroup
+wg.Add(1); go arrayWorker(h.stops, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"early close through array element is safe", `
+stop := make(chan struct{})
+stops := [2]chan struct{}{stop, nil}
+var wg sync.WaitGroup
+wg.Add(1); go arrayWorker(stops, &wg)
+close(stops[0]); wg.Wait()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f() {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_ArrayChannelElementsStayIndependent(t *testing.T) {
+	src := `package p
+import "sync"
+func f() {
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+	stops := [2]chan struct{}{stop1, stop2}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); select { case <-stops[0]: return } }()
+	wg2.Add(1); go func(){ defer wg2.Done(); select { case <-stops[1]: return } }()
+	close(stops[0]); wg1.Wait()
+	wg2.Wait(); close(stops[1])
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
+func TestStopOrder_DynamicArrayIndexAndSlicesRemainConservative(t *testing.T) {
+	cases := []string{
+		`package p
+import "sync"
+func f(i int) {
+	stop := make(chan struct{})
+	stops := [2]chan struct{}{stop, stop}
+	var wg sync.WaitGroup
+	wg.Add(1); go func(){ defer wg.Done(); select { case <-stops[i]: return } }()
+	wg.Wait(); close(stop)
+}`,
+		`package p
+import "sync"
+func f() {
+	stop := make(chan struct{})
+	stops := []chan struct{}{stop}
+	var wg sync.WaitGroup
+	wg.Add(1); go func(){ defer wg.Done(); select { case <-stops[0]: return } }()
+	wg.Wait(); close(stop)
+}`,
+	}
+	for i, src := range cases {
+		if got := rulesOnly(findings(t, src)); got != "" {
+			t.Fatalf("case %d: unsupported dynamic/container aliasing must withhold LL1005, got %q", i, got)
+		}
+	}
+}
