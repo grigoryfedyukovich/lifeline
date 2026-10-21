@@ -332,6 +332,16 @@ type builder struct {
 	// a mix) from looping forever. See handleSummaryOf.
 	receiverSummaries map[types.Object]*receiverSummary
 	receiverStack     []types.Object
+
+	// channelParamReceiveMemo and channelParamCloseMemo memoize the narrow
+	// same-package helper summaries used by LL1005 channel correlation. They
+	// distinguish direct/recursive helper delegation from arbitrary callbacks:
+	// a receive summary means the parameter participates in a close-dependent
+	// termination shape; a close summary means every normal return path closes
+	// the parameter. Values use 1=visiting, 2=false, 3=true so recursion cycles
+	// terminate conservatively without manufacturing an effect.
+	channelParamReceiveMemo map[channelParamKey]uint8
+	channelParamCloseMemo   map[channelParamKey]uint8
 }
 
 type structuralCFG struct {
@@ -7212,6 +7222,11 @@ type channelSource struct {
 	field string
 }
 
+type channelParamKey struct {
+	fn    *types.Func
+	index int
+}
+
 type channelFieldKey struct {
 	base  types.Object
 	field string
@@ -7535,6 +7550,18 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 					}
 				}
 			}
+		case *ast.CallExpr:
+			callee := b.resolveCalleeFunc(x.Fun)
+			if callee == nil || b.funcs[callee] == nil {
+				break
+			}
+			for i, arg := range x.Args {
+				if b.channelParamIsReceived(callee, i) {
+					if field := fieldOf(arg); field != "" {
+						out[field] = true
+					}
+				}
+			}
 		}
 		return true
 	})
@@ -7545,9 +7572,10 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 // demonstrably depend on closing to terminate. Closing such a channel is a
 // recognized stop signal for LL1005. Merely passing, sending, or doing an
 // ordinary data receive does not establish the relation: the worker must range
-// over the channel or return from a select receive branch, or a visible
-// same-package named worker must do the same through the corresponding channel
-// parameter or explicit local channel-field path.
+// over the channel or return from a select receive branch, directly or through
+// a statically resolved visible same-package helper; named workers may establish
+// the same relation through the corresponding channel parameter or explicit
+// local channel-field path.
 func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt, channels *channelSourceIndex) map[channelSource]bool {
 	used := map[channelSource]bool{}
 	addReceives := func(root ast.Node) {
@@ -7569,6 +7597,19 @@ func (b *builder) workerStopChannels(gr *groupState, body *ast.BlockStmt, channe
 				}
 				if expr := receivedExpr(x.Comm); expr != nil {
 					for src := range channels.sourcesForExpr(expr, b.in.Info) {
+						used[src] = true
+					}
+				}
+			case *ast.CallExpr:
+				callee := b.resolveCalleeFunc(x.Fun)
+				if callee == nil || b.funcs[callee] == nil {
+					break
+				}
+				for i, arg := range x.Args {
+					if !b.channelParamIsReceived(callee, i) {
+						continue
+					}
+					for src := range channels.sourcesForExpr(arg, b.in.Info) {
 						used[src] = true
 					}
 				}
@@ -7634,9 +7675,35 @@ func isRecvChannelObject(obj types.Object) bool {
 
 // channelParamIsReceived reports whether a visible same-package worker body
 // has a close-dependent termination shape on parameter index: a range over
-// the channel, or a select receive whose clause returns. Helper-mediated
-// receives through helpers are intentionally not guessed at.
+// the channel, a select receive whose clause returns, or a direct call to a
+// visible same-package helper whose corresponding channel parameter has such a
+// shape. The summary is memoized and recursion cycles conservatively resolve
+// to false rather than guessing.
 func (b *builder) channelParamIsReceived(fn *types.Func, index int) bool {
+	if fn == nil || index < 0 {
+		return false
+	}
+	if b.channelParamReceiveMemo == nil {
+		b.channelParamReceiveMemo = map[channelParamKey]uint8{}
+	}
+	key := channelParamKey{fn: fn, index: index}
+	switch b.channelParamReceiveMemo[key] {
+	case 1, 2:
+		return false
+	case 3:
+		return true
+	}
+	b.channelParamReceiveMemo[key] = 1
+	found := b.channelParamIsReceivedUncached(fn, index)
+	if found {
+		b.channelParamReceiveMemo[key] = 3
+	} else {
+		b.channelParamReceiveMemo[key] = 2
+	}
+	return found
+}
+
+func (b *builder) channelParamIsReceivedUncached(fn *types.Func, index int) bool {
 	decl := b.funcs[fn]
 	if decl == nil || decl.Body == nil {
 		return false
@@ -7664,18 +7731,128 @@ func (b *builder) channelParamIsReceived(fn *types.Func, index int) bool {
 					found = true
 				}
 			}
+		case *ast.CallExpr:
+			callee := b.resolveCalleeFunc(x.Fun)
+			if callee == nil || b.funcs[callee] == nil {
+				break
+			}
+			for i, arg := range x.Args {
+				if identObject(arg, b.in.Info) == param && b.channelParamIsReceived(callee, i) {
+					found = true
+					break
+				}
+			}
 		}
 		return !found
 	})
 	return found
 }
 
-// closeCallsByChannel indexes direct builtin close(ch) calls in the owner
-// body. Calls nested inside function literals are excluded because they do not
-// have the owner's execution semantics/call-site placement unless invocation
-// effects are modeled separately.
+// channelParamMustClose reports whether a visible same-package helper closes
+// parameter index on every normal return path. Direct close(param) calls and
+// calls to other must-close helpers are treated as discharge sites. This is a
+// must summary (unlike the receive summary above): conditional close helpers
+// are deliberately not promoted to owner-side stop signals, because doing so
+// could manufacture LL1005 when the helper returns without closing the
+// channel.
+func (b *builder) channelParamMustClose(fn *types.Func, index int) bool {
+	if fn == nil || index < 0 {
+		return false
+	}
+	if b.channelParamCloseMemo == nil {
+		b.channelParamCloseMemo = map[channelParamKey]uint8{}
+	}
+	key := channelParamKey{fn: fn, index: index}
+	switch b.channelParamCloseMemo[key] {
+	case 1, 2:
+		return false
+	case 3:
+		return true
+	}
+	b.channelParamCloseMemo[key] = 1
+	found := b.channelParamMustCloseUncached(fn, index)
+	if found {
+		b.channelParamCloseMemo[key] = 3
+	} else {
+		b.channelParamCloseMemo[key] = 2
+	}
+	return found
+}
+
+func (b *builder) channelParamMustCloseUncached(fn *types.Func, index int) bool {
+	decl := b.funcs[fn]
+	if decl == nil || decl.Body == nil {
+		return false
+	}
+	param := paramObjectAtIndex(b.in.Info, decl, index)
+	if param == nil || param.Type() == nil {
+		return false
+	}
+	ch, ok := param.Type().Underlying().(*types.Chan)
+	if !ok || ch.Dir() == types.RecvOnly {
+		return false
+	}
+	var discharges []*ast.CallExpr
+	b.inspect(decl.Body, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if len(call.Args) == 1 {
+			if id, ok := call.Fun.(*ast.Ident); ok {
+				if builtin, ok := b.in.Info.ObjectOf(id).(*types.Builtin); ok && builtin.Name() == "close" && identObject(call.Args[0], b.in.Info) == param {
+					discharges = append(discharges, call)
+					return true
+				}
+			}
+		}
+		callee := b.resolveCalleeFunc(call.Fun)
+		if callee == nil || b.funcs[callee] == nil {
+			return true
+		}
+		for i, arg := range call.Args {
+			if identObject(arg, b.in.Info) == param && b.channelParamMustClose(callee, i) {
+				discharges = append(discharges, call)
+				break
+			}
+		}
+		return true
+	})
+	if len(discharges) == 0 || b.cancelled() {
+		return false
+	}
+	name := fn.FullName()
+	g, sites, err := b.structuralCFG(name, decl.Body)
+	if err != nil {
+		b.err = err
+		return false
+	}
+	plain, deferred := splitDeferred(discharges, deferredCallSet(decl.Body), sites)
+	origin := []flowgraph.CallSite{{Block: g.Entry, Index: -1}}
+	bypassed, known := liveExitReachable(g, origin, plain, deferred, nil)
+	return known && !bypassed
+}
+
+// closeCallsByChannel indexes owner-side stop calls for channels: direct
+// builtin close(ch), plus a call to a visible same-package helper whose
+// corresponding channel parameter is proven to be closed on every normal
+// return path. Calls nested inside function literals are excluded because they
+// do not have the owner's execution semantics/call-site placement unless
+// invocation effects are modeled separately. Conditional helpers are not
+// indexed: channelParamMustClose deliberately requires a must-close summary.
 func (b *builder) closeCallsByChannel(body *ast.BlockStmt, channels *channelSourceIndex) map[channelSource][]*ast.CallExpr {
 	out := map[channelSource][]*ast.CallExpr{}
+	add := func(call *ast.CallExpr, expr ast.Expr) {
+		for src := range channels.sourcesForExpr(expr, b.in.Info) {
+			out[src] = append(out[src], call)
+		}
+	}
 	b.inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			return true
@@ -7684,19 +7861,25 @@ func (b *builder) closeCallsByChannel(body *ast.BlockStmt, channels *channelSour
 			return false
 		}
 		call, ok := n.(*ast.CallExpr)
-		if !ok || len(call.Args) != 1 {
-			return true
-		}
-		id, ok := call.Fun.(*ast.Ident)
 		if !ok {
 			return true
 		}
-		builtin, ok := b.in.Info.ObjectOf(id).(*types.Builtin)
-		if !ok || builtin.Name() != "close" {
+		if len(call.Args) == 1 {
+			if id, ok := call.Fun.(*ast.Ident); ok {
+				if builtin, ok := b.in.Info.ObjectOf(id).(*types.Builtin); ok && builtin.Name() == "close" {
+					add(call, call.Args[0])
+					return true
+				}
+			}
+		}
+		callee := b.resolveCalleeFunc(call.Fun)
+		if callee == nil || b.funcs[callee] == nil {
 			return true
 		}
-		for src := range channels.sourcesForExpr(call.Args[0], b.in.Info) {
-			out[src] = append(out[src], call)
+		for i, arg := range call.Args {
+			if b.channelParamMustClose(callee, i) {
+				add(call, arg)
+			}
 		}
 		return true
 	})

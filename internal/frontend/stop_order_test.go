@@ -736,3 +736,61 @@ func f() {
 		t.Fatalf("reported groups %v, want [wg2]", got)
 	}
 }
+
+func TestStopOrder_HelperMediatedChannelShutdown(t *testing.T) {
+	const hdr = `package p
+import "sync"
+func waitStop(ch <-chan struct{}) { for range ch {} }
+func waitStop2(ch <-chan struct{}) { waitStop(ch) }
+func workerViaHelper(ch <-chan struct{}, wg *sync.WaitGroup) { defer wg.Done(); waitStop2(ch) }
+func closeStop(ch chan struct{}) { close(ch) }
+func closeStop2(ch chan struct{}) { closeStop(ch) }
+type helperHolder struct { stop chan struct{} }
+func workerFieldViaHelper(h helperHolder, wg *sync.WaitGroup) { defer wg.Done(); waitStop(h.stop) }
+func maybeClose(ch chan struct{}, ok bool) { if ok { close(ch) } }
+`
+	cases := []struct{ name, body, want string }{
+		{"literal delegates receive to helper", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); waitStop(stop) }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"named worker delegates receive through helper chain", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go workerViaHelper(stop, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"named worker passes channel field to helper", `
+stop := make(chan struct{})
+h := helperHolder{stop: stop}
+var wg sync.WaitGroup
+wg.Add(1); go workerFieldViaHelper(h, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"owner delegates close to helper", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+wg.Wait(); closeStop(stop)`, "LL1005"},
+		{"owner delegates close through helper chain", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+wg.Wait(); closeStop2(stop)`, "LL1005"},
+		{"must-close helper before wait is safe", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+closeStop(stop); wg.Wait()`, ""},
+		{"conditional close helper is not promoted to a stop signal", `
+stop := make(chan struct{})
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-stop: return } }()
+wg.Wait(); maybeClose(stop, false)`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f() {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
