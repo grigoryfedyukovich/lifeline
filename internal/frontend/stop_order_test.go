@@ -418,6 +418,123 @@ func f(parent context.Context) {
 	}
 }
 
+func TestStopOrder_ContextFieldsThroughHelpersCorrelate(t *testing.T) {
+	const hdr = `package p
+import ("context"; "sync")
+type helperHolder struct { ctx context.Context }
+type helperService struct { worker helperHolder }
+func waitHolder(h helperHolder) { <-h.ctx.Done() }
+func waitHolder2(h helperHolder) { waitHolder(h) }
+func ignoreHolder(h helperHolder) { _ = h }
+func delegatedContextWorker(h helperHolder, wg *sync.WaitGroup) { defer wg.Done(); waitHolder2(h) }
+func ignoredContextWorker(h helperHolder, wg *sync.WaitGroup) { defer wg.Done(); ignoreHolder(h) }
+`
+	cases := []struct{ name, body, want string }{
+		{"literal worker delegates whole holder", `
+ctx, cancel := context.WithCancel(parent)
+h := helperHolder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); waitHolder(h) }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"literal worker delegates nested holder", `
+ctx, cancel := context.WithCancel(parent)
+s := helperService{worker: helperHolder{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); waitHolder(s.worker) }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"named worker follows two helper hops", `
+ctx, cancel := context.WithCancel(parent)
+h := helperHolder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go delegatedContextWorker(h, &wg)
+wg.Wait(); cancel()`, "LL1005"},
+		{"early cancel through helper stays clean", `
+ctx, cancel := context.WithCancel(parent)
+h := helperHolder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go delegatedContextWorker(h, &wg)
+cancel(); wg.Wait()`, ""},
+		{"helper that ignores holder stays uncorrelated", `
+ctx, cancel := context.WithCancel(parent)
+h := helperHolder{ctx: ctx}
+var wg sync.WaitGroup
+wg.Add(1); go ignoredContextWorker(h, &wg)
+wg.Wait(); cancel()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f(parent context.Context) {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_ContextHelperRecursionDoesNotCachePartialSummary(t *testing.T) {
+	src := `package p
+import ("context"; "sync")
+type cycleHolder struct { ctx context.Context }
+func cycleA(h cycleHolder, n int) { if n > 0 { cycleB(h, n-1) }; <-h.ctx.Done() }
+func cycleB(h cycleHolder, n int) { if n > 0 { cycleA(h, n-1) } }
+func workerCycleA(h cycleHolder, wg *sync.WaitGroup) { defer wg.Done(); cycleA(h, 1) }
+func workerCycleB(h cycleHolder, wg *sync.WaitGroup) { defer wg.Done(); cycleB(h, 1) }
+func f(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	h := cycleHolder{ctx: ctx}
+	var wgA, wgB sync.WaitGroup
+	wgA.Add(1); go workerCycleA(h, &wgA)
+	wgB.Add(1); go workerCycleB(h, &wgB)
+	wgA.Wait(); wgB.Wait(); cancel()
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wgA", "wgB"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wgA,wgB" {
+		t.Fatalf("reported groups %v, want [wgA wgB]", got)
+	}
+}
+
+func TestStopOrder_HelperMediatedContextFieldsStayIndependent(t *testing.T) {
+	src := `package p
+import ("context"; "sync")
+type pairHolder struct { a, b context.Context }
+func waitA(h pairHolder) { <-h.a.Done() }
+func waitB(h pairHolder) { <-h.b.Done() }
+func workerA(h pairHolder, wg *sync.WaitGroup) { defer wg.Done(); waitA(h) }
+func workerB(h pairHolder, wg *sync.WaitGroup) { defer wg.Done(); waitB(h) }
+func f(parent context.Context) {
+	ctx1, cancel1 := context.WithCancel(parent)
+	ctx2, cancel2 := context.WithCancel(parent)
+	h := pairHolder{a: ctx1, b: ctx2}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go workerA(h, &wg1)
+	wg2.Add(1); go workerB(h, &wg2)
+	cancel1(); wg1.Wait()
+	wg2.Wait(); cancel2()
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
 func TestStopOrder_ChannelCloseCorrelatesWithWorkerTermination(t *testing.T) {
 	const hdr = `package p
 import "sync"

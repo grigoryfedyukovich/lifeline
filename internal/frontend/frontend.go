@@ -342,6 +342,11 @@ type builder struct {
 	// terminate conservatively without manufacturing an effect.
 	channelParamReceiveMemo map[channelParamKey]uint8
 	channelParamCloseMemo   map[channelParamKey]uint8
+	// contextFieldUseMemo memoizes acyclic explicit context-field summaries
+	// for visible same-package helpers. Recursive queries use a per-query stack
+	// and are deliberately not cached when a cycle is encountered, so an early
+	// query cannot freeze an incomplete cycle result for a later worker.
+	contextFieldUseMemo map[channelParamKey]map[string]bool
 }
 
 type structuralCFG struct {
@@ -7172,19 +7177,53 @@ func unparenExpr(expr ast.Expr) ast.Expr {
 }
 
 // contextFieldsUsedByParam returns explicit context-field paths read through
-// parameter index by a visible same-package worker body. It deliberately does
-// not infer through arbitrary helper calls; unresolved shapes simply withhold
-// LL1005 rather than inventing a worker/stop relation.
+// parameter index by a visible same-package worker/helper body. Besides direct
+// reads, it follows statically resolved same-package helper calls and composes
+// the caller's argument prefix with the callee's field paths. This is the
+// context analogue of channelFieldsUsedByParam: unresolved callbacks or
+// interface dispatch simply contribute no verified relation.
 func (b *builder) contextFieldsUsedByParam(fn *types.Func, index int) map[string]bool {
+	out, _ := b.contextFieldsUsedByParamRec(fn, index, map[channelParamKey]bool{})
+	return out
+}
+
+// contextFieldsUsedByParamRec also reports whether the summary was complete.
+// A recursion edge returns no evidence and complete=false; every caller on that
+// stack still keeps direct/other-helper evidence it can prove, but none of
+// those cycle-dependent results are cached. A later top-level query can then
+// recompute the cycle from the other entry point instead of reusing a stale
+// partial result.
+func (b *builder) contextFieldsUsedByParamRec(fn *types.Func, index int, stack map[channelParamKey]bool) (map[string]bool, bool) {
 	out := map[string]bool{}
+	if fn == nil || index < 0 {
+		return out, true
+	}
+	if b.contextFieldUseMemo == nil {
+		b.contextFieldUseMemo = map[channelParamKey]map[string]bool{}
+	}
+	key := channelParamKey{fn: fn, index: index}
+	if cached, ok := b.contextFieldUseMemo[key]; ok {
+		for path := range cached {
+			out[path] = true
+		}
+		return out, true
+	}
+	if stack[key] {
+		return out, false
+	}
+	stack[key] = true
+	defer delete(stack, key)
 	decl := b.funcs[fn]
 	if decl == nil || decl.Body == nil {
-		return out
+		b.contextFieldUseMemo[key] = out
+		return out, true
 	}
 	param := paramObjectAtIndex(b.in.Info, decl, index)
 	if param == nil {
-		return out
+		b.contextFieldUseMemo[key] = out
+		return out, true
 	}
+	complete := true
 	b.inspect(decl.Body, func(n ast.Node) bool {
 		if n == nil {
 			return true
@@ -7192,19 +7231,42 @@ func (b *builder) contextFieldsUsedByParam(fn *types.Func, index int) map[string
 		if _, ok := n.(*ast.FuncLit); ok {
 			return false
 		}
-		sel, ok := n.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		selection := b.in.Info.Selections[sel]
-		if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
-			if base, path, ok := localFieldPath(sel, b.in.Info); ok && base == param && path != "" {
-				out[path] = true
+		switch x := n.(type) {
+		case *ast.SelectorExpr:
+			selection := b.in.Info.Selections[x]
+			if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
+				if base, path, ok := localFieldPath(x, b.in.Info); ok && base == param && path != "" {
+					out[path] = true
+				}
+			}
+		case *ast.CallExpr:
+			callee := b.resolveCalleeFunc(x.Fun)
+			if callee == nil || b.funcs[callee] == nil {
+				break
+			}
+			for i, arg := range x.Args {
+				base, prefix, ok := localFieldPath(arg, b.in.Info)
+				if !ok || base != param {
+					continue
+				}
+				fields, childComplete := b.contextFieldsUsedByParamRec(callee, i, stack)
+				if !childComplete {
+					complete = false
+				}
+				for field := range fields {
+					out[joinFieldPath(prefix, field)] = true
+				}
 			}
 		}
 		return true
 	})
-	return out
+	if complete {
+		b.contextFieldUseMemo[key] = map[string]bool{}
+		for path := range out {
+			b.contextFieldUseMemo[key][path] = true
+		}
+	}
+	return out, complete
 }
 
 // workerContexts returns the context objects used by gr's workers: the
@@ -7223,17 +7285,33 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 			}
 		}
 		b.inspect(expr, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			selection := b.in.Info.Selections[sel]
-			if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 || !isContextType(selection.Obj().Type(), b.contextInterface) {
-				return true
-			}
-			if base, path, ok := localFieldPath(sel, b.in.Info); ok && path != "" {
-				for src := range fields[contextFieldKey{base: base, field: path}] {
-					used[src] = true
+			switch x := n.(type) {
+			case *ast.SelectorExpr:
+				selection := b.in.Info.Selections[x]
+				if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 || !isContextType(selection.Obj().Type(), b.contextInterface) {
+					return true
+				}
+				if base, path, ok := localFieldPath(x, b.in.Info); ok && path != "" {
+					for src := range fields[contextFieldKey{base: base, field: path}] {
+						used[src] = true
+					}
+				}
+			case *ast.CallExpr:
+				callee := b.resolveCalleeFunc(x.Fun)
+				if callee == nil || b.funcs[callee] == nil {
+					return true
+				}
+				for i, arg := range x.Args {
+					base, prefix, ok := localFieldPath(arg, b.in.Info)
+					if !ok || base == nil {
+						continue
+					}
+					for field := range b.contextFieldsUsedByParam(callee, i) {
+						path := joinFieldPath(prefix, field)
+						for src := range fields[contextFieldKey{base: base, field: path}] {
+							used[src] = true
+						}
+					}
 				}
 			}
 			return true
