@@ -2983,12 +2983,11 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 			// Recording it as Joined instead keeps that finding live: an
 			// outstanding literal imbalance is exactly as real regardless
 			// of whether Wait() is called directly or through a helper.
-			// (JoinedOnAllPaths and StopAfterWait stay unestablished for a
-			// helper-mediated join either way, the same as for a
-			// join_wrapper call: neither has a direct Wait() call site in
-			// *this* function's own CFG to anchor to. That is an existing,
-			// separately documented limitation, not something this
-			// change affects.)
+			// (A verified helper-mediated join records this call as its join site,
+			// so JoinedOnAllPaths and stop-before-wait ordering can reason
+			// about the owner's real control flow at the helper call. A
+			// configured join_wrapper remains assumption-based and is handled
+			// separately.)
 			if b.isRecursivePass(call) {
 				g.recCalls = append(g.recCalls, call)
 			}
@@ -6690,7 +6689,7 @@ func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wr
 		return
 	}
 	var waits []stopSignal // reused: a wait is a call with a place and a time
-	for _, call := range gr.waitCallSites {
+	for _, call := range append(append([]*ast.CallExpr(nil), gr.waitCallSites...), gr.helperJoinCalls...) {
 		if site, ok := callSites[call]; ok {
 			waits = append(waits, stopSignal{call: call, site: site, deferred: deferredCalls[call]})
 		}
@@ -8194,9 +8193,11 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		}
 		waitSites := callSitesOf(gr.waitCallSites, callSites)
 		// A helper that joins the group on every path is a join at its
-		// call, for the all-path question; stop-before-wait below only
-		// ever reasons about direct Wait() calls.
-		joinSites := append(append([]flowgraph.CallSite(nil), waitSites...), callSitesOf(gr.helperJoinCalls, callSites)...)
+		// call for both the all-path question and stop-before-wait
+		// ordering. The callee summary establishes the must-Wait effect;
+		// the caller-side call node supplies the concrete CFG anchor.
+		helperJoinSites := callSitesOf(gr.helperJoinCalls, callSites)
+		joinSites := append(append([]flowgraph.CallSite(nil), waitSites...), helperJoinSites...)
 		if len(joinSites) == 0 {
 			if len(callSitesOf(gr.mayJoinCalls, callSites)) > 0 {
 				// Only a callee that joins on some of its own paths: its
@@ -8219,7 +8220,7 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the point a worker is started to the function's return bypasses every Wait() call for this group"})
 			}
 		}
-		if len(waitSites) == 0 {
+		if len(waitSites)+len(helperJoinSites) == 0 {
 			continue
 		}
 		b.computeStopOrdering(gr, cancels, stopWrapperCalls, closeCalls, channels, body, g, callSites, deferredCalls)

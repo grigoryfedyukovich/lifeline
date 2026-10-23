@@ -1051,3 +1051,68 @@ func f() {
 		}
 	}
 }
+
+func TestStopOrder_HelperMediatedJoinAnchorsOrdering(t *testing.T) {
+	const hdr = `package p
+import ("context"; "sync")
+func join(g *sync.WaitGroup) { g.Wait() }
+func join2(g *sync.WaitGroup) { join(g) }
+func maybeJoin(g *sync.WaitGroup, ok bool) { if ok { g.Wait() } }
+`
+	mk := func(body string) string {
+		return hdr + `func f(parent context.Context, ok bool) {
+	ctx, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); <-ctx.Done() }()
+` + body + "\n}\n"
+	}
+	cases := []struct {
+		name, body, want string
+	}{
+		{"verified helper join before cancel is flagged", "join(&wg); cancel()", "LL1005"},
+		{"cancel before verified helper join is clean", "cancel(); join(&wg)", ""},
+		{"two-hop verified helper join before cancel is flagged", "join2(&wg); cancel()", "LL1005"},
+		{"deferred cancel after plain helper join is flagged", "defer cancel(); join(&wg)", "LL1005"},
+		{"deferred helper join registered before deferred cancel is clean", "defer join(&wg); defer cancel()", ""},
+		{"deferred cancel registered before deferred helper join is flagged", "defer cancel(); defer join(&wg)", "LL1005"},
+		{"conditional helper is not promoted to a definite wait site", "maybeJoin(&wg, ok); cancel()", "LL1003"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := rulesOnly(findings(t, mk(c.body))); got != c.want {
+				t.Fatalf("rules = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestStopOrder_HelperMediatedJoinKeepsGroupsIndependent(t *testing.T) {
+	const src = `package p
+import ("context"; "sync")
+func join(g *sync.WaitGroup) { g.Wait() }
+func f(parent context.Context) {
+	ctx1, cancel1 := context.WithCancel(parent)
+	ctx2, cancel2 := context.WithCancel(parent)
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func() { defer wg1.Done(); <-ctx1.Done() }()
+	wg2.Add(1); go func() { defer wg2.Done(); <-ctx2.Done() }()
+	cancel1(); join(&wg1)
+	join(&wg2); cancel2()
+}
+`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			t.Fatalf("unexpected diagnostic %s: %s", d.RuleID, d.Message)
+		}
+		for _, name := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+name+`"`) {
+				got = append(got, name)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
