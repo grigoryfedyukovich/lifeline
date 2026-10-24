@@ -390,6 +390,86 @@ cancel(); wg.Wait()`, ""},
 	}
 }
 
+func TestStopOrder_PromotedContextFieldsCorrelate(t *testing.T) {
+	const hdr = `package p
+import ("context"; "sync")
+type embeddedCtx struct { ctx context.Context }
+type embeddedService struct { embeddedCtx }
+func promotedContextWorker(s embeddedService, wg *sync.WaitGroup) { defer wg.Done(); <-s.ctx.Done() }
+`
+	cases := []struct{ name, body, want string }{
+		{"literal promoted read", `
+ctx, cancel := context.WithCancel(parent)
+s := embeddedService{embeddedCtx: embeddedCtx{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-s.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"promoted direct assignment", `
+ctx, cancel := context.WithCancel(parent)
+var s embeddedService; s.ctx = ctx
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-s.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"named worker promoted read", `
+ctx, cancel := context.WithCancel(parent)
+s := embeddedService{embeddedCtx: embeddedCtx{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go promotedContextWorker(s, &wg)
+wg.Wait(); cancel()`, "LL1005"},
+		{"pointer-embedded promoted context", `
+ctx, cancel := context.WithCancel(parent)
+type ptrService struct { *embeddedCtx }
+s := ptrService{embeddedCtx: &embeddedCtx{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); <-s.ctx.Done() }()
+wg.Wait(); cancel()`, "LL1005"},
+		{"early cancel through promoted field is safe", `
+ctx, cancel := context.WithCancel(parent)
+s := embeddedService{embeddedCtx: embeddedCtx{ctx: ctx}}
+var wg sync.WaitGroup
+wg.Add(1); go promotedContextWorker(s, &wg)
+cancel(); wg.Wait()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f(parent context.Context) {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_PromotedContextFieldsStayIndependent(t *testing.T) {
+	src := `package p
+import ("context"; "sync")
+type embeddedA struct { a context.Context }
+type embeddedB struct { b context.Context }
+type embeddedService struct { embeddedA; embeddedB }
+func f(parent context.Context) {
+	ctx1, cancel1 := context.WithCancel(parent)
+	ctx2, cancel2 := context.WithCancel(parent)
+	s := embeddedService{embeddedA: embeddedA{a: ctx1}, embeddedB: embeddedB{b: ctx2}}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); <-s.a.Done() }()
+	wg2.Add(1); go func(){ defer wg2.Done(); <-s.b.Done() }()
+	cancel1(); wg1.Wait()
+	wg2.Wait(); cancel2()
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
 func TestStopOrder_NestedContextFieldPathsStayIndependent(t *testing.T) {
 	src := `package p
 import ("context"; "sync")
@@ -823,6 +903,86 @@ close(s.worker.stop); wg.Wait()`, ""},
 		if got := rulesOnly(findings(t, src)); got != tc.want {
 			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestStopOrder_PromotedChannelFieldsCorrelate(t *testing.T) {
+	const hdr = `package p
+import "sync"
+type embeddedStop struct { stop chan struct{} }
+type embeddedStopService struct { embeddedStop }
+func promotedChannelWorker(s embeddedStopService, wg *sync.WaitGroup) { defer wg.Done(); select { case <-s.stop: return } }
+`
+	cases := []struct{ name, body, want string }{
+		{"literal promoted receive, close original", `
+stop := make(chan struct{})
+s := embeddedStopService{embeddedStop: embeddedStop{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"promoted direct assignment and close", `
+stop := make(chan struct{})
+var s embeddedStopService; s.stop = stop
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s.stop: return } }()
+wg.Wait(); close(s.stop)`, "LL1005"},
+		{"named worker promoted receive", `
+stop := make(chan struct{})
+s := embeddedStopService{embeddedStop: embeddedStop{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go promotedChannelWorker(s, &wg)
+wg.Wait(); close(stop)`, "LL1005"},
+		{"pointer-embedded promoted channel", `
+stop := make(chan struct{})
+type ptrStopService struct { *embeddedStop }
+s := ptrStopService{embeddedStop: &embeddedStop{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go func(){ defer wg.Done(); select { case <-s.stop: return } }()
+wg.Wait(); close(stop)`, "LL1005"},
+		{"early promoted close is safe", `
+stop := make(chan struct{})
+s := embeddedStopService{embeddedStop: embeddedStop{stop: stop}}
+var wg sync.WaitGroup
+wg.Add(1); go promotedChannelWorker(s, &wg)
+close(s.stop); wg.Wait()`, ""},
+	}
+	for _, tc := range cases {
+		src := hdr + "func f() {" + tc.body + "\n}\n"
+		if got := rulesOnly(findings(t, src)); got != tc.want {
+			t.Errorf("%s: rules = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestStopOrder_PromotedChannelFieldsStayIndependent(t *testing.T) {
+	src := `package p
+import "sync"
+type embeddedStopA struct { a chan struct{} }
+type embeddedStopB struct { b chan struct{} }
+type embeddedStopService struct { embeddedStopA; embeddedStopB }
+func f() {
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+	s := embeddedStopService{embeddedStopA: embeddedStopA{a: stop1}, embeddedStopB: embeddedStopB{b: stop2}}
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); select { case <-s.a: return } }()
+	wg2.Add(1); go func(){ defer wg2.Done(); select { case <-s.b: return } }()
+	close(s.a); wg1.Wait()
+	wg2.Wait(); close(s.b)
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
 	}
 }
 

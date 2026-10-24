@@ -6912,6 +6912,33 @@ func joinStoragePath(prefix, suffix string) string {
 	return prefix + "." + suffix
 }
 
+// selectionFieldPath expands a field selection into the concrete embedded-field
+// path reported by go/types. A direct field such as s.worker yields "worker";
+// a promoted field such as s.stop where stop is declared on an embedded Inner
+// yields "Inner.stop". This keeps promoted selectors instance-sensitive without
+// introducing alias analysis: every step must be a concrete struct field chosen
+// by the type checker.
+func selectionFieldPath(sel *types.Selection) (string, bool) {
+	if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) == 0 {
+		return "", false
+	}
+	t := sel.Recv()
+	parts := make([]string, 0, len(sel.Index()))
+	for _, i := range sel.Index() {
+		if t == nil {
+			return "", false
+		}
+		st, ok := deref(t).Underlying().(*types.Struct)
+		if !ok || i < 0 || i >= st.NumFields() {
+			return "", false
+		}
+		f := st.Field(i)
+		parts = append(parts, f.Name())
+		t = f.Type()
+	}
+	return strings.Join(parts, "."), true
+}
+
 // constantArrayIndex returns a non-negative, compile-time integer index for
 // expr. Dynamic indices deliberately remain unsupported for stop-correlation
 // identities: collapsing a[i] to one guessed element would be less sound than
@@ -6954,14 +6981,15 @@ func localStoragePath(expr ast.Expr, info *types.Info) (types.Object, string, bo
 		return base, joinIndexPath(prefix, idx), true
 	case *ast.SelectorExpr:
 		sel := info.Selections[x]
-		if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
+		suffix, ok := selectionFieldPath(sel)
+		if !ok {
 			return nil, "", false
 		}
 		base, prefix, ok := localStoragePath(x.X, info)
 		if !ok || base == nil {
 			return nil, "", false
 		}
-		return base, joinFieldPath(prefix, x.Sel.Name), true
+		return base, joinStoragePath(prefix, suffix), true
 	default:
 		return localFieldPath(expr, info)
 	}
@@ -6969,9 +6997,10 @@ func localStoragePath(expr ast.Expr, info *types.Info) (types.Object, string, bo
 
 // localFieldPath resolves an explicit local selector path such as h.stop or
 // svc.worker.stop to its root object and dot-separated field path. It accepts
-// pointer/address wrappers around the local root, but deliberately rejects
-// package selectors, method selections, promoted-field shortcuts and other
-// expressions whose identity would require alias analysis.
+// pointer/address wrappers around the local root. Promoted embedded fields are
+// expanded to their concrete go/types field path (for example s.stop becomes
+// s.Inner.stop). Package selectors, method selections and expressions whose
+// identity would require alias analysis are still rejected.
 func localFieldPath(expr ast.Expr, info *types.Info) (types.Object, string, bool) {
 	switch x := unparenExpr(expr).(type) {
 	case *ast.Ident:
@@ -6986,14 +7015,15 @@ func localFieldPath(expr ast.Expr, info *types.Info) (types.Object, string, bool
 		return localFieldPath(x.X, info)
 	case *ast.SelectorExpr:
 		sel := info.Selections[x]
-		if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
+		suffix, ok := selectionFieldPath(sel)
+		if !ok {
 			return nil, "", false
 		}
 		base, prefix, ok := localFieldPath(x.X, info)
 		if !ok || base == nil {
 			return nil, "", false
 		}
-		return base, joinFieldPath(prefix, x.Sel.Name), true
+		return base, joinFieldPath(prefix, suffix), true
 	default:
 		return nil, "", false
 	}
@@ -7031,7 +7061,7 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 				res[obj] = true
 			}
 		case *ast.SelectorExpr:
-			if sel := b.in.Info.Selections[x]; sel != nil && sel.Kind() == types.FieldVal && len(sel.Index()) == 1 && isContextType(sel.Obj().Type(), b.contextInterface) {
+			if sel := b.in.Info.Selections[x]; sel != nil && sel.Kind() == types.FieldVal && isContextType(sel.Obj().Type(), b.contextInterface) {
 				if base, path, ok := localFieldPath(x, b.in.Info); ok && path != "" {
 					for obj := range out[contextFieldKey{base: base, field: path}] {
 						res[obj] = true
@@ -7110,7 +7140,7 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 				rhs := x.Rhs[i]
 				if sel, ok := unparenExpr(lhs).(*ast.SelectorExpr); ok {
 					selection := b.in.Info.Selections[sel]
-					if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
+					if selection != nil && selection.Kind() == types.FieldVal && isContextType(selection.Obj().Type(), b.contextInterface) {
 						if base, path, ok := localFieldPath(sel, b.in.Info); ok && path != "" {
 							for src := range sources(rhs) {
 								add(contextFieldKey{base: base, field: path}, src)
@@ -7238,7 +7268,7 @@ func (b *builder) contextFieldsUsedByParamRec(fn *types.Func, index int, stack m
 		switch x := n.(type) {
 		case *ast.SelectorExpr:
 			selection := b.in.Info.Selections[x]
-			if selection != nil && selection.Kind() == types.FieldVal && len(selection.Index()) == 1 && isContextType(selection.Obj().Type(), b.contextInterface) {
+			if selection != nil && selection.Kind() == types.FieldVal && isContextType(selection.Obj().Type(), b.contextInterface) {
 				if base, path, ok := localFieldPath(x, b.in.Info); ok && base == param && path != "" {
 					out[path] = true
 				}
@@ -7292,7 +7322,7 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 			switch x := n.(type) {
 			case *ast.SelectorExpr:
 				selection := b.in.Info.Selections[x]
-				if selection == nil || selection.Kind() != types.FieldVal || len(selection.Index()) != 1 || !isContextType(selection.Obj().Type(), b.contextInterface) {
+				if selection == nil || selection.Kind() != types.FieldVal || !isContextType(selection.Obj().Type(), b.contextInterface) {
 					return true
 				}
 				if base, path, ok := localFieldPath(x, b.in.Info); ok && path != "" {
@@ -7391,11 +7421,11 @@ type channelFieldKey struct {
 }
 
 // channelSourceIndex conservatively relates simple local aliases and explicit
-// local struct-field / constant-array-index paths to the channel values they may hold. Assignments union sources:
+// local struct-field / promoted-field / constant-array-index paths to the channel values they may hold. Assignments union sources:
 // if a variable/field may refer to more than one channel, all of those channels
 // remain candidates and LL1005 is emitted only when every candidate stop is
-// proven late. Dynamic slice/map/container aliases and promoted/implicit selector
-// paths remain unsupported instead of being guessed at.
+// proven late. Promoted embedded fields are expanded to concrete field paths;
+// dynamic slice/map/container aliases remain unsupported instead of being guessed at.
 type channelSourceIndex struct {
 	vars   map[types.Object]map[channelSource]bool
 	fields map[channelFieldKey]map[channelSource]bool
@@ -7474,7 +7504,7 @@ func (idx *channelSourceIndex) sourcesForExpr(expr ast.Expr, info *types.Info) m
 		return map[channelSource]bool{{obj: obj}: true}
 	case *ast.SelectorExpr:
 		sel := info.Selections[x]
-		if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
+		if sel == nil || sel.Kind() != types.FieldVal {
 			return nil
 		}
 		if _, ok := sel.Obj().Type().Underlying().(*types.Chan); !ok {
