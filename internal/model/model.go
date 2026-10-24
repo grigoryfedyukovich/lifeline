@@ -130,9 +130,9 @@ type JoinGroup struct {
 	// (docs/cfg-migration-plan.md). This mirrors Goroutine.
 	// ImportedUnresolvedLoop's own nil-means-"not established" convention
 	// deliberately: nil covers every case this wasn't (or couldn't be)
-	// checked -- Joined is false to begin with, Joined came from a
-	// join_wrapper call rather than a direct Wait() with a call site to
-	// find a block for, or there was no CFG to check against at all -- and
+	// checked -- Joined is false to begin with, no recognized join site
+	// can be placed in the owner CFG, or there was no CFG to check against
+	// at all -- and
 	// is treated exactly like Joined's own pre-Phase-3 meaning, not as a
 	// disproof. This is the same class of precision LL1002 already has for
 	// loops (see UnresolvedLoop's own doc comment): a Wait() call reachable

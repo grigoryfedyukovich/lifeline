@@ -167,8 +167,8 @@ func AnalyzeWithStatus(program model.Program, cfg config.Config) ([]Diagnostic, 
 			// unjoined case existed originally; the other three are real,
 			// checked findings the old flat Joined bool could not tell
 			// apart from "everything's fine". JoinedOnAllPaths == nil (not
-			// established at all -- no CFG, or Joined came from a
-			// join_wrapper call with no call site to check) is treated the
+			// established at all -- no CFG or no placeable recognized join
+			// site) is treated the
 			// same as "on all paths", matching Joined's own pre-Phase-3
 			// meaning: this only ever downgrades a verdict on positive
 			// evidence, never on an inability to check.

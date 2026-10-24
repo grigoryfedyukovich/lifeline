@@ -816,10 +816,11 @@ type groupState struct {
 	// a helper that joins it on every path (helperJoinCalls, a discharge at
 	// that call), on some paths only (mayJoinCalls, never a discharge), or
 	// that returns it.
-	returned        bool
-	mayJoinCalls    []*ast.CallExpr
-	helperJoinCalls []*ast.CallExpr
-	recCalls        []*ast.CallExpr
+	returned         bool
+	mayJoinCalls     []*ast.CallExpr
+	helperJoinCalls  []*ast.CallExpr
+	wrapperJoinCalls []*ast.CallExpr
+	recCalls         []*ast.CallExpr
 	// waitCallSites is the same kind of AST-node record as
 	// cancelState.callSites above, for the same reason: finding each
 	// Wait() call's CFG block by identity, not by span.
@@ -2958,6 +2959,8 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 		usesGroup := hasObject(argObjects, g.obj)
 		if b.hasWrapper(b.joinWrappers, name) && usesGroup {
 			g.group.Joined = true
+			g.wrapperJoinCalls = append(g.wrapperJoinCalls, call)
+			g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "join-wrapper-assumption", Message: "configured join wrapper is assumed to wait for this group when called", Span: ptrSpan(b.span(call))})
 		}
 		if receiver != g.obj && usesGroup && !b.hasWrapper(b.joinWrappers, name) {
 			// Same Phase 5 verification as cancels above, applied to a
@@ -2986,8 +2989,9 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 			// (A verified helper-mediated join records this call as its join site,
 			// so JoinedOnAllPaths and stop-before-wait ordering can reason
 			// about the owner's real control flow at the helper call. A
-			// configured join_wrapper remains assumption-based and is handled
-			// separately.)
+			// configured join_wrapper remains assumption-based about callee
+			// semantics, but its caller-side call site is recorded separately so
+			// all-path and stop-ordering checks can verify the surrounding flow.)
 			if b.isRecursivePass(call) {
 				g.recCalls = append(g.recCalls, call)
 			}
@@ -6689,7 +6693,8 @@ func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wr
 		return
 	}
 	var waits []stopSignal // reused: a wait is a call with a place and a time
-	for _, call := range append(append([]*ast.CallExpr(nil), gr.waitCallSites...), gr.helperJoinCalls...) {
+	joinCalls := append(append(append([]*ast.CallExpr(nil), gr.waitCallSites...), gr.helperJoinCalls...), gr.wrapperJoinCalls...)
+	for _, call := range joinCalls {
 		if site, ok := callSites[call]; ok {
 			waits = append(waits, stopSignal{call: call, site: site, deferred: deferredCalls[call]})
 		}
@@ -8197,7 +8202,13 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 		// ordering. The callee summary establishes the must-Wait effect;
 		// the caller-side call node supplies the concrete CFG anchor.
 		helperJoinSites := callSitesOf(gr.helperJoinCalls, callSites)
-		joinSites := append(append([]flowgraph.CallSite(nil), waitSites...), helperJoinSites...)
+		// A configured join_wrapper is assumption-based about what the
+		// callee does, but its caller-side control-flow position is exact.
+		// Recording that site lets the owner's all-path and stop-ordering
+		// checks verify when the assumed join is actually reached instead
+		// of treating one wrapper call anywhere as an unconditional join.
+		wrapperJoinSites := callSitesOf(gr.wrapperJoinCalls, callSites)
+		joinSites := append(append(append([]flowgraph.CallSite(nil), waitSites...), helperJoinSites...), wrapperJoinSites...)
 		if len(joinSites) == 0 {
 			if len(callSitesOf(gr.mayJoinCalls, callSites)) > 0 {
 				// Only a callee that joins on some of its own paths: its
@@ -8206,7 +8217,7 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 				gr.group.JoinedOnAllPaths = &no
 				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "the only join is a callee that waits on some of its own paths, so no path is known to join this group"})
 			}
-			continue // Joined came from a join_wrapper call, not a direct Wait(); no call site here to find a block for
+			continue // Joined was established, but no placeable direct/helper/wrapper join site is available in this CFG.
 		}
 		// The join obligation begins when worker accounting starts
 		// (Add/Go), not at function entry: a path that never started a
@@ -8217,10 +8228,10 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 			onAllPaths := !bypassed
 			gr.group.JoinedOnAllPaths = &onAllPaths
 			if !onAllPaths {
-				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the point a worker is started to the function's return bypasses every Wait() call for this group"})
+				gr.group.Evidence = append(gr.group.Evidence, model.Evidence{Kind: "join-not-on-all-paths", Message: "some path from the point a worker is started to the function's return bypasses every recognized join site for this group"})
 			}
 		}
-		if len(waitSites)+len(helperJoinSites) == 0 {
+		if len(waitSites)+len(helperJoinSites)+len(wrapperJoinSites) == 0 {
 			continue
 		}
 		b.computeStopOrdering(gr, cancels, stopWrapperCalls, closeCalls, channels, body, g, callSites, deferredCalls)

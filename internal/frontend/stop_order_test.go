@@ -3,6 +3,9 @@ package frontend
 import (
 	"strings"
 	"testing"
+
+	"github.com/gfedyukovich/lifeline/internal/config"
+	"github.com/gfedyukovich/lifeline/internal/engine"
 )
 
 // Regression tests for audit finding F7: LL1005 relates a group to the stop
@@ -1110,6 +1113,92 @@ func f(parent context.Context) {
 			if strings.Contains(d.Message, `"`+name+`"`) {
 				got = append(got, name)
 			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
+
+func analyzeSourceWithJoinWrapper(t *testing.T, source, joinWrapper string) []engine.Diagnostic {
+	t.Helper()
+	program := buildProgramFor(t, source, func(cfg *config.Config) {
+		cfg.JoinWrappers = []string{joinWrapper}
+	})
+	cfg := config.Default()
+	cfg.JoinWrappers = []string{joinWrapper}
+	return engine.Analyze(program, cfg)
+}
+
+func TestStopOrder_ConfiguredJoinWrapperAnchorsOrdering(t *testing.T) {
+	const hdr = `package p
+import ("context"; "sync")
+func Join(g *sync.WaitGroup) {}
+`
+	mk := func(body string) string {
+		return hdr + `func f(parent context.Context, ok bool) {
+	ctx, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); <-ctx.Done() }()
+` + body + "\n}\n"
+	}
+	const wrapper = "example.test/input.Join"
+	cases := []struct {
+		name, body, want string
+	}{
+		{"configured join wrapper before cancel is flagged", "Join(&wg); cancel()", "LL1005"},
+		{"cancel before configured join wrapper is clean", "cancel(); Join(&wg)", ""},
+		{"conditional configured join wrapper is not an all-path join", "if ok { Join(&wg) }; cancel()", "LL1003"},
+		{"deferred join wrapper registered before deferred cancel is clean", "defer Join(&wg); defer cancel()", ""},
+		{"deferred cancel registered before deferred join wrapper is flagged", "defer cancel(); defer Join(&wg)", "LL1005"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var rules []string
+			for _, d := range analyzeSourceWithJoinWrapper(t, mk(c.body), wrapper) {
+				rules = append(rules, d.RuleID)
+			}
+			got := strings.Join(rules, ",")
+			if got != c.want {
+				t.Fatalf("rules = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestStopOrder_ConfiguredJoinWrapperKeepsGroupsIndependent(t *testing.T) {
+	const src = `package p
+import ("context"; "sync")
+func Join(g *sync.WaitGroup) {}
+func f(parent context.Context) {
+	ctx1, cancel1 := context.WithCancel(parent)
+	ctx2, cancel2 := context.WithCancel(parent)
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func() { defer wg1.Done(); <-ctx1.Done() }()
+	wg2.Add(1); go func() { defer wg2.Done(); <-ctx2.Done() }()
+	cancel1(); Join(&wg1)
+	Join(&wg2); cancel2()
+}
+`
+	var got []string
+	for _, d := range analyzeSourceWithJoinWrapper(t, src, "example.test/input.Join") {
+		if d.RuleID != "LL1005" {
+			t.Fatalf("unexpected diagnostic %s: %s", d.RuleID, d.Message)
+		}
+		for _, name := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+name+`"`) {
+				got = append(got, name)
+			}
+		}
+		foundAssumption := false
+		for _, ev := range d.Evidence {
+			if ev.Kind == "join-wrapper-assumption" {
+				foundAssumption = true
+			}
+		}
+		if !foundAssumption {
+			t.Fatalf("LL1005 from configured join wrapper must retain assumption evidence: %#v", d.Evidence)
 		}
 	}
 	if strings.Join(got, ",") != "wg2" {
