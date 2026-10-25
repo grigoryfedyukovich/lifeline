@@ -6960,6 +6960,116 @@ func constantArrayIndex(expr ast.Expr, info *types.Info) (int64, bool) {
 // a general container/alias resolver: slices and maps have shared/dynamic
 // storage semantics that need separate alias reasoning. A path may therefore
 // look like "worker.stops[0]".
+
+// stableStructuredPointerAliases returns a canonical root for local pointer
+// aliases whose identity is statically stable for the whole function body.
+// Only pointers to structs/fixed arrays participate. A local is considered
+// stable when it is assigned at most once in the body (parameters therefore
+// start stable); an alias edge is recorded only for a direct pointer-variable
+// assignment such as alias := holder. If either endpoint is reassigned, the
+// edge is discarded. This deliberately avoids general heap points-to reasoning
+// while still making mutations through simple aliases visible to the same
+// context/channel storage path.
+func stableStructuredPointerAliases(body *ast.BlockStmt, info *types.Info) map[types.Object]types.Object {
+	roots := map[types.Object]types.Object{}
+	if body == nil || info == nil {
+		return roots
+	}
+	isStructuredPtr := func(t types.Type) bool {
+		if t == nil {
+			return false
+		}
+		p, ok := t.Underlying().(*types.Pointer)
+		if !ok || p.Elem() == nil {
+			return false
+		}
+		switch deref(p.Elem()).Underlying().(type) {
+		case *types.Struct, *types.Array:
+			return true
+		default:
+			return false
+		}
+	}
+	writes := map[types.Object]int{}
+	edges := map[types.Object]types.Object{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range x.Lhs {
+				obj := identObject(lhs, info)
+				if obj == nil || !isStructuredPtr(obj.Type()) {
+					continue
+				}
+				writes[obj]++
+				if i < len(x.Rhs) {
+					if src := identObject(x.Rhs[i], info); src != nil && isStructuredPtr(src.Type()) {
+						edges[obj] = src
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for i, name := range x.Names {
+				obj := info.Defs[name]
+				if obj == nil || !isStructuredPtr(obj.Type()) {
+					continue
+				}
+				if i < len(x.Values) {
+					writes[obj]++
+					if src := identObject(x.Values[i], info); src != nil && isStructuredPtr(src.Type()) {
+						edges[obj] = src
+					}
+				}
+			}
+		}
+		return true
+	})
+	var resolve func(types.Object, map[types.Object]bool) types.Object
+	resolve = func(obj types.Object, seen map[types.Object]bool) types.Object {
+		if obj == nil || writes[obj] > 1 || seen[obj] {
+			return obj
+		}
+		src := edges[obj]
+		if src == nil || writes[src] > 1 {
+			return obj
+		}
+		seen[obj] = true
+		root := resolve(src, seen)
+		delete(seen, obj)
+		if root == nil || root == obj {
+			return obj
+		}
+		return root
+	}
+	for obj := range edges {
+		if writes[obj] != 1 {
+			continue
+		}
+		root := resolve(obj, map[types.Object]bool{})
+		if root != nil && root != obj {
+			roots[obj] = root
+		}
+	}
+	return roots
+}
+
+func canonicalStorageBase(obj types.Object, aliases map[types.Object]types.Object) types.Object {
+	if obj == nil || len(aliases) == 0 {
+		return obj
+	}
+	seen := map[types.Object]bool{}
+	for aliases[obj] != nil && !seen[obj] {
+		seen[obj] = true
+		obj = aliases[obj]
+	}
+	return obj
+}
+
 func localStoragePath(expr ast.Expr, info *types.Info) (types.Object, string, bool) {
 	switch x := unparenExpr(expr).(type) {
 	case *ast.IndexExpr:
@@ -7034,12 +7144,14 @@ func localFieldPath(expr ast.Expr, info *types.Info) (types.Object, string, bool
 // unioned across assignments: when a field can hold either of two contexts,
 // both cancels become candidate stop signals and LL1005 is emitted only if
 // every candidate is proven late. That is the conservative direction.
-func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]map[types.Object]bool {
+func (b *builder) contextFieldSources(body *ast.BlockStmt) (map[contextFieldKey]map[types.Object]bool, map[types.Object]types.Object) {
 	out := map[contextFieldKey]map[types.Object]bool{}
+	aliases := stableStructuredPointerAliases(body, b.in.Info)
 	if body == nil {
-		return out
+		return out, aliases
 	}
 	add := func(key contextFieldKey, src types.Object) bool {
+		key.base = canonicalStorageBase(key.base, aliases)
 		if key.base == nil || key.field == "" || src == nil || !isContextType(src.Type(), b.contextInterface) {
 			return false
 		}
@@ -7063,6 +7175,7 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 		case *ast.SelectorExpr:
 			if sel := b.in.Info.Selections[x]; sel != nil && sel.Kind() == types.FieldVal && isContextType(sel.Obj().Type(), b.contextInterface) {
 				if base, path, ok := localFieldPath(x, b.in.Info); ok && path != "" {
+					base = canonicalStorageBase(base, aliases)
 					for obj := range out[contextFieldKey{base: base, field: path}] {
 						res[obj] = true
 					}
@@ -7159,6 +7272,8 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 				}
 				// Whole-value copies preserve every known context field.
 				if other := identObject(rhs, b.in.Info); other != nil {
+					other = canonicalStorageBase(other, aliases)
+					base = canonicalStorageBase(base, aliases)
 					for key, vals := range out {
 						if key.base != other {
 							continue
@@ -7184,6 +7299,8 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 					continue
 				}
 				if other := identObject(rhs, b.in.Info); other != nil {
+					other = canonicalStorageBase(other, aliases)
+					base = canonicalStorageBase(base, aliases)
 					for key, vals := range out {
 						if key.base != other {
 							continue
@@ -7197,7 +7314,7 @@ func (b *builder) contextFieldSources(body *ast.BlockStmt) map[contextFieldKey]m
 		}
 		return true
 	})
-	return out
+	return out, aliases
 }
 
 func unparenExpr(expr ast.Expr) ast.Expr {
@@ -7257,6 +7374,8 @@ func (b *builder) contextFieldsUsedByParamRec(fn *types.Func, index int, stack m
 		b.contextFieldUseMemo[key] = out
 		return out, true
 	}
+	aliases := stableStructuredPointerAliases(decl.Body, b.in.Info)
+	paramRoot := canonicalStorageBase(param, aliases)
 	complete := true
 	b.inspect(decl.Body, func(n ast.Node) bool {
 		if n == nil {
@@ -7269,7 +7388,7 @@ func (b *builder) contextFieldsUsedByParamRec(fn *types.Func, index int, stack m
 		case *ast.SelectorExpr:
 			selection := b.in.Info.Selections[x]
 			if selection != nil && selection.Kind() == types.FieldVal && isContextType(selection.Obj().Type(), b.contextInterface) {
-				if base, path, ok := localFieldPath(x, b.in.Info); ok && base == param && path != "" {
+				if base, path, ok := localFieldPath(x, b.in.Info); ok && canonicalStorageBase(base, aliases) == paramRoot && path != "" {
 					out[path] = true
 				}
 			}
@@ -7280,7 +7399,7 @@ func (b *builder) contextFieldsUsedByParamRec(fn *types.Func, index int, stack m
 			}
 			for i, arg := range x.Args {
 				base, prefix, ok := localFieldPath(arg, b.in.Info)
-				if !ok || base != param {
+				if !ok || canonicalStorageBase(base, aliases) != paramRoot {
 					continue
 				}
 				fields, childComplete := b.contextFieldsUsedByParamRec(callee, i, stack)
@@ -7311,7 +7430,7 @@ func (b *builder) contextFieldsUsedByParamRec(fn *types.Func, index int, stack m
 // (audit finding F7).
 func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.Object]bool {
 	used := map[types.Object]bool{}
-	fields := b.contextFieldSources(body)
+	fields, aliases := b.contextFieldSources(body)
 	addExpr := func(expr ast.Node) {
 		for obj := range objectsUsed(expr, b.in.Info, true) {
 			if isContextType(obj.Type(), b.contextInterface) {
@@ -7326,6 +7445,7 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 					return true
 				}
 				if base, path, ok := localFieldPath(x, b.in.Info); ok && path != "" {
+					base = canonicalStorageBase(base, aliases)
 					for src := range fields[contextFieldKey{base: base, field: path}] {
 						used[src] = true
 					}
@@ -7340,6 +7460,7 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 					if !ok || base == nil {
 						continue
 					}
+					base = canonicalStorageBase(base, aliases)
 					for field := range b.contextFieldsUsedByParam(callee, i) {
 						path := joinFieldPath(prefix, field)
 						for src := range fields[contextFieldKey{base: base, field: path}] {
@@ -7376,6 +7497,7 @@ func (b *builder) workerContexts(gr *groupState, body *ast.BlockStmt) map[types.
 				if !ok || base == nil {
 					continue
 				}
+				base = canonicalStorageBase(base, aliases)
 				for field := range b.contextFieldsUsedByParam(fn, i) {
 					path := joinFieldPath(prefix, field)
 					for src := range fields[contextFieldKey{base: base, field: path}] {
@@ -7421,21 +7543,30 @@ type channelFieldKey struct {
 }
 
 // channelSourceIndex conservatively relates simple local aliases and explicit
-// local struct-field / promoted-field / constant-array-index paths to the channel values they may hold. Assignments union sources:
+// local struct-field / promoted-field / constant-array-index paths to the channel
+// values they may hold. Stable local pointer aliases to structured roots are
+// canonicalized when neither pointer is reassigned. Assignments union sources:
 // if a variable/field may refer to more than one channel, all of those channels
 // remain candidates and LL1005 is emitted only when every candidate stop is
 // proven late. Promoted embedded fields are expanded to concrete field paths;
-// dynamic slice/map/container aliases remain unsupported instead of being guessed at.
+// dynamic slice/map/container aliases and mutable heap aliases remain unsupported
+// instead of being guessed at.
 type channelSourceIndex struct {
-	vars   map[types.Object]map[channelSource]bool
-	fields map[channelFieldKey]map[channelSource]bool
+	vars    map[types.Object]map[channelSource]bool
+	fields  map[channelFieldKey]map[channelSource]bool
+	aliases map[types.Object]types.Object
 }
 
-func newChannelSourceIndex() *channelSourceIndex {
+func newChannelSourceIndex(aliases map[types.Object]types.Object) *channelSourceIndex {
 	return &channelSourceIndex{
-		vars:   map[types.Object]map[channelSource]bool{},
-		fields: map[channelFieldKey]map[channelSource]bool{},
+		vars:    map[types.Object]map[channelSource]bool{},
+		fields:  map[channelFieldKey]map[channelSource]bool{},
+		aliases: aliases,
 	}
+}
+
+func (idx *channelSourceIndex) canonicalBase(obj types.Object) types.Object {
+	return canonicalStorageBase(obj, idx.aliases)
 }
 
 func copyChannelSources(in map[channelSource]bool) map[channelSource]bool {
@@ -7462,6 +7593,7 @@ func (idx *channelSourceIndex) addVar(obj types.Object, srcs map[channelSource]b
 }
 
 func (idx *channelSourceIndex) addField(key channelFieldKey, srcs map[channelSource]bool) {
+	key.base = idx.canonicalBase(key.base)
 	if key.base == nil || key.field == "" {
 		return
 	}
@@ -7474,6 +7606,7 @@ func (idx *channelSourceIndex) addField(key channelFieldKey, srcs map[channelSou
 }
 
 func (idx *channelSourceIndex) sourcesForField(base types.Object, field string) map[channelSource]bool {
+	base = idx.canonicalBase(base)
 	if base == nil || field == "" {
 		return nil
 	}
@@ -7553,7 +7686,7 @@ func channelFieldNameAt(info *types.Info, lit *ast.CompositeLit, i int) string {
 // such as svc.worker.stop = stop or stops[0] = stop, keyed/unkeyed nested
 // literals, and whole-value local struct/fixed-array copies.
 func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceIndex {
-	idx := newChannelSourceIndex()
+	idx := newChannelSourceIndex(stableStructuredPointerAliases(body, b.in.Info))
 	if body == nil {
 		return idx
 	}
@@ -7658,6 +7791,8 @@ func (b *builder) buildChannelSourceIndex(body *ast.BlockStmt) *channelSourceInd
 		if dst == nil || src == nil {
 			return
 		}
+		dst = idx.canonicalBase(dst)
+		src = idx.canonicalBase(src)
 		for key, vals := range idx.fields {
 			if key.base != src {
 				continue
@@ -7745,6 +7880,8 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 	if param == nil {
 		return out
 	}
+	aliases := stableStructuredPointerAliases(decl.Body, b.in.Info)
+	paramRoot := canonicalStorageBase(param, aliases)
 	fieldOf := func(expr ast.Expr) string {
 		t := b.in.Info.TypeOf(expr)
 		if t == nil {
@@ -7755,7 +7892,7 @@ func (b *builder) channelFieldsUsedByParam(fn *types.Func, index int) map[string
 			return ""
 		}
 		base, path, ok := localStoragePath(expr, b.in.Info)
-		if !ok || base != param || path == "" {
+		if !ok || canonicalStorageBase(base, aliases) != paramRoot || path == "" {
 			return ""
 		}
 		return path

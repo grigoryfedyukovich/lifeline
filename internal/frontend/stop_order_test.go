@@ -1365,3 +1365,195 @@ func f(parent context.Context) {
 		t.Fatalf("reported groups %v, want [wg2]", got)
 	}
 }
+
+func TestStopOrder_StablePointerAliasChannelMutationCorrelates(t *testing.T) {
+	src := `package p
+import "sync"
+type holder struct { stop chan struct{} }
+func f() {
+	stop := make(chan struct{})
+	h := &holder{}
+	alias := h
+	alias.stop = stop
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done(); select { case <-h.stop: return } }()
+	wg.Wait()
+	close(stop)
+}`
+	if got := rulesOnly(findings(t, src)); got != "LL1005" {
+		t.Fatalf("rules = %q, want LL1005", got)
+	}
+}
+
+func TestStopOrder_StablePointerAliasContextMutationCorrelates(t *testing.T) {
+	src := `package p
+import ("context"; "sync")
+type holder struct { ctx context.Context }
+func f(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	h := &holder{}
+	alias := h
+	alias.ctx = ctx
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done(); <-h.ctx.Done() }()
+	wg.Wait()
+	cancel()
+}`
+	if got := rulesOnly(findings(t, src)); got != "LL1005" {
+		t.Fatalf("rules = %q, want LL1005", got)
+	}
+}
+
+func TestStopOrder_StablePointerAliasMultiHopCorrelates(t *testing.T) {
+	src := `package p
+import "sync"
+type holder struct { stop chan struct{} }
+func f() {
+	stop := make(chan struct{})
+	h := &holder{}
+	a := h
+	b := a
+	b.stop = stop
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done(); for range h.stop {} }()
+	wg.Wait()
+	close(stop)
+}`
+	if got := rulesOnly(findings(t, src)); got != "LL1005" {
+		t.Fatalf("rules = %q, want LL1005", got)
+	}
+}
+
+func TestStopOrder_ReassignedPointerAliasRemainsConservative(t *testing.T) {
+	cases := []string{
+		`package p
+import "sync"
+type holder struct { stop chan struct{} }
+func f() {
+	stop := make(chan struct{})
+	h1 := &holder{}
+	h2 := &holder{}
+	alias := h1
+	alias = h2
+	alias.stop = stop
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done(); for range h1.stop {} }()
+	wg.Wait()
+	close(stop)
+}`,
+		`package p
+import "sync"
+type holder struct { stop chan struct{} }
+func f() {
+	stop := make(chan struct{})
+	h := &holder{}
+	alias := h
+	h = &holder{}
+	alias.stop = stop
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done(); for range h.stop {} }()
+	wg.Wait()
+	close(stop)
+}`,
+	}
+	for i, src := range cases {
+		if got := rulesOnly(findings(t, src)); got != "" {
+			t.Fatalf("case %d: mutable pointer alias must withhold LL1005, got %q", i, got)
+		}
+	}
+}
+
+func TestStopOrder_NamedWorkerStablePointerAliasFields(t *testing.T) {
+	const hdr = `package p
+import ("context"; "sync")
+type holder struct { ctx context.Context; stop chan struct{} }
+func waitCtx(h *holder, wg *sync.WaitGroup) { defer wg.Done(); alias := h; <-alias.ctx.Done() }
+func waitStop(h *holder, wg *sync.WaitGroup) { defer wg.Done(); alias := h; select { case <-alias.stop: return } }
+`
+	cases := []struct{ body string }{
+		{`func f(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	h := &holder{}
+	alias := h
+	alias.ctx = ctx
+	var wg sync.WaitGroup
+	wg.Add(1); go waitCtx(h, &wg)
+	wg.Wait(); cancel()
+}`},
+		{`func f(parent context.Context) {
+	_ = parent
+	stop := make(chan struct{})
+	h := &holder{}
+	alias := h
+	alias.stop = stop
+	var wg sync.WaitGroup
+	wg.Add(1); go waitStop(h, &wg)
+	wg.Wait(); close(stop)
+}`},
+	}
+	for i, tc := range cases {
+		if got := rulesOnly(findings(t, hdr+tc.body)); got != "LL1005" {
+			t.Fatalf("case %d: rules = %q, want LL1005", i, got)
+		}
+	}
+}
+
+func TestStopOrder_StablePointerAliasEarlyStopIsClean(t *testing.T) {
+	src := `package p
+import "sync"
+type holder struct { stop chan struct{} }
+func f() {
+	stop := make(chan struct{})
+	h := &holder{}
+	alias := h
+	alias.stop = stop
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(){ defer wg.Done(); select { case <-h.stop: return } }()
+	close(stop)
+	wg.Wait()
+}`
+	if got := rulesOnly(findings(t, src)); got != "" {
+		t.Fatalf("rules = %q, want clean", got)
+	}
+}
+
+func TestStopOrder_StablePointerAliasRootsStayIndependent(t *testing.T) {
+	src := `package p
+import "sync"
+type holder struct { stop chan struct{} }
+func f() {
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+	h1 := &holder{}
+	h2 := &holder{}
+	a1 := h1
+	a2 := h2
+	a1.stop = stop1
+	a2.stop = stop2
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(1); go func(){ defer wg1.Done(); select { case <-h1.stop: return } }()
+	wg2.Add(1); go func(){ defer wg2.Done(); select { case <-h2.stop: return } }()
+	close(stop1); wg1.Wait()
+	wg2.Wait(); close(stop2)
+}`
+	var got []string
+	for _, d := range analyzeSource(t, src) {
+		if d.RuleID != "LL1005" {
+			continue
+		}
+		for _, g := range []string{"wg1", "wg2"} {
+			if strings.Contains(d.Message, `"`+g+`"`) {
+				got = append(got, g)
+			}
+		}
+	}
+	if strings.Join(got, ",") != "wg2" {
+		t.Fatalf("reported groups %v, want [wg2]", got)
+	}
+}
