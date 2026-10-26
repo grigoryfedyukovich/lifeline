@@ -4,7 +4,7 @@ This tutorial walks from the first build to CI integration. Commands assume the 
 
 ## 1. Build the analyzer
 
-Lifeline is a normal Go program. Its dependencies are vendored, so this build does not need network access.
+Lifeline is a normal Go program. Its dependencies are **not vendored**. The supported Go toolchain and modules may need to be downloaded on the first build; this source archive does not include `go.sum`.
 
 ```bash
 go build -o ./bin/lifeline ./cmd/lifeline

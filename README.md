@@ -4,7 +4,13 @@ Lifeline is a conservative Go static analyzer for goroutine lifecycle protocols.
 
 The same executable works as a normal command and as a `go vet` tool.
 
-New to the project? Start with the [very high-level tutorial](docs/high-level-tutorial.md), then the [step-by-step tutorial](docs/tutorial.md), then use the [runnable examples index](examples/README.md) as a protocol catalog.
+New to the project? Read the quick mental model below, continue with the [step-by-step tutorial](docs/tutorial.md), and browse the [runnable examples index](examples/README.md) as a protocol catalog.
+
+## Quick mental model
+
+A lifecycle has three parts: an **owner** creates and manages a worker, a **worker** needs a recognized way to stop (such as a context, channel signal, or returning from its loop), and an **owner** must join workers whose completion it owns. Lifeline checks a conservative subset of these obligations; it is not a leak detector or a termination proof.
+
+Use the analyzer for review, onboarding, and opt-in CI checks of lifecycle protocols. Do not treat a clean run as proof of safety when code relies on reflection, indirect interface dispatch, complex aliasing, or other unsupported behavior. See [Semantics](docs/semantics.md) and [Limitations](docs/limitations.md).
 
 ## Two-minute demo
 
@@ -36,7 +42,7 @@ examples/ignored_context/worker.go:10:2: [LL1002] goroutine has an unconditional
 
 ## Development verification
 
-The repository pins module checksums in `go.sum` and includes a checked-in GitHub Actions workflow at `.github/workflows/ci.yml`. The CI job uses the Go version declared by `go.mod` and runs module-tidiness verification, tests, `go vet`, the race detector, machine-independent algorithmic work budgets, a one-iteration scaling-benchmark smoke run, and a standalone build.
+The `Makefile` defines module-tidiness, test, vet, race, work-budget, benchmark, and build targets. **This supplied source archive does not include `go.sum` or `.github/workflows/ci.yml`**, despite older release notes describing them. Recreate and commit `go.sum` with a supported Go toolchain and normal module verification before relying on reproducible dependency checks; restore a reviewed CI workflow before claiming automated verification.
 
 Run the same core verification locally with:
 
@@ -48,7 +54,7 @@ make perfcheck
 make bench
 ```
 
-`make modcheck` uses `go mod tidy -diff`, so it reports stale `go.mod`/`go.sum` state without rewriting either file. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
+`make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. In this archive it is expected to report the missing checksum file until that file is restored. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
 
 ## Implemented rules
 
@@ -224,7 +230,7 @@ See:
 - [Runnable examples](examples/README.md)
 - [Semantics](docs/semantics.md)
 - [Architecture](docs/architecture.md)
-- [AST/CFG migration plan](docs/cfg-migration-plan.md)
+- [AST/CFG implementation phase index](docs/cfg-migration-plan.md)
 - [Limitations](docs/limitations.md)
 - [Evaluation](docs/evaluation.md)
 - [Roadmap](docs/roadmap.md)

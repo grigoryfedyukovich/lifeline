@@ -1,6 +1,6 @@
 # Code review resolution — v0.1.1
 
-This document records the disposition of the July 2026 source-verified review in [`docs/reviews/lifeline_code_review_2026-07.md`](reviews/lifeline_code_review_2026-07.md).
+This document records the disposition of the July 2026 source-verified review. The original review document (`docs/reviews/lifeline_code_review_2026-07.md`) is **not included in this source archive**; the resolution details below are retained as a historical record.
 
 All four reported bugs, all ten code smells, and all seven performance findings were addressed. The fixes intentionally preserve Lifeline's conservative warning contract rather than expanding the default rule set.
 

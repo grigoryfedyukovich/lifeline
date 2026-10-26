@@ -102,7 +102,7 @@ No new canonical performance numbers are recorded here yet. This repository targ
 
 ## Reproducible CI and module state (added 2026-10-09)
 
-The repository now checks in `go.sum` for its direct module dependencies and `.github/workflows/ci.yml` for the supported Go toolchain declared in `go.mod`. CI performs the following gates on `ubuntu-latest`:
+The October 2026 evaluation notes describe a `go.sum` and `.github/workflows/ci.yml` workflow, but **neither file is present in this source archive**. The following list describes the documented *intended* `ubuntu-latest` gates; they cannot be verified from this archive as shipped:
 
 1. `make modcheck` (`go mod tidy -diff`) so dependency metadata drift fails without rewriting files;
 2. `make check` for the ordinary test suite plus `go vet`;
