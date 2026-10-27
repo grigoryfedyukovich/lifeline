@@ -4,6 +4,7 @@ Lifeline 0.1.1 is intentionally conservative and bounded.
 
 ## Unsupported or approximate cases
 
+- A `go` statement launches its target asynchronously. A direct, helper-mediated, or field-mediated `go ...Wait()` does not join the owner's workers before the owner returns. Cancellation passed to a goroutine is a handoff. Asynchronous stop completion cannot establish stop-versus-wait order.
 - Indirect calls through interfaces, reflection, arbitrary function values, and generated dispatch are not resolved.
 - Same-package direct goroutine targets are inspected only when they are within `max_functions`.
 - Vet mode may use a compatible direct-function fact for a cross-package target. Standalone mode now computes the equivalent source-derived summaries dependency-first for requested packages and non-standard dependencies whose source is exposed by `go list`, including third-party modules, and feeds them through the same `LookupFunctionSummary`/parameter/`Done`/returned-field hooks. It also source-analyzes standard-library packages imported directly by a requested root as summary-only units. Their transitive standard-library dependencies remain export-data-only, so effects that require deeper stdlib summaries still widen conservatively and may remain unsupported rather than being silently treated as checked.

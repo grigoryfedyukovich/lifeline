@@ -150,14 +150,15 @@ type funcSource struct {
 }
 
 type builder struct {
-	ctx       context.Context
-	err       error
-	in        Input
-	cfg       config.Config
-	stats     *WorkStats
-	funcs     map[*types.Func]*ast.FuncDecl
-	analyzed  map[*types.Func]bool
-	summaries map[*types.Func]model.Goroutine
+	ctx        context.Context
+	err        error
+	in         Input
+	cfg        config.Config
+	stats      *WorkStats
+	funcs      map[*types.Func]*ast.FuncDecl
+	analyzed   map[*types.Func]bool
+	summaries  map[*types.Func]model.Goroutine
+	asyncCalls map[*ast.CallExpr]bool
 	// fieldGroupObjects memoizes a synthetic *types.Var identity for each
 	// (base local variable, group-typed field name) pair this build has
 	// seen -- e.g. w.a and w.b for `var w struct{ a, b sync.WaitGroup }`
@@ -617,6 +618,7 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 		funcs:                  map[*types.Func]*ast.FuncDecl{},
 		analyzed:               map[*types.Func]bool{},
 		summaries:              map[*types.Func]model.Goroutine{},
+		asyncCalls:             map[*ast.CallExpr]bool{},
 		fieldGroupObjects:      map[fieldGroupKey]*types.Var{},
 		fieldGroupOwners:       map[*types.Var]fieldGroupKey{},
 		paramEffects:           map[types.Object]model.ParamEffect{},
@@ -640,6 +642,12 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 		if err := ctx.Err(); err != nil {
 			return model.Program{}, err
 		}
+		b.inspect(file, func(n ast.Node) bool {
+			if launch, ok := n.(*ast.GoStmt); ok {
+				b.asyncCalls[launch.Call] = true
+			}
+			return true
+		})
 		for _, d := range file.Decls {
 			if err := ctx.Err(); err != nil {
 				return model.Program{}, err
@@ -1418,25 +1426,6 @@ func closureCallTarget(call *ast.CallExpr, info *types.Info, singleAssign map[ty
 	return closureValueTarget(call.Fun, info, singleAssign)
 }
 
-// goCallSet records the calls launched asynchronously by go statements.
-// A closure body reached through one of these calls is definitely started,
-// but its cleanup is not ordered before the owner function returns.  For a
-// captured cancel value that is an ownership transfer, not an all-path
-// discharge; for a captured join group it is not a join at all.
-func goCallSet(body *ast.BlockStmt) map[*ast.CallExpr]bool {
-	out := map[*ast.CallExpr]bool{}
-	if body == nil {
-		return out
-	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		if g, ok := n.(*ast.GoStmt); ok && g.Call != nil {
-			out[g.Call] = true
-		}
-		return true
-	})
-	return out
-}
-
 // objectReferencedInLiteral reports whether lit closes over obj.  It does
 // not treat a declaration of a same-named inner object as a capture because
 // identity comes from go/types rather than spelling.
@@ -1609,13 +1598,15 @@ func (b *builder) closureCaptureEffect(lit *ast.FuncLit, obj types.Object, kind 
 	reach := g.Reachable(g.Entry)
 	live := make([]*ast.CallExpr, 0, len(discharge))
 	for _, c := range discharge {
-		if site, ok := sites[c]; ok && reach[site.Block] {
+		if site, ok := sites[c]; ok && reach[site.Block] && !site.Async {
 			live = append(live, c)
+		} else if ok && site.Async && kind == "cancel" {
+			opaque = true
 		}
 	}
 	liveMay := false
 	for _, c := range may {
-		if site, ok := sites[c]; ok && reach[site.Block] {
+		if site, ok := sites[c]; ok && reach[site.Block] && !site.Async {
 			liveMay = true
 			break
 		}
@@ -1761,7 +1752,7 @@ func (b *builder) applyClosureInvocation(call *ast.CallExpr, lit *ast.FuncLit, a
 
 func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Object]string, cancels []*cancelState, groups []*groupState, fn *model.Function, fnObj *types.Func) {
 	b.singleAssignTargets = singleAssignmentTargets(body, b.in.Info)
-	asyncClosureCalls := goCallSet(body)
+	asyncClosureCalls := b.asyncCalls
 	// Field/constructor ownership tracking (docs/roadmap.md item 3): find
 	// every "stored struct" or "constructor" field-capture shape in body
 	// up front, before the main traversal below runs, so the generic
@@ -1840,7 +1831,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 				b.applyClosureInvocation(x, lit, asyncClosureCalls[x], cancels, groups)
 			} else {
 				b.observeClosureArgumentTransfers(x, cancels)
-				b.observeCall(x, cancels, groups)
+				b.observeCall(x, cancels, groups, asyncClosureCalls[x])
 			}
 			if b.isConfigured(x, b.startWrappers) {
 				if target := firstStartTarget(x.Args, b.in.Info); target != nil {
@@ -2164,7 +2155,7 @@ func (b *builder) paramEffectOf(body *ast.BlockStmt, g *model.CFG, sites map[*as
 	reachable := func(calls []*ast.CallExpr) []*ast.CallExpr {
 		var out []*ast.CallExpr
 		for _, c := range calls {
-			if site, ok := sites[c]; ok && reach[site.Block] {
+			if site, ok := sites[c]; ok && reach[site.Block] && !site.Async {
 				out = append(out, c)
 			}
 		}
@@ -2874,11 +2865,17 @@ func spreadArgumentContains(call *ast.CallExpr, obj types.Object, info *types.In
 	return compositeLitContainsObject(lit, obj, info)
 }
 
-func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups []*groupState) {
+func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups []*groupState, async bool) {
 	name := b.callName(call)
 	funObj := calledObject(call.Fun, b.in.Info)
 	argObjects := objectsUsedInExpressions(call.Args, b.in.Info, true)
 	for _, c := range cancels {
+		if async && c.cancelObj != nil && (funObj == c.cancelObj || hasObject(argObjects, c.cancelObj) || spreadArgumentContains(call, c.cancelObj, b.in.Info, b.singleAssignTargets)) {
+			c.binding.Escapes = true
+			c.callSites = append(c.callSites, call)
+			c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "async-transfer", Message: "cleanup is passed to a goroutine; completion is not ordered before the owner returns", Span: ptrSpan(b.span(call))})
+			continue
+		}
 		if c.cancelObj != nil && funObj == c.cancelObj {
 			c.binding.Called = true
 			c.callSites = append(c.callSites, call)
@@ -2951,16 +2948,24 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 				g.startCalls = append(g.startCalls, call)
 				g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "worker-start", Message: "worker accounting starts here", Span: ptrSpan(b.span(call))})
 			case "Wait":
-				g.group.Joined = true
-				g.waitCallSites = append(g.waitCallSites, call)
-				g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "join", Message: "group is joined here", Span: ptrSpan(b.span(call))})
+				if async {
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "async-join", Message: "asynchronous Wait does not join before the owner returns", Span: ptrSpan(b.span(call))})
+				} else {
+					g.group.Joined = true
+					g.waitCallSites = append(g.waitCallSites, call)
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "join", Message: "group is joined here", Span: ptrSpan(b.span(call))})
+				}
 			}
 		}
 		usesGroup := hasObject(argObjects, g.obj)
 		if b.hasWrapper(b.joinWrappers, name) && usesGroup {
-			g.group.Joined = true
-			g.wrapperJoinCalls = append(g.wrapperJoinCalls, call)
-			g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "join-wrapper-assumption", Message: "configured join wrapper is assumed to wait for this group when called", Span: ptrSpan(b.span(call))})
+			if async {
+				g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "async-join", Message: "asynchronous wrapper does not join before the owner returns", Span: ptrSpan(b.span(call))})
+			} else {
+				g.group.Joined = true
+				g.wrapperJoinCalls = append(g.wrapperJoinCalls, call)
+				g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "join-wrapper-assumption", Message: "configured join wrapper is assumed to wait for this group when called", Span: ptrSpan(b.span(call))})
+			}
 		}
 		if receiver != g.obj && usesGroup && !b.hasWrapper(b.joinWrappers, name) {
 			// Same Phase 5 verification as cancels above, applied to a
@@ -2996,6 +3001,10 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 				g.recCalls = append(g.recCalls, call)
 			}
 			if effect, verified, pending := b.argumentEffects(call, g.obj); verified {
+				if async && (effect.Has(model.EffectMust) || effect.Has(model.EffectMay)) {
+					g.group.Evidence = append(g.group.Evidence, model.Evidence{Kind: "async-join", Message: "asynchronous helper does not join before the owner returns", Span: ptrSpan(b.span(call))})
+					continue
+				}
 				switch {
 				case effect.Has(model.EffectMust):
 					// The callee joins on every path: a Wait for the
@@ -3966,6 +3975,20 @@ func newReceiverSummary() *receiverSummary {
 
 // merge folds o (a further method's summary, reached through a call on
 // the same receiver) into s.
+func (s *receiverSummary) mergeInvocation(o *receiverSummary, async bool) {
+	if !async {
+		s.merge(o)
+		return
+	}
+	for f := range o.called {
+		s.fieldEscaped[f] = true
+	}
+	for f := range o.fieldEscaped {
+		s.fieldEscaped[f] = true
+	}
+	s.escapes = s.escapes || o.escapes
+}
+
 func (s *receiverSummary) merge(o *receiverSummary) {
 	for f := range o.called {
 		s.called[f] = true
@@ -4338,7 +4361,7 @@ func (b *builder) classifyReceiverUse(stack []ast.Node, id *ast.Ident, sum *rece
 				sum.escapes = true
 				return low
 			}
-			sum.merge(calleeSum)
+			sum.mergeInvocation(calleeSum, b.asyncCalls[call])
 			return low
 		default:
 			sum.escapes = true
@@ -4365,7 +4388,7 @@ func (b *builder) classifyReceiverUse(stack []ast.Node, id *ast.Ident, sum *rece
 			sum.escapes = true
 			return low
 		}
-		sum.merge(calleeSum)
+		sum.mergeInvocation(calleeSum, b.asyncCalls[parent])
 		return low
 	default:
 		// Returned, passed as an argument, stored, address taken, ranged
@@ -4383,14 +4406,20 @@ func (b *builder) classifyReceiverFieldUse(stack []ast.Node, sel *ast.SelectorEx
 	field := sel.Sel.Name
 	grand := ancestor(stack, 2)
 	if call, ok := grand.(*ast.CallExpr); ok && call.Fun == ast.Expr(sel) {
-		sum.called[field] = true
+		if b.asyncCalls[call] {
+			sum.fieldEscaped[field] = true
+		} else {
+			sum.called[field] = true
+		}
 		return
 	}
 	if outer, ok := grand.(*ast.SelectorExpr); ok && outer.X == ast.Expr(sel) {
 		if call, ok := ancestor(stack, 3).(*ast.CallExpr); ok && call.Fun == ast.Expr(outer) {
 			switch outer.Sel.Name {
 			case "Wait":
-				sum.waited[field] = true
+				if !b.asyncCalls[call] {
+					sum.waited[field] = true
+				}
 				return
 			case "Add", "Go":
 				return
@@ -4414,6 +4443,13 @@ func (b *builder) classifyReceiverFieldUse(stack []ast.Node, sel *ast.SelectorEx
 // look call sites up in the CFG of the function being analyzed, which
 // only contains the caller's own nodes.
 func (b *builder) markCancelFieldConsumed(fc *fieldCapture, consumed map[*fieldCapture]bool, call *ast.CallExpr, via string) {
+	if b.asyncCalls[call] {
+		consumed[fc] = true
+		fc.cancel.binding.Escapes = true
+		fc.cancel.callSites = append(fc.cancel.callSites, call)
+		fc.cancel.binding.Evidence = append(fc.cancel.binding.Evidence, model.Evidence{Kind: "async-transfer", Message: "field cleanup is passed to another goroutine", Span: ptrSpan(b.span(call))})
+		return
+	}
 	message := fmt.Sprintf("cancellation function is called through field %q", fc.fieldName)
 	if via != "" {
 		message = fmt.Sprintf("cancellation function is called through field %q inside method %s", fc.fieldName, via)
@@ -4446,6 +4482,10 @@ func (b *builder) markGroupFieldConsumed(fc *fieldCapture, method string, consum
 		fc.group.startCalls = append(fc.group.startCalls, call)
 		fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "worker-start", Message: fmt.Sprintf("worker accounting starts here (through field %q)", fc.fieldName), Span: ptrSpan(b.span(call))})
 	case "Wait":
+		if b.asyncCalls[call] {
+			fc.group.group.Evidence = append(fc.group.group.Evidence, model.Evidence{Kind: "async-join", Message: "asynchronous field Wait does not join before the owner returns", Span: ptrSpan(b.span(call))})
+			return
+		}
 		fc.group.group.Joined = true
 		fc.group.waitCallSites = append(fc.group.waitCallSites, call)
 		message := fmt.Sprintf("group is joined here, through field %q", fc.fieldName)
@@ -6308,7 +6348,7 @@ func (b *builder) collectStopWrapperCalls(body *ast.BlockStmt) []*ast.CallExpr {
 func callSitesOf(calls []*ast.CallExpr, callSites map[*ast.CallExpr]flowgraph.CallSite) []flowgraph.CallSite {
 	var sites []flowgraph.CallSite
 	for _, call := range calls {
-		if site, ok := callSites[call]; ok {
+		if site, ok := callSites[call]; ok && !site.Async {
 			sites = append(sites, site)
 		}
 	}
@@ -6617,7 +6657,7 @@ func (b *builder) errorBranchSkipper(body *ast.BlockStmt, errObj types.Object, o
 func splitDeferred(calls []*ast.CallExpr, deferredCalls map[*ast.CallExpr]bool, sites map[*ast.CallExpr]flowgraph.CallSite) (plain, deferred []flowgraph.CallSite) {
 	for _, call := range calls {
 		site, ok := sites[call]
-		if !ok {
+		if !ok || site.Async {
 			continue
 		}
 		if deferredCalls[call] {
@@ -6695,7 +6735,7 @@ func (b *builder) computeStopOrdering(gr *groupState, cancels []*cancelState, wr
 	var waits []stopSignal // reused: a wait is a call with a place and a time
 	joinCalls := append(append(append([]*ast.CallExpr(nil), gr.waitCallSites...), gr.helperJoinCalls...), gr.wrapperJoinCalls...)
 	for _, call := range joinCalls {
-		if site, ok := callSites[call]; ok {
+		if site, ok := callSites[call]; ok && !site.Async {
 			waits = append(waits, stopSignal{call: call, site: site, deferred: deferredCalls[call]})
 		}
 	}
@@ -6806,7 +6846,7 @@ func (b *builder) stopSignalsFor(gr *groupState, cancels []*cancelState, wrapper
 	add := func(calls []*ast.CallExpr, correlation string) {
 		for _, call := range calls {
 			site, ok := callSites[call]
-			if !ok {
+			if !ok || site.Async {
 				placeable = false
 				continue
 			}

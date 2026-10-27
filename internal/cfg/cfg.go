@@ -93,6 +93,8 @@ import (
 type CallSite struct {
 	Block model.BlockID
 	Index int
+	// Async marks a launch; completion is not ordered in this graph.
+	Async bool
 }
 
 func Build(name string, fset *token.FileSet, body *ast.BlockStmt, info *types.Info, isTrustedTerminator func(*ast.CallExpr) bool) (*model.CFG, map[*ast.CallExpr]CallSite) {
@@ -337,6 +339,9 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 		b.emit("decl", x, "", nil, nil)
 	case *ast.GoStmt:
 		b.recordCall(x.Call)
+		site := b.callSites[x.Call]
+		site.Async = true
+		b.callSites[x.Call] = site
 		b.emit("go", x, calleeName(b.info, x.Call), nil, nil)
 	case *ast.DeferStmt:
 		b.recordCall(x.Call)

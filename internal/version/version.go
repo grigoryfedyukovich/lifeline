@@ -31,6 +31,7 @@ const (
 	// describe only a field shape; treating its zero-valued new fields as a
 	// real verdict would silently lose cross-package constructor obligations
 	// (audit finding F2), so old facts are rejected.
-	FactVersion = 6
+	// Version 7 rejects old facts that credit asynchronous launches as joins.
+	FactVersion = 7
 	Backend     = "local-ast-types-ssa-summary/v2"
 )
