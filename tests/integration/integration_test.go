@@ -122,6 +122,21 @@ func TestCIPolicyIsOptIn(t *testing.T) {
 	}
 }
 
+func TestCIPolicyExitCodeRange(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	for _, code := range []string{"256", "512"} {
+		out, got := run(t, root, binary, "-fail-on", "LL1002", "-ci-exit-code", code, "./examples/ignored_context")
+		if got != 2 || !strings.Contains(out, "ci_exit_code must be in 1..255") {
+			t.Fatalf("code %s: exit=%d output=%s", code, got, out)
+		}
+	}
+	out, code := run(t, root, binary, "-fail-on", "LL1002", "-ci-exit-code", "255", "./examples/ignored_context")
+	if code != 255 || !strings.Contains(out, "LL1002") {
+		t.Fatalf("boundary: exit=%d output=%s", code, out)
+	}
+}
+
 func TestMachineFormats(t *testing.T) {
 	root := repositoryRoot(t)
 	binary := buildBinary(t, root)

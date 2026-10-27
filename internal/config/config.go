@@ -107,8 +107,8 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("format must be text, json, or sarif, got %q", c.Format)
 	}
-	if c.CIExitCode <= 0 || c.CIExitCode == 2 || c.CIExitCode == 3 {
-		return errors.New("ci_exit_code must be positive and distinct from reserved exit codes 2 and 3")
+	if c.CIExitCode <= 0 || c.CIExitCode > 255 || c.CIExitCode == 2 || c.CIExitCode == 3 {
+		return errors.New("ci_exit_code must be in 1..255 and distinct from reserved exit codes 2 and 3")
 	}
 	if c.MaxFunctions <= 0 {
 		return errors.New("max_functions must be positive")

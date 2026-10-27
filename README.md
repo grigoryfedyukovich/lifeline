@@ -42,7 +42,7 @@ examples/ignored_context/worker.go:10:2: [LL1002] goroutine has an unconditional
 
 ## Development verification
 
-The `Makefile` defines module-tidiness, test, vet, race, work-budget, benchmark, and build targets. **This supplied source archive does not include `go.sum` or `.github/workflows/ci.yml`**, despite older release notes describing them. Recreate and commit `go.sum` with a supported Go toolchain and normal module verification before relying on reproducible dependency checks; restore a reviewed CI workflow before claiming automated verification.
+The `Makefile` defines module-tidiness, test, vet, race, work-budget, benchmark, and build targets. Dependency checksums are committed in `go.sum`; dependency versions remain pinned in `go.mod`. This source archive has no hosted CI workflow, so run the checks locally.
 
 Run the same core verification locally with:
 
@@ -54,7 +54,7 @@ make perfcheck
 make bench
 ```
 
-`make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. In this archive it is expected to report the missing checksum file until that file is restored. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
+`make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
 
 ## Implemented rules
 
@@ -163,7 +163,7 @@ Under `go vet`, which shows only diagnostics, the same data is available as a re
 -config PATH          explicit YAML, TOML, or JSON file
 -format FORMAT        text, json, or sarif
 -fail-on RULES        comma-separated rule IDs or all
--ci-exit-code N       policy-failure code; 2 and 3 are reserved
+-ci-exit-code N       policy-failure code in 1..255; 2 and 3 are reserved
 -fail-on-incomplete   fail when analysis was cut short by a bound or timeout, whatever the diagnostics say
 -fail-on-unsupported  fail when any part of the input was judged under an approximation
 -timeout DURATION     overall standalone timeout
