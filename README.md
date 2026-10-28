@@ -74,6 +74,7 @@ Every diagnostic includes a stable rule ID, source span, protocol, evidence, ass
 Lifeline recognizes:
 
 - standard context factories and direct cancellation calls;
+- local `var child, cancel = context.WithCancel(parent)` declarations, including grouped declarations and error-returning configured factories;
 - cancellation ownership returned, assigned, passed, or stored in a value;
 - `select` cases that receive from `ctx.Done()` and return;
 - contexts delegated to called operations;

@@ -9,7 +9,7 @@ import (
 func TestLifecycleRegressionsInStandaloneAndVet(t *testing.T) {
 	root := repositoryRoot(t)
 	binary := buildBinary(t, root)
-	for _, tc := range []struct{ pattern, rule string }{{"./tests/testdata/facts/async_consumer", "LL1003"}, {"./tests/testdata/facts/async_errgroup", "LL1004"}} {
+	for _, tc := range []struct{ pattern, rule string }{{"./tests/testdata/facts/async_consumer", "LL1003"}, {"./tests/testdata/facts/async_errgroup", "LL1004"}, {"./tests/testdata/facts/var_cancels", "LL1001"}} {
 		t.Run(tc.rule, func(t *testing.T) {
 			out, code := run(t, root, binary, "-timeout", "30s", "-fail-on", tc.rule, "-ci-exit-code", "7", tc.pattern)
 			if code != 7 || !strings.Contains(out, "["+tc.rule+"]") {

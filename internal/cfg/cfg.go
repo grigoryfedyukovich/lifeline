@@ -337,7 +337,14 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 	case *ast.SendStmt:
 		b.simpleStmt(x)
 	case *ast.DeclStmt:
-		b.emit("decl", x, "", nil, nil)
+		if decl, ok := x.Decl.(*ast.GenDecl); ok && decl.Tok == token.VAR {
+			// Specs initialize in order, so retain distinct instruction indices.
+			for _, spec := range decl.Specs {
+				b.simpleStmt(spec)
+			}
+		} else {
+			b.emit("decl", x, "", nil, nil)
+		}
 	case *ast.GoStmt:
 		b.recordCall(x.Call)
 		site := b.callSites[x.Call]
@@ -375,7 +382,7 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 	}
 }
 
-func (b *builder) simpleStmt(s ast.Stmt) {
+func (b *builder) simpleStmt(s ast.Node) {
 	b.recordDirectCalls(s)
 	if _, ok := b.findCall(s, b.isPanicCall); ok {
 		b.emit("panic", s, "panic", nil, nil)
@@ -408,6 +415,8 @@ func (b *builder) simpleStmt(s ast.Stmt) {
 	op := "stmt"
 	callee := ""
 	switch x := s.(type) {
+	case *ast.ValueSpec:
+		op = "decl"
 	case *ast.AssignStmt:
 		op = "assign"
 	case *ast.ExprStmt:
@@ -427,8 +436,14 @@ func (b *builder) simpleStmt(s ast.Stmt) {
 // turns out to be doesn't change which block it executed in, and a caller
 // asking Build's call-site map about a specific call doesn't care whether
 // internal/cfg separately decided to treat it as a trusted terminator.
-func (b *builder) recordDirectCalls(s ast.Stmt) {
+func (b *builder) recordDirectCalls(s ast.Node) {
 	switch x := s.(type) {
+	case *ast.ValueSpec:
+		for _, value := range x.Values {
+			if call, ok := value.(*ast.CallExpr); ok {
+				b.recordCall(call)
+			}
+		}
 	case *ast.ExprStmt:
 		if call, ok := x.X.(*ast.CallExpr); ok {
 			b.recordCall(call)
@@ -449,7 +464,7 @@ func (b *builder) recordDirectCalls(s ast.Stmt) {
 // already uses for the same kinds of calls (stop wrappers, context
 // delegation), so a CFG built with a trust predicate derived from that
 // mechanism recognizes exactly the same calls it does.
-func (b *builder) findCall(s ast.Stmt, predicate func(*ast.CallExpr) bool) (*ast.CallExpr, bool) {
+func (b *builder) findCall(s ast.Node, predicate func(*ast.CallExpr) bool) (*ast.CallExpr, bool) {
 	var found *ast.CallExpr
 	ast.Inspect(s, func(n ast.Node) bool {
 		if found != nil {

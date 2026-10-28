@@ -33,6 +33,7 @@ const (
 	// (audit finding F2), so old facts are rejected.
 	// Version 7 rejects old facts that credit asynchronous launches as joins.
 	// Version 8 removes impossible constant if/for edges from facts.
-	FactVersion = 8
+	// Version 9 tracks factory obligations in local var declarations.
+	FactVersion = 9
 	Backend     = "local-ast-types-ssa-summary/v2"
 )

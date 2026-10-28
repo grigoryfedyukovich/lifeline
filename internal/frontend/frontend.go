@@ -1293,11 +1293,19 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 			return false
 		}
 		switch x := n.(type) {
-		case *ast.AssignStmt:
-			if len(x.Rhs) != 1 || len(x.Lhs) < 2 {
+		case *ast.AssignStmt, *ast.ValueSpec:
+			var lhs, rhs []ast.Expr
+			var assignment *ast.AssignStmt
+			switch x := x.(type) {
+			case *ast.AssignStmt:
+				assignment, lhs, rhs = x, x.Lhs, x.Rhs
+			case *ast.ValueSpec:
+				lhs, rhs = valueSpecLHS(x), x.Values
+			}
+			if len(rhs) != 1 || len(lhs) < 2 {
 				break
 			}
-			call, ok := x.Rhs[0].(*ast.CallExpr)
+			call, ok := rhs[0].(*ast.CallExpr)
 			if !ok {
 				break
 			}
@@ -1306,15 +1314,15 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 				break
 			}
 			ctxIdx, cancelIdx := contextFactoryRoles(b.in.Info.TypeOf(call), b.contextInterface)
-			if ctxIdx == -1 || cancelIdx == -1 || ctxIdx >= len(x.Lhs) || cancelIdx >= len(x.Lhs) {
+			if ctxIdx == -1 || cancelIdx == -1 || ctxIdx >= len(lhs) || cancelIdx >= len(lhs) {
 				break // roles could not be identified by type; do not guess positionally
 			}
-			ctxID, ctxOK := x.Lhs[ctxIdx].(*ast.Ident)
-			cancelID, cancelOK := x.Lhs[cancelIdx].(*ast.Ident)
+			ctxID, ctxOK := lhs[ctxIdx].(*ast.Ident)
+			cancelID, cancelOK := lhs[cancelIdx].(*ast.Ident)
 			if !ctxOK || !cancelOK {
 				break // field/container ownership is explicit and not guessed
 			}
-			state := &cancelState{binding: model.CancelBinding{Factory: factory, Span: b.span(x)}, acquireCall: call, errObj: b.errorLHSObject(x.Lhs)}
+			state := &cancelState{binding: model.CancelBinding{Factory: factory, Span: b.span(x)}, acquireCall: call, errObj: b.errorLHSObject(lhs)}
 			if ctxID.Name != "_" {
 				state.ctxObj = b.in.Info.ObjectOf(ctxID)
 				state.binding.ContextName = ctxID.Name
@@ -1329,7 +1337,7 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 				// resource's scope and lifetime: see fixableAssignments
 				// and cancelCallableWithoutArguments (audit finding F4).
 				// Everywhere else the diagnostic stands without a fix.
-				if x.Tok == token.DEFINE && cancelCallableWithoutArguments(b.in.Info.TypeOf(call), cancelIdx) && b.fixable(fd, &fixable)[x] {
+				if assignment != nil && assignment.Tok == token.DEFINE && cancelCallableWithoutArguments(b.in.Info.TypeOf(call), cancelIdx) && b.fixable(fd, &fixable)[assignment] {
 					if allNames == nil {
 						allNames = identifierNames(fd)
 					}
@@ -1339,7 +1347,7 @@ func (b *builder) collectBindings(fd *ast.FuncDecl, contexts map[types.Object]st
 						Message: "retain and defer the cancellation function",
 						Edits: []model.FixEdit{
 							{Span: b.span(cancelID), NewText: name},
-							{Span: zeroWidthAtEnd(b.span(x)), NewText: "; defer " + name + "()"},
+							{Span: zeroWidthAtEnd(b.span(assignment)), NewText: "; defer " + name + "()"},
 						},
 					}
 				}
@@ -6465,11 +6473,23 @@ func (b *builder) errorLHSObject(lhs []ast.Expr) types.Object {
 
 // assignLHSOfCall returns the left-hand side of the assignment whose single
 // right-hand side is call, or nil if call is not assigned that way.
+func valueSpecLHS(spec *ast.ValueSpec) []ast.Expr {
+	lhs := make([]ast.Expr, len(spec.Names))
+	for i, name := range spec.Names {
+		lhs[i] = name
+	}
+	return lhs
+}
+
 func assignLHSOfCall(body *ast.BlockStmt, call *ast.CallExpr) []ast.Expr {
 	var lhs []ast.Expr
 	ast.Inspect(body, func(n ast.Node) bool {
 		if as, ok := n.(*ast.AssignStmt); ok && len(as.Rhs) == 1 && as.Rhs[0] == call {
 			lhs = as.Lhs
+			return false
+		}
+		if spec, ok := n.(*ast.ValueSpec); ok && len(spec.Values) == 1 && spec.Values[0] == call {
+			lhs = valueSpecLHS(spec)
 			return false
 		}
 		return lhs == nil
