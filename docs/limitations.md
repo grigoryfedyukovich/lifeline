@@ -4,6 +4,7 @@ Lifeline 0.1.1 is intentionally conservative and bounded.
 
 ## Unsupported or approximate cases
 
+- Boolean constant `if` and `for` conditions use only feasible edges, including named constants and typed constant expressions. Dead cleanup and transfer branches do not discharge obligations. Runtime conditions retain both alternatives, including variables named `true` or `false`; this does not add general value propagation.
 - A `go` statement launches its target asynchronously. A direct, helper-mediated, or field-mediated `go ...Wait()` does not join the owner's workers before the owner returns. Cancellation passed to a goroutine is a handoff. Asynchronous stop completion cannot establish stop-versus-wait order.
 - Indirect calls through interfaces, reflection, arbitrary function values, and generated dispatch are not resolved.
 - Same-package direct goroutine targets are inspected only when they are within `max_functions`.

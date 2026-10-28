@@ -32,6 +32,7 @@ const (
 	// real verdict would silently lose cross-package constructor obligations
 	// (audit finding F2), so old facts are rejected.
 	// Version 7 rejects old facts that credit asynchronous launches as joins.
-	FactVersion = 7
+	// Version 8 removes impossible constant if/for edges from facts.
+	FactVersion = 8
 	Backend     = "local-ast-types-ssa-summary/v2"
 )

@@ -150,15 +150,16 @@ type funcSource struct {
 }
 
 type builder struct {
-	ctx        context.Context
-	err        error
-	in         Input
-	cfg        config.Config
-	stats      *WorkStats
-	funcs      map[*types.Func]*ast.FuncDecl
-	analyzed   map[*types.Func]bool
-	summaries  map[*types.Func]model.Goroutine
-	asyncCalls map[*ast.CallExpr]bool
+	ctx          context.Context
+	err          error
+	in           Input
+	cfg          config.Config
+	stats        *WorkStats
+	funcs        map[*types.Func]*ast.FuncDecl
+	analyzed     map[*types.Func]bool
+	summaries    map[*types.Func]model.Goroutine
+	asyncCalls   map[*ast.CallExpr]bool
+	constantDead map[ast.Node]bool
 	// fieldGroupObjects memoizes a synthetic *types.Var identity for each
 	// (base local variable, group-typed field name) pair this build has
 	// seen -- e.g. w.a and w.b for `var w struct{ a, b sync.WaitGroup }`
@@ -398,6 +399,9 @@ func (b *builder) inspect(root ast.Node, visit func(ast.Node) bool) {
 	}
 	ast.Inspect(root, func(n ast.Node) bool {
 		if b.cancelled() {
+			return false
+		}
+		if b.constantDead[n] {
 			return false
 		}
 		return visit(n)
@@ -642,12 +646,7 @@ func BuildContext(ctx context.Context, in Input, cfg config.Config) (model.Progr
 		if err := ctx.Err(); err != nil {
 			return model.Program{}, err
 		}
-		b.inspect(file, func(n ast.Node) bool {
-			if launch, ok := n.(*ast.GoStmt); ok {
-				b.asyncCalls[launch.Call] = true
-			}
-			return true
-		})
+		b.indexSource(file)
 		for _, d := range file.Decls {
 			if err := ctx.Err(); err != nil {
 				return model.Program{}, err
@@ -5836,6 +5835,14 @@ func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types
 			b.walkGroupBalanceStmt(sub, obj, info, bal, scope, index)
 		}
 	case *ast.IfStmt:
+		if value, known := flowgraph.ConstantBool(x.Cond, info); known {
+			if value {
+				b.walkGroupBalanceStmt(x.Body, obj, info, bal, scope, index)
+			} else if x.Else != nil {
+				b.walkGroupBalanceStmt(x.Else, obj, info, bal, scope, index)
+			}
+			return
+		}
 		arms := []groupBalance{b.walkGroupBalanceStmts(x.Body.List, obj, info, index)}
 		if x.Else != nil {
 			// x.Else is either another *ast.BlockStmt or (for an else-if
@@ -5848,6 +5855,9 @@ func (b *builder) walkGroupBalanceStmt(s ast.Stmt, obj types.Object, info *types
 		}
 		foldConditionalArms(bal, scope, arms)
 	case *ast.ForStmt:
+		if value, known := flowgraph.ConstantBool(x.Cond, info); known && !value {
+			return
+		}
 		b.foldLoopBody(x.Body, obj, info, bal, index)
 	case *ast.RangeStmt:
 		b.foldLoopBody(x.Body, obj, info, bal, index)
@@ -8683,7 +8693,7 @@ func (b *builder) loopExitEvidence(loop *ast.ForStmt, label string, contexts map
 func (b *builder) observeLifecycleNode(n ast.Node, contexts map[types.Object]string, labels map[*ast.ForStmt]string, g *model.Goroutine) {
 	switch x := n.(type) {
 	case *ast.ForStmt:
-		if x.Cond == nil {
+		if value, known := flowgraph.ConstantBool(x.Cond, b.in.Info); x.Cond == nil || known && value {
 			g.InfiniteLoop = true
 			g.Evidence = append(g.Evidence, model.Evidence{Kind: "infinite-loop", Message: "unconditional for loop", Span: ptrSpan(b.span(x))})
 			hasReturn, contextStop, channelStop, explicitStop, loopEvidence := b.loopExitEvidence(x, labels[x], contexts)
@@ -9281,4 +9291,52 @@ func appendUnique(list []string, value string) []string {
 		}
 	}
 	return append(list, value)
+}
+
+// indexSource records all launch sites and impossible constant branches once.
+// Unreachable literals retain stable unit identities without reviving effects.
+func (b *builder) indexSource(root ast.Node) {
+	var deadStack []bool
+	ast.Inspect(root, func(n ast.Node) bool {
+		if b.cancelled() {
+			return false
+		}
+		if n == nil {
+			deadStack = deadStack[:len(deadStack)-1]
+			return true
+		}
+		dead := b.constantDead[n] || len(deadStack) > 0 && deadStack[len(deadStack)-1]
+		deadStack = append(deadStack, dead)
+		markDead := func(node ast.Node) {
+			if node == nil {
+				return
+			}
+			if b.constantDead == nil {
+				b.constantDead = make(map[ast.Node]bool)
+			}
+			b.constantDead[node] = true
+		}
+		switch x := n.(type) {
+		case *ast.GoStmt:
+			b.asyncCalls[x.Call] = true
+		case *ast.FuncLit:
+			if dead {
+				markDead(x.Body)
+			}
+		case *ast.IfStmt:
+			if value, known := flowgraph.ConstantBool(x.Cond, b.in.Info); known {
+				if value {
+					markDead(x.Else)
+				} else {
+					markDead(x.Body)
+				}
+			}
+		case *ast.ForStmt:
+			if value, known := flowgraph.ConstantBool(x.Cond, b.in.Info); known && !value {
+				markDead(x.Body)
+				markDead(x.Post)
+			}
+		}
+		return true
+	})
 }

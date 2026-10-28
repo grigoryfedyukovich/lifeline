@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 
@@ -490,7 +491,10 @@ func (b *builder) ifStmt(x *ast.IfStmt) {
 	thenBlk := b.newBlock("if-then")
 	after := b.newBlock("if-after")
 	condSpan := b.spanOf(x.Cond)
-	b.addEdge(cond, thenBlk, model.EdgeTrue, renderExpr(x.Cond), condSpan)
+	value, known := ConstantBool(x.Cond, b.info)
+	if !known || value {
+		b.addEdge(cond, thenBlk, model.EdgeTrue, renderExpr(x.Cond), condSpan)
+	}
 
 	b.current = thenBlk
 	b.stmt(x.Body, "")
@@ -500,14 +504,18 @@ func (b *builder) ifStmt(x *ast.IfStmt) {
 
 	if x.Else != nil {
 		elseBlk := b.newBlock("if-else")
-		b.addEdge(cond, elseBlk, model.EdgeFalse, "", condSpan)
+		if !known || !value {
+			b.addEdge(cond, elseBlk, model.EdgeFalse, "", condSpan)
+		}
 		b.current = elseBlk
 		b.stmt(x.Else, "")
 		if b.current != invalidBlock {
 			b.addEdge(b.current, after, model.EdgeNormal, "", model.Span{})
 		}
 	} else {
-		b.addEdge(cond, after, model.EdgeFalse, "", condSpan)
+		if !known || !value {
+			b.addEdge(cond, after, model.EdgeFalse, "", condSpan)
+		}
 	}
 	b.current = after
 }
@@ -531,8 +539,13 @@ func (b *builder) forStmt(x *ast.ForStmt, label string) {
 
 	if x.Cond != nil {
 		condSpan := b.spanOf(x.Cond)
-		b.addEdge(header, body, model.EdgeTrue, renderExpr(x.Cond), condSpan)
-		b.addEdge(header, after, model.EdgeFalse, "", condSpan)
+		value, known := ConstantBool(x.Cond, b.info)
+		if !known || value {
+			b.addEdge(header, body, model.EdgeTrue, renderExpr(x.Cond), condSpan)
+		}
+		if !known || !value {
+			b.addEdge(header, after, model.EdgeFalse, "", condSpan)
+		}
 	} else {
 		// An unconditional loop has no false-edge out of the header at all:
 		// the only way to reach `after` is an explicit break (or a return).
@@ -558,6 +571,19 @@ func (b *builder) forStmt(x *ast.ForStmt, label string) {
 	}
 	b.frames = b.frames[:len(b.frames)-1]
 	b.current = after
+}
+
+// ConstantBool uses typed values, since names true and false can be shadowed.
+// Unknown runtime conditions retain both alternatives.
+func ConstantBool(expr ast.Expr, info *types.Info) (bool, bool) {
+	if expr == nil || info == nil {
+		return false, false
+	}
+	v := info.Types[expr].Value
+	if v == nil || v.Kind() != constant.Bool {
+		return false, false
+	}
+	return constant.BoolVal(v), true
 }
 
 func (b *builder) rangeStmt(x *ast.RangeStmt, label string) {
