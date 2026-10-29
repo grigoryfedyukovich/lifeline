@@ -2,7 +2,7 @@ package version
 
 const (
 	Tool           = "lifeline"
-	Version        = "0.1.1"
+	Version        = "0.1.2"
 	InformationURI = "https://github.com/gfedyukovich/lifeline"
 	ReportSchema   = "lifeline.report/v1"
 	// FactVersion 3 (Phase 4, docs/cfg-migration-plan.md) added
@@ -34,6 +34,8 @@ const (
 	// Version 7 rejects old facts that credit asynchronous launches as joins.
 	// Version 8 removes impossible constant if/for edges from facts.
 	// Version 9 tracks factory obligations in local var declarations.
-	FactVersion = 9
+	// Version 10 anchors direct return-expression calls, including return
+	// g.Wait(), so effect and all-path summaries include their execution.
+	FactVersion = 10
 	Backend     = "local-ast-types-ssa-summary/v2"
 )

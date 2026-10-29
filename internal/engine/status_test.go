@@ -99,12 +99,12 @@ func TestStatus_SeparatesBoundedIncompletenessFromSemanticGaps(t *testing.T) {
 		Functions: []model.Function{{
 			Name: "example.test/p.f",
 			Cancels: []model.CancelBinding{
-				{Factory: "context.WithCancel", Escapes: true},                        // handed off, nothing else known
-				{Factory: "context.WithCancel", Called: true, Escapes: true},          // verified and also returned: not approximated
-				{Factory: "context.WithCancel", Called: true},                         // discharged, all-paths unestablished
-				{Factory: "context.WithCancel", Called: true, CalledOnAllPaths: &yes}, // fully verified
+				{Factory: "context.WithCancel", Escapes: true},                                       // handed off, nothing else known
+				{Factory: "context.WithCancel", Called: true, Escapes: true, CalledOnAllPaths: &yes}, // verified and also returned
+				{Factory: "context.WithCancel", Called: true},                                        // discharged, all-paths unestablished
+				{Factory: "context.WithCancel", Called: true, CalledOnAllPaths: &yes},                // fully verified
 			},
-			Groups:     []model.JoinGroup{{Kind: "waitgroup", Name: "wg", Starts: 1, Joined: true, Escapes: true}},
+			Groups:     []model.JoinGroup{{Kind: "waitgroup", Name: "wg", Starts: 1, Joined: true, Escapes: true, JoinedOnAllPaths: &yes}},
 			Goroutines: []model.Goroutine{{Evidence: []model.Evidence{{Kind: "unsupported", Message: "target not statically identifiable"}}}},
 		}},
 	}

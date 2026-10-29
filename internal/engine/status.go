@@ -122,14 +122,12 @@ func StatusOf(program model.Program, assumptions []string) Status {
 		})
 	}
 	for _, fn := range program.Functions {
-		// A binding counts as handed off only when the hand-off is all the
-		// evidence there is: Escapes is also set by an ordinary verified
-		// discharge that happens to sit in a return statement
-		// (`return g.Wait()`), and counting that would make a properly joined
-		// group look approximated.
+		// A partial or unestablished discharge cannot verify the paths on
+		// which ownership escapes. Only an all-path discharge, or a handoff
+		// whose callers were checked, removes that approximation.
 		for _, c := range fn.Cancels {
 			switch {
-			case c.Escapes && !c.Called && !verifiedHandOff(c.Evidence):
+			case c.Escapes && !dischargedOnAllPaths(c.Called, c.CalledOnAllPaths) && !verifiedHandOff(c.Evidence):
 				st.Unsupported.HandedOff++
 			case c.Called && c.CalledOnAllPaths == nil && !c.Escapes:
 				st.Unsupported.UnestablishedPathChecks++
@@ -137,7 +135,7 @@ func StatusOf(program model.Program, assumptions []string) Status {
 		}
 		for _, g := range fn.Groups {
 			switch {
-			case g.Escapes && !g.Joined && !verifiedHandOff(g.Evidence):
+			case g.Escapes && !dischargedOnAllPaths(g.Joined, g.JoinedOnAllPaths) && !verifiedHandOff(g.Evidence):
 				st.Unsupported.HandedOff++
 			case g.Joined && g.JoinedOnAllPaths == nil && !g.Escapes:
 				st.Unsupported.UnestablishedPathChecks++
@@ -155,6 +153,10 @@ func StatusOf(program model.Program, assumptions []string) Status {
 // verifiedHandOff reports whether the evidence records a hand-off to callers
 // that this package checks at their own call sites (recordReturnedField's
 // ownership-transfer note), as opposed to one that is merely assumed.
+func dischargedOnAllPaths(observed bool, allPaths *bool) bool {
+	return observed && allPaths != nil && *allPaths
+}
+
 func verifiedHandOff(evidence []model.Evidence) bool {
 	for _, e := range evidence {
 		if e.Kind == "ownership-transfer" && strings.Contains(e.Message, "checked at its own call site") {

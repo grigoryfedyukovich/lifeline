@@ -369,6 +369,11 @@ func (b *builder) stmt(s ast.Stmt, pendingLabel string) {
 	case *ast.SelectStmt:
 		b.selectStmt(x, pendingLabel)
 	case *ast.ReturnStmt:
+		for _, result := range x.Results {
+			if call, ok := ast.Unparen(result).(*ast.CallExpr); ok {
+				b.recordCall(call)
+			}
+		}
 		b.emit("return", x, "", nil, nil)
 		b.addEdge(b.ensureCurrent(), b.exit, model.EdgeReturn, "", b.spanOf(x))
 		b.current = invalidBlock
