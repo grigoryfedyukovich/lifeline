@@ -1,18 +1,17 @@
-package main
+package example
 
 import "context"
 
-type Worker struct { cancel context.CancelFunc }
+type Worker struct{ cancel context.CancelFunc }
 
 func NewWorker() *Worker {
-    _, cancel := context.WithCancel(context.Background())
-    return &Worker{cancel: cancel}
+	_, cancel := context.WithCancel(context.Background())
+	return &Worker{cancel: cancel}
 }
 
 func Start(flag bool) {
-    w := NewWorker()
-    if flag {
-        w.cancel()
-    }
+	w := NewWorker()
+	if flag {
+		w.cancel()
+	}
 }
-

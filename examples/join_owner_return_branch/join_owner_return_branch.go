@@ -13,5 +13,5 @@ func Start(fail bool) error {
 	return nil
 }
 
-func work() {}
+func work()           {}
 func errValue() error { return nil }

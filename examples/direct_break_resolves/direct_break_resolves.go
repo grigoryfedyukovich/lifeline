@@ -11,5 +11,5 @@ func Start() {
 	}()
 }
 
-func work() {}
+func work()            {}
 func shouldStop() bool { return false }

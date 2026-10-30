@@ -8,11 +8,9 @@
 // "does this body contain a return/break/select-with-ctx.Done() anywhere"
 // booleans the way internal/frontend's lifecycle summaries do today.
 //
-// Building a CFG does not by itself change any diagnostic: nothing in the
-// existing rule engine consumes this package yet. It exists to be dumped,
-// inspected, and tested against real code first, so that a subsequent pass
-// can migrate specific rules (starting with LL1002) onto it deliberately,
-// with the graph's correctness already established independently.
+// The rule engine consumes these graphs for LL1002 reachability/SCC checks,
+// while frontend ownership checks use structural graphs for acquisition,
+// discharge, and stop/join ordering. Graphs can also be dumped for inspection.
 package cfg
 
 import (

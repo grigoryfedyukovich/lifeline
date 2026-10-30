@@ -6471,8 +6471,7 @@ func (b *builder) errorLHSObject(lhs []ast.Expr) types.Object {
 	return found
 }
 
-// assignLHSOfCall returns the left-hand side of the assignment whose single
-// right-hand side is call, or nil if call is not assigned that way.
+// valueSpecLHS exposes declaration identifiers in the same form as assignment targets.
 func valueSpecLHS(spec *ast.ValueSpec) []ast.Expr {
 	lhs := make([]ast.Expr, len(spec.Names))
 	for i, name := range spec.Names {
@@ -6481,6 +6480,7 @@ func valueSpecLHS(spec *ast.ValueSpec) []ast.Expr {
 	return lhs
 }
 
+// assignLHSOfCall finds assignment or var-declaration targets for a direct call.
 func assignLHSOfCall(body *ast.BlockStmt, call *ast.CallExpr) []ast.Expr {
 	var lhs []ast.Expr
 	ast.Inspect(body, func(n ast.Node) bool {

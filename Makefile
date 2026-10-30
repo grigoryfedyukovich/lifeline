@@ -3,6 +3,7 @@
 all: check build
 
 build:
+	go build ./...
 	mkdir -p bin
 	go build -o bin/lifeline ./cmd/lifeline
 
@@ -21,7 +22,7 @@ perfcheck:
 modcheck:
 	go mod tidy -diff
 
-ci: modcheck check race perfcheck
+ci: modcheck check race perfcheck build
 	go test -run '^$$' -bench 'BenchmarkBuild' -benchtime=1x ./internal/frontend
 
 check: test

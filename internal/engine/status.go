@@ -150,13 +150,12 @@ func StatusOf(program model.Program, assumptions []string) Status {
 	return st
 }
 
-// verifiedHandOff reports whether the evidence records a hand-off to callers
-// that this package checks at their own call sites (recordReturnedField's
-// ownership-transfer note), as opposed to one that is merely assumed.
 func dischargedOnAllPaths(observed bool, allPaths *bool) bool {
 	return observed && allPaths != nil && *allPaths
 }
 
+// verifiedHandOff reports whether the evidence records a transfer whose
+// callers were checked, rather than an assumed ownership handoff.
 func verifiedHandOff(evidence []model.Evidence) bool {
 	for _, e := range evidence {
 		if e.Kind == "ownership-transfer" && strings.Contains(e.Message, "checked at its own call site") {

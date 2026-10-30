@@ -2,7 +2,7 @@ package main
 
 import "context"
 
-type worker struct { cancel context.CancelFunc }
+type worker struct{ cancel context.CancelFunc }
 
 func newWorker() worker {
 	_, cancel := context.WithCancel(context.Background())
