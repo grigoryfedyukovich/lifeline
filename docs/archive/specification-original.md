@@ -1,5 +1,7 @@
 # Lifeline — Functional Specification
 
+> **Archived record.** This is the original project brief, kept for history. The authoritative specification is [`../specification.md`](../specification.md); it differs from this brief in places (for example, this brief proposes a `.github/workflows/` layout that this archive does not contain).
+
 **Primary language:** Go  
 **Category:** Goroutine lifecycle analyzer  
 **Suggested repository name:** `lifeline`

@@ -7,7 +7,7 @@ Lifeline emits:
 - `WARNING`: the modeled program contains a recognized lifecycle protocol with a missing element;
 - `UNKNOWN`: a configured function bound or standalone timeout prevents a complete pass.
 
-Unsupported direct targets are explicit in the internal model and are never counted as termination evidence. Version 0.1.1 does not yet emit a separate user-visible unsupported verdict; that visibility gap is tracked in the validated specification and roadmap.
+Unsupported direct targets are explicit in the internal model and are never counted as termination evidence. They are not a diagnostic or verdict of their own: they are reported as coverage information (`coverage.unsupported_targets`, `status.unsupported`) beside the diagnostics. See [Limitations](limitations.md).
 
 No diagnostic is a proof that a goroutine leaks or fails to terminate. Evidence says that a local, supported stop/join protocol was not found.
 

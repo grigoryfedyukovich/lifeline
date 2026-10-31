@@ -1,5 +1,7 @@
 # Original specification validation
 
+> **Archived record.** Point-in-time validation of Lifeline 0.1.1 (2026-07-17) against the original brief. Statuses here are not updated for later releases; see [`../specification.md`](../specification.md) and [`../limitations.md`](../limitations.md) for current behavior.
+
 **Validated against:** [`specification-original.md`](specification-original.md)  
 **Implementation:** Lifeline 0.1.1  
 **Validation date:** 2026-07-17

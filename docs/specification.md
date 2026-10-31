@@ -1,13 +1,13 @@
 # Lifeline — validated implementation specification
 
-**Specification version:** 0.1.1  
+**Specification version:** 0.1.2  
 **Primary language:** Go 1.25+  
 **Category:** conservative goroutine lifecycle analyzer  
 **Report schema:** `lifeline.report/v1`  
-**Fact schema:** version 3  
+**Fact schema:** version 10 (`internal/version.FactVersion`)  
 **Backend:** `local-ast-types-ssa-summary/v2`
 
-This is the authoritative specification for the implemented repository. The original project brief is retained as [`specification-original.md`](specification-original.md), and its requirement-by-requirement validation is recorded in [`spec-validation.md`](spec-validation.md).
+This is the authoritative specification for the implemented repository. The original project brief is retained as [`archive/specification-original.md`](archive/specification-original.md), and its requirement-by-requirement validation is recorded in [`archive/spec-validation.md`](archive/spec-validation.md).
 
 ## 1. Purpose
 
@@ -79,7 +79,7 @@ Vet mode follows the normal `go vet` diagnostic exit convention.
 For verified channel-close correlation, Lifeline follows direct local channel variables, simple local aliases, explicit nested local struct-field selector paths (including promoted embedded fields, expanded to their concrete go/types field chain), and compile-time indices into local fixed-size arrays on both the worker receive and owner `close(...)` sides. Nested keyed/unkeyed composites, direct nested field/array-element assignment, local whole-value struct/array copies, pointers to local arrays, and visible same-package named-worker arguments are mapped to the same canonical local source. A local pointer alias such as `alias := holder` is also canonicalized to the same struct/array storage root when both pointer variables are stable (assigned at most once); mutations through either spelling therefore update the same context/channel field identity. If either pointer is reassigned, Lifeline deliberately stops unifying the roots. It does not treat ordinary data receives as termination evidence. Visible same-package helper functions are followed for close-dependent channel receives, and an owner-side helper call counts as a stop signal only when the helper is proven to close that channel parameter on every normal return path. Dynamic indices, slices/maps, mutable/general heap aliases, callbacks, and otherwise opaque helper shapes withhold `LL1005` rather than guessing.
 | `LL9001` | `UNKNOWN` | `max_functions` or the standalone timeout makes analysis incomplete. Hiding it does not change `status.incomplete`. |
 
-An unsupported direct target is retained as `unsupported` model evidence and is never interpreted as a successful termination proof. Version 0.1.1 does not emit a separate user-visible unsupported diagnostic; this remaining specification gap is tracked in the roadmap.
+An unsupported direct target is retained as `unsupported` model evidence and is never interpreted as a successful termination proof. Unsupported targets are surfaced as non-diagnostic coverage information (text output lists them under a clean result; JSON/SARIF carry `coverage.unsupported_targets` and `status.unsupported`) rather than as a rule diagnostic; see [limitations](limitations.md).
 
 ## 7. Recognized lifecycle evidence
 
@@ -137,10 +137,10 @@ Stop-signal recognition is correlated per group to the workers that group starts
 - `internal/cfg` builds a parser-independent control-flow graph from the same typed AST, dumpable via `-dump cfg`. `internal/frontend` attaches one to each goroutine body, and `internal/engine` consumes it for `LL1002`'s verdict (`docs/architecture.md`) via `model.CFG`'s own graph algorithms, without importing `go/ast`/`go/types` itself.
 - `internal/model.Solve` is a generic forward-dataflow worklist solver over a CFG; `internal/engine`'s `StopCapability`/`JoinObligation`/`Ownership` lattices are built on it (`docs/cfg-migration-plan.md` Phase 3, `docs/architecture.md`), dumpable via `-dump facts`. Only `StopCapability` is wired to real goroutines as of this release; no diagnostic rule reads a dataflow result yet.
 - `internal/engine` imports neither `go/ast` nor `go/types`.
-- Vet mode exports and imports versioned object facts for named function lifecycle summaries. As of fact schema version 3 (Phase 4, `docs/cfg-migration-plan.md`), the exported fact includes a CFG/SCC-derived `LoopUnresolved` verdict alongside the prior flat booleans, so a cross-package `LL1002` target gets the same precision a same-package or closure target has from `internal/cfg`/`internal/engine`. An incompatible fact version is unavailable, not reinterpreted. Standalone mode computes equivalent in-memory summaries for requested packages and non-standard source dependencies (including third-party modules exposed by `go list`), dependency-first, and also source-summarizes standard-library packages imported directly by requested roots. Those summaries are supplied through the same frontend `Lookup*` interfaces; transitive stdlib packages remain summary-unavailable and conservative.
+- Vet mode exports and imports versioned object facts for named function lifecycle summaries. Since fact schema version 3 (Phase 4, `docs/cfg-migration-plan.md`; the current version is 10, see `internal/version`), the exported fact includes a CFG/SCC-derived `LoopUnresolved` verdict alongside the prior flat booleans, so a cross-package `LL1002` target gets the same precision a same-package or closure target has from `internal/cfg`/`internal/engine`. An incompatible fact version is unavailable, not reinterpreted. Standalone mode computes equivalent in-memory summaries for requested packages and non-standard source dependencies (including third-party modules exposed by `go list`), dependency-first, and also source-summarizes standard-library packages imported directly by requested roots. Those summaries are supplied through the same frontend `Lookup*` interfaces; transitive stdlib packages remain summary-unavailable and conservative.
 - Rendering is isolated in `internal/report`.
 
-There is no Lifeline-managed persistent result cache in v0.1.1. If one is introduced, its key must include the tool and fact versions, Go toolchain/build configuration, source and dependency digests, effective configuration, and backend mode.
+There is no Lifeline-managed persistent result cache in v0.1.2. If one is introduced, its key must include the tool and fact versions, Go toolchain/build configuration, source and dependency digests, effective configuration, and backend mode.
 
 ## 9. Configuration
 

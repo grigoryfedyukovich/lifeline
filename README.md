@@ -39,23 +39,6 @@ examples/ignored_context/worker.go:10:2: [LL1002] goroutine has an unconditional
   model: local-ast-types-ssa-summary/v2; max_functions=10000; timeout=5s
 ```
 
-
-## Development verification
-
-The `Makefile` defines module-tidiness, test, vet, race, work-budget, benchmark, and build targets. Dependency checksums are committed in `go.sum`; dependency versions remain pinned in `go.mod`. This source archive has no hosted CI workflow, so run the checks locally.
-
-Run the same core verification locally with:
-
-```bash
-make modcheck
-make check
-make race
-make perfcheck
-make bench
-```
-
-`make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
-
 ## Implemented rules
 
 | Rule | Meaning |
@@ -214,19 +197,23 @@ Every emitted fix is applied to source and type-checked in the test suite (`inte
 
 ## Development
 
+Dependency versions are pinned in `go.mod`. This source archive contains neither a `go.sum` nor a hosted CI workflow: run `go mod tidy` (or `go mod download`) once to generate `go.sum`, and run the checks locally. Dependencies are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
+
+The `Makefile` defines module-tidiness, test, vet, race, work-budget, benchmark, and build targets. Run the core verification with:
+
 ```bash
-go test ./...
-go build ./cmd/lifeline
+make modcheck
+make check
+make race
+make perfcheck
 make bench
 ```
 
-Dependencies needed by the analyzer driver are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
+`make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
 
 See:
 
 - [Validated specification](docs/specification.md)
-- [Original-spec validation](docs/spec-validation.md)
-- [Review resolution](docs/review-resolution.md)
 - [Tutorial](docs/tutorial.md)
 - [Runnable examples](examples/README.md)
 - [Semantics](docs/semantics.md)
@@ -235,3 +222,4 @@ See:
 - [Limitations](docs/limitations.md)
 - [Evaluation](docs/evaluation.md)
 - [Roadmap](docs/roadmap.md)
+- Archived history: [original specification](docs/archive/specification-original.md), [original-spec validation](docs/archive/spec-validation.md), [review resolution](docs/archive/review-resolution.md)

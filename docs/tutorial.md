@@ -14,7 +14,7 @@ go build -o ./bin/lifeline ./cmd/lifeline
 A successful version command has this shape:
 
 ```text
-lifeline 0.1.1 (local-ast-types-ssa-summary/v2)
+lifeline 0.1.2 (local-ast-types-ssa-summary/v2)
 ```
 
 You can also install it into `GOBIN`:
@@ -218,7 +218,7 @@ Lifeline accepts this bounded pattern:
 ./bin/lifeline ./examples/channel_shutdown
 ```
 
-Version 0.1.1 does not prove that any reachable owner actually closes the channel. This remains an explicit limitation of the modeled trust boundary.
+Lifeline does not prove that any reachable owner actually closes the channel. This remains an explicit limitation of the modeled trust boundary.
 
 ## 7. Declare a project-specific context wrapper
 
@@ -318,7 +318,7 @@ Run with that configuration:
   ./examples/custom_start_wrapper
 ```
 
-Lifeline now inspects the function literal passed to `Launch` and reports `LL1002` for its unconditional loop. Version 0.1.1 inspects configured start wrappers only when a function literal is directly present in the argument list.
+Lifeline now inspects the function literal passed to `Launch` and reports `LL1002` for its unconditional loop. Lifeline inspects configured start wrappers only when a function literal is directly present in the argument list.
 
 ## 8. Analyze a real module
 
