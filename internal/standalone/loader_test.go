@@ -435,8 +435,19 @@ func Leak(parent context.Context) {
 	if len(loaded.AnalysisFiles) != 1 {
 		t.Fatalf("analysis files = %d, want translated user cgo source only", len(loaded.AnalysisFiles))
 	}
-	if got := filepath.Clean(loaded.Fset.Position(loaded.AnalysisFiles[0].Package).Filename); got != filepath.Join(dir, "p", "cgo.go") {
-		t.Fatalf("translated cgo source maps to %q, want original cgo.go", got)
+	// cgo may canonicalize symlinks in the temporary directory (for example,
+	// /var -> /private/var on macOS). Verify file identity rather than spelling.
+	gotPath := loaded.Fset.Position(loaded.AnalysisFiles[0].Package).Filename
+	gotFile, err := os.Stat(gotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFile, err := os.Stat(filepath.Join(dir, "p", "cgo.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(gotFile, wantFile) {
+		t.Fatalf("translated cgo source maps to %q, want original cgo.go", gotPath)
 	}
 	if frontend.IsGeneratedFile(loaded.AnalysisFiles[0]) {
 		t.Fatal("cmd/cgo translation marker was not removed from analysis source")

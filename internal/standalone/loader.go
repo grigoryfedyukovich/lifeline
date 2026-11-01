@@ -871,6 +871,14 @@ func selectAnalysisRoots(packages []listedPackage, includeTests bool) []listedPa
 }
 
 func listPackages(ctx context.Context, patterns []string, includeTests bool) ([]listedPackage, error) {
+	// Patterns are operands, never go command flags. Reject leading dashes
+	// before starting go so invalid input cannot execute tools or be silently
+	// discarded as a source-less error record under go list -e.
+	for _, pattern := range patterns {
+		if strings.HasPrefix(pattern, "-") {
+			return nil, fmt.Errorf("invalid package pattern %q: must not start with '-'", pattern)
+		}
+	}
 	args := []string{"list", "-deps", "-compiled"}
 	if includeTests {
 		// Asking go list for the test graph is essential: same-package tests can
@@ -880,7 +888,7 @@ func listPackages(ctx context.Context, patterns []string, includeTests bool) ([]
 		// map and cannot represent external tests at all.
 		args = append(args, "-test")
 	}
-	args = append(args, "-export", "-json", "-e")
+	args = append(args, "-export", "-json", "-e", "--")
 	args = append(args, patterns...)
 
 	// Decode directly from go list's stdout pipe instead of first retaining the
