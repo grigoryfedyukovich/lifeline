@@ -1,0 +1,3 @@
+schema_version: 1
+join_wrappers:
+  - github.com/gfedyukovich/lifeline/examples/stop_join_wrapper_early.Join

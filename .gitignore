@@ -1,0 +1,5 @@
+/bin/
+*txt
+*.sarif
+lifeline.json
+.DS_Store

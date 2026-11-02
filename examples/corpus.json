@@ -1,0 +1,252 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "var_cancel_lost",
+      "feature": "Cancellation acquired by a local var declaration",
+      "commits": [
+        "2219d4a"
+      ],
+      "rules": [
+        "LL1001"
+      ]
+    },
+    {
+      "name": "var_cancel_deferred",
+      "feature": "Cancellation acquired by a local var declaration",
+      "commits": [
+        "2219d4a"
+      ],
+      "rules": []
+    },
+    {
+      "name": "constant_dead_exit",
+      "feature": "Typed constant conditions determine reachable loop exits",
+      "commits": [
+        "da89f32"
+      ],
+      "rules": [
+        "LL1002"
+      ]
+    },
+    {
+      "name": "constant_live_exit",
+      "feature": "Typed constant conditions determine reachable loop exits",
+      "commits": [
+        "da89f32"
+      ],
+      "rules": []
+    },
+    {
+      "name": "constant_dead_cancel",
+      "feature": "Dead constant branches cannot discharge cancellation",
+      "commits": [
+        "da89f32"
+      ],
+      "rules": [
+        "LL1001"
+      ]
+    },
+    {
+      "name": "constant_live_cancel",
+      "feature": "Dead constant branches cannot discharge cancellation",
+      "commits": [
+        "da89f32"
+      ],
+      "rules": []
+    },
+    {
+      "name": "join_helper_async",
+      "feature": "An asynchronous helper wait does not join the owner",
+      "commits": [
+        "892599f"
+      ],
+      "rules": [
+        "LL1003"
+      ]
+    },
+    {
+      "name": "join_helper_owner",
+      "feature": "An asynchronous helper wait does not join the owner",
+      "commits": [
+        "892599f"
+      ],
+      "rules": []
+    },
+    {
+      "name": "closure_cancel_uninvoked",
+      "feature": "Captured cleanup takes effect at invocation, not definition",
+      "commits": [
+        "6919920"
+      ],
+      "rules": [
+        "LL1001"
+      ]
+    },
+    {
+      "name": "closure_cancel_invoked",
+      "feature": "Captured cleanup takes effect at invocation, not definition",
+      "commits": [
+        "6919920"
+      ],
+      "rules": []
+    },
+    {
+      "name": "nested_goroutine_loop",
+      "feature": "B1: only the inner goroutine owns its infinite loop",
+      "commits": [],
+      "rules": [
+        "LL1002"
+      ]
+    },
+    {
+      "name": "nested_goroutine_stop",
+      "feature": "B1: a reachable inner stop cannot resolve the outer loop",
+      "commits": [],
+      "rules": [
+        "LL1002"
+      ]
+    },
+    {
+      "name": "stop_promoted_context_late",
+      "feature": "Stop-before-wait through promoted context",
+      "commits": [
+        "da5a014"
+      ],
+      "rules": [
+        "LL1005"
+      ]
+    },
+    {
+      "name": "stop_promoted_context_early",
+      "feature": "Stop-before-wait through promoted context",
+      "commits": [
+        "da5a014"
+      ],
+      "rules": []
+    },
+    {
+      "name": "stop_pointer_alias_late",
+      "feature": "Stop-before-wait through pointer alias",
+      "commits": [
+        "efa4285"
+      ],
+      "rules": [
+        "LL1005"
+      ]
+    },
+    {
+      "name": "stop_pointer_alias_early",
+      "feature": "Stop-before-wait through pointer alias",
+      "commits": [
+        "efa4285"
+      ],
+      "rules": []
+    },
+    {
+      "name": "stop_array_channel_late",
+      "feature": "Stop-before-wait through array channel",
+      "commits": [
+        "b263883"
+      ],
+      "rules": [
+        "LL1005"
+      ]
+    },
+    {
+      "name": "stop_array_channel_early",
+      "feature": "Stop-before-wait through array channel",
+      "commits": [
+        "b263883"
+      ],
+      "rules": []
+    },
+    {
+      "name": "stop_context_helper_late",
+      "feature": "Stop-before-wait through context helper",
+      "commits": [
+        "fb2ebbb",
+        "7216e45"
+      ],
+      "rules": [
+        "LL1005"
+      ]
+    },
+    {
+      "name": "stop_context_helper_early",
+      "feature": "Stop-before-wait through context helper",
+      "commits": [
+        "fb2ebbb",
+        "7216e45"
+      ],
+      "rules": []
+    },
+    {
+      "name": "stop_join_helper_late",
+      "feature": "Stop-before-wait through join helper",
+      "commits": [
+        "9e2e80c"
+      ],
+      "rules": [
+        "LL1005"
+      ]
+    },
+    {
+      "name": "stop_join_helper_early",
+      "feature": "Stop-before-wait through join helper",
+      "commits": [
+        "9e2e80c"
+      ],
+      "rules": []
+    },
+    {
+      "name": "stop_join_wrapper_late",
+      "feature": "Stop-before-wait through join wrapper",
+      "commits": [
+        "1cb4f3f"
+      ],
+      "rules": [
+        "LL1005"
+      ]
+    },
+    {
+      "name": "stop_join_wrapper_early",
+      "feature": "Stop-before-wait through join wrapper",
+      "commits": [
+        "1cb4f3f"
+      ],
+      "rules": []
+    },
+    {
+      "name": "handoff_partial",
+      "feature": "Partial cleanup must retain unsupported ownership-transfer status",
+      "commits": [
+        "10ea4da"
+      ],
+      "rules": [],
+      "handed_off": 1
+    },
+    {
+      "name": "handoff_verified",
+      "feature": "Partial cleanup must retain unsupported ownership-transfer status",
+      "commits": [
+        "10ea4da"
+      ],
+      "rules": [],
+      "handed_off": 0
+    },
+    {
+      "name": "cross_package_constructor_callers",
+      "feature": "Imported constructor obligations are attributed to each caller independently",
+      "commits": [
+        "6eb8d85"
+      ],
+      "rules": [
+        "LL1001"
+      ],
+      "functions": [
+        "Bad"
+      ]
+    }
+  ]
+}

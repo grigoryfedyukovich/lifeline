@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Record toolchain
+        run: go version
+
+      - name: Verify module files are tidy
+        run: make modcheck
+
+      - name: Run tests and vet
+        run: make check
+
+      - name: Run race detector
+        run: make race
+
+      - name: Check algorithmic work budgets
+        run: make perfcheck
+
+      - name: Smoke scaling benchmarks
+        run: go test -run '^$' -bench 'BenchmarkBuild' -benchtime=1x ./internal/frontend
+
+      - name: Build standalone binary
+        run: make build
