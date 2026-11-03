@@ -74,12 +74,17 @@ type joinFacts struct {
 // exists to make Phase 3's dataflow output inspectable and independently
 // verifiable, not to report findings. It applies no ignore_paths/
 // generated-file filtering, matching dumpCFGs' precedent.
-func dumpFacts(ctx context.Context, patterns []string, cfg config.Config, format string, w io.Writer) error {
+func dumpFacts(parent context.Context, patterns []string, cfg config.Config, format string, w io.Writer) error {
 	cwd, _ := os.Getwd()
-	packages, err := listPackages(ctx, patterns, cfg.IncludeTests)
+	packages, err := listPackages(parent, patterns, cfg.IncludeTests)
 	if err != nil {
 		return err
 	}
+	ctx, cancel, err := analysisContext(parent, cfg)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 	exports := map[string]string{}
 	for _, p := range packages {
 		if p.Export != "" {

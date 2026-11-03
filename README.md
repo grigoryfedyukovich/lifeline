@@ -139,7 +139,7 @@ status.assumptions         what the results rest on
 
 Policy on the status is separate from `fail_on`: `-fail-on-incomplete` (`fail_on_incomplete: true`) and `-fail-on-unsupported` (`fail_on_unsupported: true`) fail with `ci_exit_code` based on the status alone, so ignoring `LL9001` cannot be used to pass an incomplete run.
 
-Under `go vet`, which shows only diagnostics, the same data is available as a result and as a companion file: pass `-lifeline.status-out=PATH` and each analyzed package appends one JSON line (`package`, `coverage`, `status`). The analyzer also returns that record (`*analyzer.Result`) as its result, for drivers that consume analyzer results. `-lifeline.timeout=DURATION` is enforced as a cooperative per-package frontend deadline; the standalone `-timeout` remains an overall deadline across the selected roots.
+Under `go vet`, which shows only diagnostics, the same data is available as a result and as a companion file: pass `-lifeline.status-out=PATH` and each analyzed package appends one JSON line (`package`, `coverage`, `status`). The analyzer also returns that record (`*analyzer.Result`) as its result, for drivers that consume analyzer results. `-lifeline.timeout=DURATION` is enforced as a cooperative per-package frontend deadline. The standalone `-timeout` begins after `go list` package discovery completes and applies across loading and analysis of the selected roots, so a cold Go build cache does not consume the analysis budget.
 
 ## Command line
 
@@ -150,7 +150,7 @@ Under `go vet`, which shows only diagnostics, the same data is available as a re
 -ci-exit-code N       policy-failure code in 1..255; 2 and 3 are reserved
 -fail-on-incomplete   fail when analysis was cut short by a bound or timeout, whatever the diagnostics say
 -fail-on-unsupported  fail when any part of the input was judged under an approximation
--timeout DURATION     overall standalone timeout
+-timeout DURATION     analysis timeout across selected roots, starting after package discovery
 -max-functions N      per-package analysis bound
 -tests                include package tests, including external package_test files
 -print-config         print effective configuration

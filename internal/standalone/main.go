@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/gfedyukovich/lifeline/internal/config"
 	"github.com/gfedyukovich/lifeline/internal/engine"
@@ -55,7 +54,7 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 	fs.IntVar(&opts.ciExitCode, "ci-exit-code", 0, "exit code used when a fail policy matches")
 	fs.BoolVar(&opts.failIncompl, "fail-on-incomplete", false, "fail when analysis was cut short by a bound or timeout, whatever the diagnostics say")
 	fs.BoolVar(&opts.failUnsupp, "fail-on-unsupported", false, "fail when any part of the input was judged under an approximation (see status.unsupported)")
-	fs.StringVar(&opts.timeout, "timeout", "", "overall analysis timeout")
+	fs.StringVar(&opts.timeout, "timeout", "", "analysis timeout across selected roots, starting after package discovery")
 	fs.IntVar(&opts.maxFunctions, "max-functions", 0, "maximum functions analyzed per package")
 	fs.BoolVar(&opts.includeTests, "tests", false, "include package tests, including external package_test files")
 	fs.BoolVar(&opts.printConfig, "print-config", false, "print effective configuration and exit")
@@ -122,20 +121,13 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 		patterns = []string{"./..."}
 	}
 	if opts.dump != "" {
-		duration, err := cfg.Duration()
-		if err != nil {
-			fmt.Fprintf(stderr, "lifeline: invalid effective configuration: %v\n", err)
-			return ExitInvalid
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), duration)
-		defer cancel()
 		switch opts.dump {
 		case "cfg":
 			if opts.dumpFormat != "text" && opts.dumpFormat != "dot" {
 				fmt.Fprintf(stderr, "lifeline: unsupported -dump-format value %q for -dump cfg (supported: text, dot)\n", opts.dumpFormat)
 				return ExitInvalid
 			}
-			if err := dumpCFGs(ctx, patterns, cfg, opts.dumpFormat, stdout); err != nil {
+			if err := dumpCFGs(context.Background(), patterns, cfg, opts.dumpFormat, stdout); err != nil {
 				fmt.Fprintf(stderr, "lifeline: %v\n", err)
 				return ExitInvalid
 			}
@@ -144,7 +136,7 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 				fmt.Fprintf(stderr, "lifeline: unsupported -dump-format value %q for -dump facts (supported: text, json)\n", opts.dumpFormat)
 				return ExitInvalid
 			}
-			if err := dumpFacts(ctx, patterns, cfg, opts.dumpFormat, stdout); err != nil {
+			if err := dumpFacts(context.Background(), patterns, cfg, opts.dumpFormat, stdout); err != nil {
 				fmt.Fprintf(stderr, "lifeline: %v\n", err)
 				return ExitInvalid
 			}
@@ -154,18 +146,10 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 		}
 		return ExitOK
 	}
-	duration, err := cfg.Duration()
+	diags, coverage, status, analysisElapsed, err := analyzePatterns(context.Background(), patterns, cfg)
 	if err != nil {
-		fmt.Fprintf(stderr, "lifeline: invalid effective configuration: %v\n", err)
-		return ExitInvalid
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
-	defer cancel()
-	start := time.Now()
-	diags, coverage, status, err := analyzePatterns(ctx, patterns, cfg)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			d := engine.TimeoutDiagnostic(cfg, time.Since(start), "")
+		if errors.Is(err, context.DeadlineExceeded) {
+			d := engine.TimeoutDiagnostic(cfg, analysisElapsed, "")
 			// The timeout is part of the run status whether or not its
 			// diagnostic is displayed: hiding LL9001 hides a notice, not the
 			// fact that the run was cut short (audit finding F8).

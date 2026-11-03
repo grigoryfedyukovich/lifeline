@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -167,6 +168,40 @@ func TestStatus_StandaloneTimeoutIsStatusEvenWhenHidden(t *testing.T) {
 	}
 	if _, code := run(t, root, binary, "-config", writeConfig(t, "ignore:\n  - LL9001\n"), "-fail-on-incomplete", "-timeout", "1ns", pkg); code != 1 {
 		t.Errorf("a hidden timeout must still trip fail-on-incomplete: exit %d", code)
+	}
+}
+
+func TestStatus_StandaloneTimeoutStartsAfterPackageDiscovery(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a Unix shell script as a fake go command")
+	}
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	binDir := t.TempDir()
+	fakeGo := filepath.Join(binDir, "go")
+	script := `#!/bin/sh
+case "$1" in
+list)
+	/bin/sleep 1
+	exit 0
+	;;
+env)
+	printf 'amd64\n'
+	exit 0
+	;;
+*)
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(fakeGo, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	report, code := runJSON(t, root, binary, "-fail-on-incomplete", "-timeout", "500ms", ".")
+	if code != 0 || report.Incomplete || report.Status.Incomplete || len(report.Diagnostics) != 0 {
+		t.Fatalf("one-second package discovery consumed the 500ms analysis budget: exit=%d report=%#v", code, report)
 	}
 }
 

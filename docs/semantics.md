@@ -87,6 +87,6 @@ Standalone mode does not persist or import vet facts, but it now computes equiva
 The explicit bounds are:
 
 - `max_functions` per package;
-- the standalone command timeout.
+- the standalone analysis timeout, which begins after package discovery.
 
 `max_functions` is applied before lifecycle construction and before optional SSA-like construction when requested. Direct same-package target inspection cannot bypass it. Every diagnostic repeats the bound values. Reaching the function bound (which counts function literals as well as named functions) or timeout emits `LL9001` and sets `status.incomplete`; the status is independent of whether `LL9001` is displayed, so ignoring the rule hides the notice and not the fact.

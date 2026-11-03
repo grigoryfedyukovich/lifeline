@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gfedyukovich/lifeline/internal/config"
 	"github.com/gfedyukovich/lifeline/internal/engine"
@@ -581,12 +582,28 @@ func classifySourceExclusions(ctx context.Context, p listedPackage, includeTests
 	return excluded, len(paths), nil
 }
 
-func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) ([]engine.Diagnostic, engine.Coverage, engine.Status, error) {
-	cwd, _ := os.Getwd()
-	packages, err := listPackages(ctx, patterns, cfg.IncludeTests)
+func analysisContext(parent context.Context, cfg config.Config) (context.Context, context.CancelFunc, error) {
+	duration, err := cfg.Duration()
 	if err != nil {
-		return nil, engine.Coverage{}, engine.Status{}, err
+		return nil, nil, err
 	}
+	ctx, cancel := context.WithTimeout(parent, duration)
+	return ctx, cancel, nil
+}
+
+func analyzePatterns(parent context.Context, patterns []string, cfg config.Config) (diagnostics []engine.Diagnostic, coverage engine.Coverage, status engine.Status, analysisElapsed time.Duration, err error) {
+	cwd, _ := os.Getwd()
+	packages, err := listPackages(parent, patterns, cfg.IncludeTests)
+	if err != nil {
+		return nil, engine.Coverage{}, engine.Status{}, 0, err
+	}
+	ctx, cancelAnalysis, err := analysisContext(parent, cfg)
+	if err != nil {
+		return nil, engine.Coverage{}, engine.Status{}, 0, err
+	}
+	defer cancelAnalysis()
+	analysisStarted := time.Now()
+	defer func() { analysisElapsed = time.Since(analysisStarted) }()
 	exports := map[string]string{}
 	for _, p := range packages {
 		if p.Export != "" {
@@ -595,18 +612,18 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 	}
 	loader, err := newTargetPackageLoader(ctx, exports)
 	if err != nil {
-		return nil, engine.Coverage{}, engine.Status{}, err
+		return nil, engine.Coverage{}, engine.Status{}, 0, err
 	}
 	roots := selectAnalysisRoots(packages, cfg.IncludeTests)
 	units := selectAnalysisUnits(packages, roots)
 	for _, unit := range units {
 		if unit.pkg.Error != nil {
-			return nil, engine.Coverage{}, engine.Status{}, fmt.Errorf("package %s: %s", unit.pkg.ImportPath, unit.pkg.Error.Err)
+			return nil, engine.Coverage{}, engine.Status{}, 0, fmt.Errorf("package %s: %s", unit.pkg.ImportPath, unit.pkg.Error.Err)
 		}
 	}
 	levels, err := analysisLevels(units)
 	if err != nil {
-		return nil, engine.Coverage{}, engine.Status{}, err
+		return nil, engine.Coverage{}, engine.Status{}, 0, err
 	}
 	facts := newStandaloneFactStore()
 
@@ -744,12 +761,12 @@ func analyzePatterns(ctx context.Context, patterns []string, cfg config.Config) 
 		totalStatus = totalStatus.Add(results[i].status)
 	}
 	if firstErr != nil {
-		return all, totalCoverage, totalStatus, firstErr
+		return all, totalCoverage, totalStatus, 0, firstErr
 	}
 	if err := ctx.Err(); err != nil {
-		return all, totalCoverage, totalStatus, err
+		return all, totalCoverage, totalStatus, 0, err
 	}
-	return all, totalCoverage, totalStatus, nil
+	return all, totalCoverage, totalStatus, 0, nil
 }
 
 const maxGoListStderrBytes = 64 << 10

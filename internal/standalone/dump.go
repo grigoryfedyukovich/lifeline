@@ -23,11 +23,16 @@ import (
 // Unlike the normal analysis path, this does not filter out generated
 // files or apply ignore_paths: someone asking to see a CFG most likely
 // wants to see every function that's there, not a lint-scoped subset.
-func dumpCFGs(ctx context.Context, patterns []string, cfg config.Config, format string, w io.Writer) error {
-	packages, err := listPackages(ctx, patterns, cfg.IncludeTests)
+func dumpCFGs(parent context.Context, patterns []string, cfg config.Config, format string, w io.Writer) error {
+	packages, err := listPackages(parent, patterns, cfg.IncludeTests)
 	if err != nil {
 		return err
 	}
+	ctx, cancel, err := analysisContext(parent, cfg)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 	exports := map[string]string{}
 	for _, p := range packages {
 		if p.Export != "" {

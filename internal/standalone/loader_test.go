@@ -455,7 +455,7 @@ func Leak(parent context.Context) {
 
 	cfg := config.Default()
 	cfg.Timeout = "30s"
-	diags, _, _, err := analyzePatterns(context.Background(), []string{"./p"}, cfg)
+	diags, _, _, _, err := analyzePatterns(context.Background(), []string{"./p"}, cfg)
 	if err != nil {
 		t.Fatalf("analyzePatterns(cgo): %v", err)
 	}
@@ -543,7 +543,7 @@ func Leak(parent context.Context) {
 
 	cfg := config.Default()
 	cfg.Timeout = "30s"
-	diags, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
+	diags, _, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
 	if err != nil {
 		t.Fatalf("analyzePatterns: %v", err)
 	}
@@ -610,7 +610,7 @@ func Bad(parent context.Context) {
 
 	cfg := config.Default()
 	cfg.Timeout = "30s"
-	diags, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
+	diags, _, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
 	if err != nil {
 		t.Fatalf("analyzePatterns: %v", err)
 	}
@@ -738,7 +738,7 @@ func Leak(parent context.Context) {
 
 	cfg := config.Default()
 	cfg.Timeout = "30s"
-	diags, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
+	diags, _, _, _, err := analyzePatterns(context.Background(), []string{"./root"}, cfg)
 	if err != nil {
 		t.Fatalf("analyzePatterns: %v", err)
 	}
@@ -782,7 +782,7 @@ func Start() {
 
 	cfg := config.Default()
 	cfg.Timeout = "30s"
-	diags, coverage, _, err := analyzePatterns(context.Background(), []string{"."}, cfg)
+	diags, coverage, _, _, err := analyzePatterns(context.Background(), []string{"."}, cfg)
 	if err != nil {
 		t.Fatalf("analyzePatterns: %v", err)
 	}
@@ -978,7 +978,7 @@ func F() {}
 
 	cfg := config.Default()
 	cfg.Timeout = "30s"
-	diags, coverage, status, err := analyzePatterns(context.Background(), []string{"./p"}, cfg)
+	diags, coverage, status, _, err := analyzePatterns(context.Background(), []string{"./p"}, cfg)
 	if err != nil {
 		t.Fatalf("analyzePatterns: %v", err)
 	}
