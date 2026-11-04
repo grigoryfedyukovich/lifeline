@@ -552,7 +552,7 @@ func sourcePathsForAnalysis(p listedPackage, includeTests bool) []string {
 // scope, because declarations from an excluded file may be required by an
 // included file. If every user source is excluded, analyzePatterns can skip
 // Lifeline parsing/type-checking of that package entirely.
-func classifySourceExclusions(ctx context.Context, p listedPackage, includeTests bool, cfg config.Config, cwd string) (map[string]struct{}, int, error) {
+func classifySourceExclusions(ctx context.Context, p listedPackage, includeTests bool, cfg config.Config, moduleRoot string) (map[string]struct{}, int, error) {
 	paths := sourcePathsForAnalysis(p, includeTests)
 	excluded := make(map[string]struct{})
 	for _, path := range paths {
@@ -560,8 +560,8 @@ func classifySourceExclusions(ctx context.Context, p listedPackage, includeTests
 			return nil, 0, err
 		}
 		rel := path
-		if cwd != "" {
-			if r, err := filepath.Rel(cwd, path); err == nil {
+		if moduleRoot != "" {
+			if r, err := filepath.Rel(moduleRoot, path); err == nil {
 				rel = r
 			}
 		}
@@ -592,7 +592,10 @@ func analysisContext(parent context.Context, cfg config.Config) (context.Context
 }
 
 func analyzePatterns(parent context.Context, patterns []string, cfg config.Config) (diagnostics []engine.Diagnostic, coverage engine.Coverage, status engine.Status, analysisElapsed time.Duration, err error) {
-	cwd, _ := os.Getwd()
+	moduleRoot, err := config.ModuleRoot("")
+	if err != nil {
+		return nil, engine.Coverage{}, engine.Status{}, 0, err
+	}
 	packages, err := listPackages(parent, patterns, cfg.IncludeTests)
 	if err != nil {
 		return nil, engine.Coverage{}, engine.Status{}, 0, err
@@ -681,7 +684,7 @@ func analyzePatterns(parent context.Context, patterns []string, cfg config.Confi
 					// selected as actual roots already carry their test files in
 					// GoFiles from go list -test.
 					includePackageTests := cfg.IncludeTests && unit.rootResult >= 0
-					excluded, sourceCount, err := classifySourceExclusions(workCtx, p, includePackageTests, cfg, cwd)
+					excluded, sourceCount, err := classifySourceExclusions(workCtx, p, includePackageTests, cfg, moduleRoot)
 					if err != nil {
 						fail(fmt.Errorf("classify %s: %w", p.ImportPath, err))
 						return

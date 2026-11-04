@@ -523,14 +523,14 @@ func IsGeneratedFile(file *ast.File) bool {
 
 // FilterFiles narrows files to those that should actually be walked for
 // lifecycle constructs: it excludes files matching cfg.IgnorePaths (matched
-// against the file's path relative to cwd, falling back to the absolute
-// path if cwd is empty or unrelated) and files carrying the standard
+// against the file's path relative to moduleRoot, falling back to the absolute
+// path if moduleRoot is empty or unrelated) and files carrying the standard
 // generated-code marker (see IsGeneratedFile). This is meant to run after
 // type-checking, not before: type-checking should still see every file in
 // the package, since excluding a file there could break resolution of
 // symbols other files in the same package legitimately depend on. Only the
 // lifecycle analysis pass itself skips them.
-func FilterFiles(fset *token.FileSet, files []*ast.File, cfg config.Config, cwd string) []*ast.File {
+func FilterFiles(fset *token.FileSet, files []*ast.File, cfg config.Config, moduleRoot string) []*ast.File {
 	out := files[:0:0]
 	for _, f := range files {
 		if IsGeneratedFile(f) {
@@ -539,8 +539,8 @@ func FilterFiles(fset *token.FileSet, files []*ast.File, cfg config.Config, cwd 
 		if len(cfg.IgnorePaths) > 0 {
 			path := fset.Position(f.Pos()).Filename
 			rel := path
-			if cwd != "" {
-				if r, err := filepath.Rel(cwd, path); err == nil {
+			if moduleRoot != "" {
+				if r, err := filepath.Rel(moduleRoot, path); err == nil {
 					rel = r
 				}
 			}
@@ -1834,12 +1834,18 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		}
 		switch x := n.(type) {
 		case *ast.CallExpr:
+			// Passing a closure that captures cleanup is an ownership transfer
+			// regardless of whether the callee is itself another local closure.
+			// Keep that question separate from applying the invoked closure's own
+			// capture effects below.
+			b.observeClosureArgumentTransfers(x, cancels)
 			if lit := closureCallTarget(x, b.in.Info, b.singleAssignTargets); lit != nil {
 				b.applyClosureInvocation(x, lit, asyncClosureCalls[x], cancels, groups)
-			} else {
-				b.observeClosureArgumentTransfers(x, cancels)
-				b.observeCall(x, cancels, groups, asyncClosureCalls[x])
 			}
+			// A local literal may also receive tracked cleanup through a formal
+			// argument. applyClosureInvocation summarizes captures only, so the
+			// normal argument-transfer path must still run for every call.
+			b.observeCall(x, cancels, groups, asyncClosureCalls[x])
 			if b.isConfigured(x, b.startWrappers) {
 				if target := firstStartTarget(x.Args, b.in.Info); target != nil {
 					g := b.buildGoroutine(x, &ast.CallExpr{Fun: target}, contexts, "configured-start")
@@ -3043,16 +3049,81 @@ func (b *builder) observeCall(call *ast.CallExpr, cancels []*cancelState, groups
 	}
 }
 
+func (b *builder) returnedValuesCarryObject(results []ast.Expr, obj types.Object) bool {
+	if obj == nil {
+		return false
+	}
+	visiting := map[types.Object]bool{}
+	var carries func(ast.Expr) bool
+	carries = func(expr ast.Expr) bool {
+		if expr == nil {
+			return false
+		}
+		// Preserve the ordinary direct-return/argument behavior while skipping
+		// literal bodies: an immediately invoked literal may mention cleanup,
+		// but its scalar result does not carry that cleanup to the caller.
+		if hasObject(objectsUsed(expr, b.in.Info, true), obj) {
+			return true
+		}
+		expr = ast.Unparen(expr)
+		switch x := expr.(type) {
+		case *ast.FuncLit:
+			// The returned function value owns everything captured anywhere in
+			// its literal tree, including a nested callback it may later expose.
+			return hasObject(objectsUsed(x, b.in.Info, false), obj)
+		case *ast.Ident:
+			assignedObj := b.in.Info.ObjectOf(x)
+			if assignedObj == nil || visiting[assignedObj] {
+				return false
+			}
+			target := ast.Unparen(b.singleAssignTargets[assignedObj])
+			switch target.(type) {
+			case *ast.FuncLit, *ast.CompositeLit, *ast.Ident, *ast.UnaryExpr:
+				visiting[assignedObj] = true
+				found := carries(target)
+				delete(visiting, assignedObj)
+				return found
+			}
+		case *ast.CompositeLit:
+			for _, elt := range x.Elts {
+				value := elt
+				if kv, ok := value.(*ast.KeyValueExpr); ok {
+					value = kv.Value
+				}
+				if carries(value) {
+					return true
+				}
+			}
+		case *ast.UnaryExpr:
+			if x.Op == token.AND {
+				return carries(x.X)
+			}
+		case *ast.CallExpr:
+			// A conversion returns its argument value; an ordinary call returns a
+			// new result and is handled by the call's own transfer logic.
+			if tv, ok := b.in.Info.Types[x.Fun]; ok && tv.IsType() && len(x.Args) == 1 {
+				return carries(x.Args[0])
+			}
+		}
+		return false
+	}
+	for _, result := range results {
+		if carries(result) {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *builder) observeReturn(ret *ast.ReturnStmt, cancels []*cancelState, groups []*groupState, claimed map[types.Object]bool) {
-	used := objectsUsedInExpressions(ret.Results, b.in.Info, true)
 	for _, c := range cancels {
-		if c.cancelObj != nil && hasObject(used, c.cancelObj) && !claimed[c.cancelObj] {
+		if c.cancelObj != nil && b.returnedValuesCarryObject(ret.Results, c.cancelObj) && !claimed[c.cancelObj] {
 			c.binding.Escapes = true
 			c.returned = true
 		}
 	}
 	for _, g := range groups {
-		if g.obj != nil && hasObject(used, g.obj) && !claimed[g.obj] {
+		if g.obj != nil && b.returnedValuesCarryObject(ret.Results, g.obj) && !claimed[g.obj] {
 			g.group.Escapes = true
 			g.returned = true
 		}

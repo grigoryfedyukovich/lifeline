@@ -115,7 +115,11 @@ func New() *analysis.Analyzer {
 var Analyzer = New()
 
 func run(pass *analysis.Pass, opts *options) (any, error) {
-	cfg, err := config.Load(opts.configPath)
+	moduleRoot, err := analyzerModuleRoot(pass)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.LoadFrom(opts.configPath, moduleRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -186,8 +190,7 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		}
 		return fact.ReturnFieldSites, true
 	}
-	cwd, _ := os.Getwd()
-	kept := frontend.FilterFiles(pass.Fset, pass.Files, cfg, cwd)
+	kept := frontend.FilterFiles(pass.Fset, pass.Files, cfg, moduleRoot)
 	duration, err := cfg.Duration()
 	if err != nil {
 		return nil, err
@@ -252,6 +255,19 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		pass.Report(ad)
 	}
 	return result, nil
+}
+
+func analyzerModuleRoot(pass *analysis.Pass) (string, error) {
+	for _, file := range pass.Files {
+		if file == nil {
+			continue
+		}
+		filename := pass.Fset.Position(file.Pos()).Filename
+		if filename != "" {
+			return config.ModuleRoot(filename)
+		}
+	}
+	return config.ModuleRoot("")
 }
 
 // appendStatus appends result as one JSON line. vet runs the tool once per

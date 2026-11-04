@@ -194,6 +194,122 @@ func f(parent context.Context) {
 	}
 }
 
+func TestClosures_ReturnedCaptureTransfersOwnership(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "direct closure",
+			body: `return func() { cancel() }`,
+		},
+		{
+			name: "assigned closure",
+			body: `done := func() { cancel() }; return done`,
+		},
+		{
+			name: "closure in returned struct",
+			body: `return holder{done: func() { cancel() }}`,
+		},
+		{
+			name: "closure in assigned returned struct",
+			body: `h := holder{done: func() { cancel() }}; return h`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			result := "func()"
+			if strings.Contains(c.body, "holder") {
+				result = "holder"
+			}
+			src := closureHeader + "type holder struct { done func() }\nfunc f(parent context.Context) " + result + " {\n\t_, cancel := context.WithCancel(parent)\n\t" + c.body + "\n}\n"
+			if got := rulesOnly(findings(t, src)); got != "" {
+				t.Fatalf("rules = %q, want no finding: returning a closure that captures cleanup transfers ownership", got)
+			}
+		})
+	}
+}
+
+func TestClosures_ReturnedCaptureTransfersGroupOwnership(t *testing.T) {
+	src := closureHeader + `func f() func() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done() }()
+	return func() { wg.Wait() }
+}
+`
+	if got := rulesOnly(findings(t, src)); got != "" {
+		t.Fatalf("rules = %q, want no finding: returning a closure that captures the group transfers ownership", got)
+	}
+}
+
+func TestClosures_ArgumentsStillTransferToInvokedLocalClosure(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		call string
+	}{
+		{name: "synchronous", call: "done(cancel)"},
+		{name: "asynchronous", call: "go done(cancel)"},
+		{name: "direct literal", call: "func(cleanup context.CancelFunc) { _ = cleanup }(cancel)"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src := closureHeader + `func f(parent context.Context) {
+	_, cancel := context.WithCancel(parent)
+	done := func(cleanup context.CancelFunc) { _ = cleanup }
+	_ = done
+	` + c.call + `
+}
+`
+			program := buildProgramFor(t, src, nil)
+			var binding *model.CancelBinding
+			for i := range program.Functions {
+				fn := &program.Functions[i]
+				if strings.HasSuffix(fn.Name, ".f") && len(fn.Cancels) == 1 {
+					binding = &fn.Cancels[0]
+				}
+			}
+			if binding == nil {
+				t.Fatal("cancel binding for f not found")
+			}
+			if !binding.Escapes || binding.Called {
+				t.Fatalf("local closure argument should be an ownership transfer, not an observed call: %#v", *binding)
+			}
+			if got := rulesOnly(findings(t, src)); got != "" {
+				t.Fatalf("rules = %q, want no finding after ownership transfer", got)
+			}
+		})
+	}
+}
+
+func TestClosures_UninvokedLocalClosureTakesNoArgumentOwnership(t *testing.T) {
+	src := closureHeader + `func f(parent context.Context) {
+	_, cancel := context.WithCancel(parent)
+	done := func(cleanup context.CancelFunc) { _ = cleanup }
+	_ = done
+	_ = cancel
+}
+`
+	if got := rulesOnly(findings(t, src)); got != "LL1001" {
+		t.Fatalf("rules = %q, want LL1001: merely defining the closure transfers no argument", got)
+	}
+}
+
+func TestClosures_InvokedLiteralResultDoesNotTransferItsCaptures(t *testing.T) {
+	src := closureHeader + `func f(parent context.Context, enabled bool) int {
+	_, cancel := context.WithCancel(parent)
+	return func() int {
+		if enabled {
+			cancel()
+		}
+		return 1
+	}()
+}
+`
+	if got := rulesOnly(findings(t, src)); got != "LL1001" {
+		t.Fatalf("rules = %q, want LL1001: returning an invoked literal's scalar result does not transfer its captures", got)
+	}
+}
+
 func TestClosures_ADefinedButNeverInvokedLiteralDoesNotJoinAGroup(t *testing.T) {
 	cases := []struct{ name, body, want string }{
 		{"blank literal waiting", `_ = func() { wg.Wait() }`, "LL1003"},

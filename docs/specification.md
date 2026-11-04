@@ -109,7 +109,7 @@ All of the above is reachability over a graph, not a proof: a resolving edge mea
 
 This applies whenever a body was available to build a CFG from. A cross-package target does not carry the body/CFG itself, but its summary carries the exporting package's CFG/SCC-derived `LoopUnresolved` verdict, so vet facts and standalone source-derived dependency summaries preserve that LL1002 result without rebuilding the callee graph in the caller; see `docs/limitations.md`.
 
-Nested function literals have independent lifecycle summaries and independent CFGs. Their loops and stop paths cannot alter the enclosing goroutine's summary, although nested goroutine start sites are analyzed separately. For lifecycle values captured from the enclosing function, literal-body calls are not copied into the owner's evidence directly: a supported synchronous invocation (an IIFE or a single-assignment local literal called later) contributes its may/must capture effect at the invocation call site in the owner's CFG; callback/go capture is a transfer rather than proof that cleanup occurred before owner return.
+Nested function literals have independent lifecycle summaries and independent CFGs. Their loops and stop paths cannot alter the enclosing goroutine's summary, although nested goroutine start sites are analyzed separately. For lifecycle values captured from the enclosing function, literal-body calls are not copied into the owner's evidence directly: a supported synchronous invocation (an IIFE or a single-assignment local literal called later) contributes its may/must capture effect at the invocation call site in the owner's CFG; callback/go capture is a transfer rather than proof that cleanup occurred before owner return. A returned function value that captures cleanup transfers that obligation to the caller, including a single-assignment local closure or closure contained in a returned composite. Invoking a local literal still applies ordinary argument-transfer accounting to cleanup passed through its parameters; this is separate from capture effects.
 
 ### Join protocol
 
@@ -144,7 +144,7 @@ There is no Lifeline-managed persistent result cache in v0.1.2. If one is introd
 
 ## 9. Configuration
 
-Configuration is discovered upward from the current directory or selected explicitly with `-config`. Unknown keys and invalid values are errors. `-print-config` emits the effective configuration as JSON.
+Configuration is discovered upward from the Go module root (falling back to the current directory outside module mode) or selected explicitly with `-config`. A relative explicit path is resolved from that same root in standalone and `go vet` modes. Unknown keys and invalid values are errors. `-print-config` emits the effective configuration as JSON.
 
 Supported keys:
 
@@ -164,7 +164,7 @@ import/path.Type.Method
 
 The YAML/TOML parser deliberately supports a strict flat subset: scalar values, quoted inline string arrays, and YAML string lists. JSON uses the standard library decoder with unknown-field rejection.
 
-`ignore_paths` excludes files by path from analysis (not just from reported output): each pattern is matched with `filepath.Match` semantics against both the file's path relative to the working directory and its base filename. A file carrying the standard `// Code generated ... DO NOT EDIT.` marker is excluded automatically, unconditionally of config. A specific finding can additionally be suppressed inline with a `//lifeline:ignore` (optionally `//lifeline:ignore LL1001,LL1002`) comment; see `docs/limitations.md` for exact matching rules.
+`ignore_paths` excludes files by path from analysis (not just from reported output): each pattern is matched with `filepath.Match` semantics against both the file's path relative to the Go module root and its base filename. A file carrying the standard `// Code generated ... DO NOT EDIT.` marker is excluded automatically, unconditionally of config. A specific finding can additionally be suppressed inline with a `//lifeline:ignore` (optionally `//lifeline:ignore LL1001,LL1002`) comment; see `docs/limitations.md` for exact matching rules.
 
 ## 10. Output contract
 

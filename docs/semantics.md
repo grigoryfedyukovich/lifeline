@@ -29,7 +29,7 @@ It does not retain AST node identities.
 
 A named function and every function literal have distinct lifecycle bodies, and each literal is also analyzed as a unit for the cancel functions and join groups it declares itself (see `docs/limitations.md`). Loops, returns, breaks, select exits, and stop calls inside a nested literal do not alter the enclosing body's lifecycle summary.
 
-Nested `go` statements are still discovered and modeled as separate start sites. References to an outer cancel function or group from a nested closure remain references to the same typed object and may discharge or transfer the outer obligation.
+Nested `go` statements are still discovered and modeled as separate start sites. References to an outer cancel function or group from a nested closure remain references to the same typed object and may discharge or transfer the outer obligation. Returning a closure that captures cleanup transfers ownership to the caller; passing cleanup as an argument to an invoked local closure uses the same conservative argument-transfer rule as any other unresolved callee.
 
 ## Context ownership
 

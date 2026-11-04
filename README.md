@@ -72,12 +72,17 @@ The analyzer deliberately does not report one-shot goroutines merely because the
 
 ## Configuration
 
-Lifeline searches upward from the working directory for:
+Lifeline searches upward from the Go module root (or the working directory
+outside module mode) for:
 
 ```text
 lifeline.yaml  .lifeline.yaml  lifeline.yml  .lifeline.yml
 lifeline.toml  .lifeline.toml  lifeline.json .lifeline.json
 ```
+
+An explicit relative `-config` path is also resolved from the module root in
+both standalone and `go vet` modes. This keeps one vet invocation from
+reinterpreting the path separately for each package.
 
 Unknown keys are errors. Print the exact effective configuration with:
 

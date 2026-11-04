@@ -72,7 +72,12 @@ func Main(args []string, stdout, stderr io.Writer) (exit int) {
 		fmt.Fprintf(stdout, "%s %s (%s)\n", version.Tool, version.Version, version.Backend)
 		return ExitOK
 	}
-	cfg, err := config.Load(opts.configPath)
+	moduleRoot, err := config.ModuleRoot("")
+	if err != nil {
+		fmt.Fprintf(stderr, "lifeline: resolve module root: %v\n", err)
+		return ExitInvalid
+	}
+	cfg, err := config.LoadFrom(opts.configPath, moduleRoot)
 	if err != nil {
 		fmt.Fprintf(stderr, "lifeline: %v\n", err)
 		return ExitInvalid

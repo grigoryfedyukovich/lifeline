@@ -101,3 +101,36 @@ func TestSplitCSV(t *testing.T) {
 		t.Fatalf("SplitCSV = %#v", got)
 	}
 }
+
+func TestLoadFromResolvesRelativePathAgainstModuleRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configDir := filepath.Join(root, "config")
+	if err := os.Mkdir(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "lifeline.yaml"), []byte("schema_version: 1\ntimeout: 17s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	packageDir := filepath.Join(root, "nested", "package")
+	if err := os.MkdirAll(packageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	moduleRoot, err := ModuleRoot(packageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moduleRoot != root {
+		t.Fatalf("ModuleRoot = %q, want %q", moduleRoot, root)
+	}
+	cfg, err := LoadFrom(filepath.Join("config", "lifeline.yaml"), moduleRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Timeout != "17s" {
+		t.Fatalf("timeout = %q, want 17s", cfg.Timeout)
+	}
+}

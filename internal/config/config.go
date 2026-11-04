@@ -137,9 +137,21 @@ func knownRule(id string) bool {
 }
 
 func Load(path string) (Config, error) {
+	return LoadFrom(path, "")
+}
+
+// LoadFrom loads path relative to baseDir. When path is empty, configuration
+// discovery starts at baseDir instead. An empty baseDir preserves the
+// historical behavior of using the process working directory.
+//
+// Drivers should pass the Go module root here. go vet runs an analyzer with a
+// package-specific working directory, so resolving paths directly against the
+// process cwd would make one command interpret the same flag differently for
+// each package.
+func LoadFrom(path, baseDir string) (Config, error) {
 	cfg := Default()
 	if path == "" {
-		found, err := Find("")
+		found, err := Find(baseDir)
 		if err != nil {
 			return cfg, err
 		}
@@ -147,6 +159,8 @@ func Load(path string) (Config, error) {
 			return cfg, nil
 		}
 		path = found
+	} else if !filepath.IsAbs(path) && baseDir != "" {
+		path = filepath.Join(baseDir, path)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -170,6 +184,39 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("invalid config %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// ModuleRoot returns the nearest directory at or above start that contains a
+// go.mod file. start may name either a file or a directory. If no module is
+// found, the absolute starting directory is returned so callers still have a
+// stable path base outside module mode.
+func ModuleRoot(start string) (string, error) {
+	if start == "" {
+		var err error
+		start, err = os.Getwd()
+		if err != nil {
+			return "", err
+		}
+	}
+	abs, err := filepath.Abs(start)
+	if err != nil {
+		return "", err
+	}
+	dir := abs
+	if st, statErr := os.Stat(abs); statErr == nil && !st.IsDir() {
+		dir = filepath.Dir(abs)
+	}
+	fallback := dir
+	for {
+		if st, statErr := os.Stat(filepath.Join(dir, "go.mod")); statErr == nil && !st.IsDir() {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return fallback, nil
+		}
+		dir = parent
+	}
 }
 
 func Find(start string) (string, error) {
