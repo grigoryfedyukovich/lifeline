@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed vet/standalone test-file parity: `include_tests: false` now excludes `_test.go` lifecycle analysis in vet mode as well as standalone mode, while `include_tests: true` preserves vet diagnostics from test files.
 - Fixed LL1001 ownership transfer through closures: returning a function value that captures cleanup (directly, through a single-assignment local, or inside a returned composite) now hands the obligation to the caller, and invoking a local function literal no longer skips ordinary transfer accounting for cleanup passed as an argument. Capture effects and argument effects remain distinct, so returning an invoked literal's scalar result does not fabricate a transfer.
 - Fixed vet/standalone path parity: relative explicit config paths and directory-bearing `ignore_paths` entries now resolve from the Go module root, so `go vet` package working directories cannot change their meaning.
 - Documentation: moved the historical `specification-original.md`, `spec-validation.md`, and `review-resolution.md` into `docs/archive/` and marked them as archived records.

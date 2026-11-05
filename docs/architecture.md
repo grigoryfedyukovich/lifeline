@@ -57,6 +57,8 @@ Dependencies are loaded for export data. With `-tests`, Lifeline analyzes Go's s
 
 The executable recognizes unitchecker protocol invocations and delegates to `golang.org/x/tools/go/analysis/unitchecker`.
 
+Go still supplies the analyzer with the files needed to type-check each vet unit. Before lifecycle modeling, the shared frontend filter removes `_test.go` files when `include_tests` is false, along with configured path exclusions and generated files. This keeps vet's analyzed source set aligned with standalone; setting `include_tests` to true retains the test files.
+
 For every analyzed named function, the analyzer exports a versioned object fact containing only its conservative body lifecycle summary:
 
 - unconditional-loop presence;

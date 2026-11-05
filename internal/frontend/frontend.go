@@ -522,22 +522,30 @@ func IsGeneratedFile(file *ast.File) bool {
 }
 
 // FilterFiles narrows files to those that should actually be walked for
-// lifecycle constructs: it excludes files matching cfg.IgnorePaths (matched
-// against the file's path relative to moduleRoot, falling back to the absolute
-// path if moduleRoot is empty or unrelated) and files carrying the standard
+// lifecycle constructs: unless cfg.IncludeTests is set it excludes _test.go
+// files, it excludes files matching cfg.IgnorePaths (matched against the file's
+// path relative to moduleRoot, falling back to the absolute path if moduleRoot
+// is empty or unrelated), and it excludes files carrying the standard
 // generated-code marker (see IsGeneratedFile). This is meant to run after
-// type-checking, not before: type-checking should still see every file in
-// the package, since excluding a file there could break resolution of
-// symbols other files in the same package legitimately depend on. Only the
-// lifecycle analysis pass itself skips them.
+// type-checking, not before: type-checking should still see every file in the
+// package, since excluding a file there could break resolution of symbols other
+// files in the same package legitimately depend on. Only the lifecycle analysis
+// pass itself skips them.
 func FilterFiles(fset *token.FileSet, files []*ast.File, cfg config.Config, moduleRoot string) []*ast.File {
 	out := files[:0:0]
 	for _, f := range files {
+		// Use the physical parser filename, not a //line-adjusted position: a
+		// directive inside a test must not make vet analyze that test as a
+		// production file.
+		filename := fset.PositionFor(f.Pos(), false).Filename
+		if !cfg.IncludeTests && strings.HasSuffix(filename, "_test.go") {
+			continue
+		}
 		if IsGeneratedFile(f) {
 			continue
 		}
 		if len(cfg.IgnorePaths) > 0 {
-			path := fset.Position(f.Pos()).Filename
+			path := filename
 			rel := path
 			if moduleRoot != "" {
 				if r, err := filepath.Rel(moduleRoot, path); err == nil {

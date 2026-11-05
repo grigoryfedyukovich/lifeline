@@ -164,7 +164,7 @@ import/path.Type.Method
 
 The YAML/TOML parser deliberately supports a strict flat subset: scalar values, quoted inline string arrays, and YAML string lists. JSON uses the standard library decoder with unknown-field rejection.
 
-`ignore_paths` excludes files by path from analysis (not just from reported output): each pattern is matched with `filepath.Match` semantics against both the file's path relative to the Go module root and its base filename. A file carrying the standard `// Code generated ... DO NOT EDIT.` marker is excluded automatically, unconditionally of config. A specific finding can additionally be suppressed inline with a `//lifeline:ignore` (optionally `//lifeline:ignore LL1001,LL1002`) comment; see `docs/limitations.md` for exact matching rules.
+`include_tests` controls `_test.go` lifecycle analysis in both standalone and vet modes and defaults to false; standalone `-tests` enables it from the command line. `ignore_paths` excludes files by path from analysis (not just from reported output): each pattern is matched with `filepath.Match` semantics against both the file's path relative to the Go module root and its base filename. A file carrying the standard `// Code generated ... DO NOT EDIT.` marker is excluded automatically, unconditionally of config. A specific finding can additionally be suppressed inline with a `//lifeline:ignore` (optionally `//lifeline:ignore LL1001,LL1002`) comment; see `docs/limitations.md` for exact matching rules.
 
 ## 10. Output contract
 

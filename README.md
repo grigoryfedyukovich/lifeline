@@ -113,6 +113,10 @@ stop_wrappers:
   - example.com/project/workers.Stopped
 ```
 
+`include_tests` has the same meaning in standalone and `go vet` modes. When it
+is false (the default), `_test.go` files are excluded from lifecycle analysis;
+set it to true or pass standalone `-tests` to analyze test code.
+
 The YAML/TOML reader is intentionally strict and flat: scalar values, string arrays, and YAML string lists are supported. JSON is available when a fully standard syntax is preferred.
 
 Wrapper names use these canonical forms:
