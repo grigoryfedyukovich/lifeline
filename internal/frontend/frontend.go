@@ -561,43 +561,78 @@ func FilterFiles(fset *token.FileSet, files []*ast.File, cfg config.Config, modu
 	return out
 }
 
-// suppressionPattern matches an inline suppression directive within a
-// comment, e.g. "//lifeline:ignore" (suppresses every rule reported on that
-// line) or "//lifeline:ignore LL1001,LL1002" (suppresses only those rules).
-// Free text may follow, e.g. "//lifeline:ignore LL1002 -- see TICKET-123".
-var suppressionPattern = regexp.MustCompile(`lifeline:ignore(?:\s+([A-Za-z0-9,]+))?`)
+const suppressionDirective = "lifeline:ignore"
+
+// parseSuppressionComment recognizes a directive only at the start of a line
+// or block comment (after optional whitespace). Rule IDs are normalized to
+// uppercase and every ID must be known; a typo invalidates the whole directive
+// rather than partially hiding findings. Optional free text must follow "--"
+// and is retained as the directive's audit reason.
+func parseSuppressionComment(text string) (model.Suppression, bool) {
+	var content string
+	switch {
+	case strings.HasPrefix(text, "//"):
+		content = text[2:]
+	case strings.HasPrefix(text, "/*") && strings.HasSuffix(text, "*/"):
+		content = text[2 : len(text)-2]
+	default:
+		return model.Suppression{}, false
+	}
+	content = strings.TrimSpace(content)
+	if !strings.HasPrefix(content, suppressionDirective) {
+		return model.Suppression{}, false
+	}
+	rest := content[len(suppressionDirective):]
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' && rest[0] != '\r' && rest[0] != '\n' {
+		return model.Suppression{}, false
+	}
+	rest = strings.TrimSpace(rest)
+	rulesText := rest
+	reason := ""
+	if before, after, found := strings.Cut(rest, "--"); found {
+		rulesText = strings.TrimSpace(before)
+		reason = strings.TrimSpace(after)
+	}
+	if rulesText == "" {
+		return model.Suppression{Rules: []string{"*"}, Reason: reason}, true
+	}
+
+	seen := map[string]bool{}
+	rules := make([]string, 0, strings.Count(rulesText, ",")+1)
+	for _, item := range strings.Split(rulesText, ",") {
+		id := strings.ToUpper(strings.TrimSpace(item))
+		if id == "" || !config.IsKnownRule(id) {
+			return model.Suppression{}, false
+		}
+		if !seen[id] {
+			seen[id] = true
+			rules = append(rules, id)
+		}
+	}
+	return model.Suppression{Rules: rules, Reason: reason}, true
+}
 
 // collectSuppressions scans every comment in files for a suppression
-// directive and returns a file -> line -> rule-IDs index. A bare directive
-// with no rule list is recorded as "*", meaning every rule is suppressed on
-// that line. The directive is matched by the comment's own line, so it is
-// expected on the same source line as the construct it applies to (the
-// convention golangci-lint's "//nolint" uses), not the line before it.
-func collectSuppressions(fset *token.FileSet, files []*ast.File) map[string]map[int][]string {
-	out := map[string]map[int][]string{}
+// directive and returns a file -> line -> directives index. A bare directive
+// records "*" as its rule, meaning every rule is suppressed on that line. The
+// directive is matched by the comment's own line, so it is expected on the same
+// source line as the construct it applies to, not the line before it.
+func collectSuppressions(fset *token.FileSet, files []*ast.File) map[string]map[int][]model.Suppression {
+	out := map[string]map[int][]model.Suppression{}
 	for _, file := range files {
 		for _, group := range file.Comments {
 			for _, c := range group.List {
-				m := suppressionPattern.FindStringSubmatch(c.Text)
-				if m == nil {
+				directive, ok := parseSuppressionComment(c.Text)
+				if !ok {
 					continue
 				}
 				pos := fset.Position(c.Pos())
 				byLine := out[pos.Filename]
 				if byLine == nil {
-					byLine = map[int][]string{}
+					byLine = map[int][]model.Suppression{}
 					out[pos.Filename] = byLine
 				}
-				if m[1] == "" {
-					byLine[pos.Line] = append(byLine[pos.Line], "*")
-					continue
-				}
-				for _, id := range strings.Split(m[1], ",") {
-					id = strings.ToUpper(strings.TrimSpace(id))
-					if id != "" {
-						byLine[pos.Line] = append(byLine[pos.Line], id)
-					}
-				}
+				byLine[pos.Line] = append(byLine[pos.Line], directive)
 			}
 		}
 	}

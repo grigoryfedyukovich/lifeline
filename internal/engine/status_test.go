@@ -78,7 +78,7 @@ func TestStatus_CountsWhatWasHiddenAndBy(t *testing.T) {
 			{Factory: "context.WithCancel", Discarded: true, Span: model.Span{File: "f.go", StartLine: 3}},
 			{Factory: "context.WithCancel", Discarded: true, Span: model.Span{File: "f.go", StartLine: 9}},
 		}}},
-		Suppressions: map[string]map[int][]string{"f.go": {9: {"LL1001"}}},
+		Suppressions: map[string]map[int][]model.Suppression{"f.go": {9: {{Rules: []string{"LL1001"}}}}},
 	}
 	cfg := config.Default()
 	_, st := AnalyzeWithStatus(prog, cfg)
