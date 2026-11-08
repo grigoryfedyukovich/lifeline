@@ -976,6 +976,63 @@ func Start(parent context.Context) {
 	}
 }
 
+// Instantiated generic method selections carry an instantiated *types.Func
+// whose identity differs from the declaration object. Interprocedural lookups
+// must normalize that object back to Origin(), or a same-package generic method
+// silently falls through to the conservative "assume transferred" path.
+func TestParameterPassing_InstantiatedGenericMethodUsesOrigin(t *testing.T) {
+	dropped := analyzeSource(t, `package p
+import "context"
+type Handler[T any] struct{}
+func (Handler[T]) Drop(c context.CancelFunc) { _ = c }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var h Handler[int]
+	h.Drop(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(dropped) != 1 || dropped[0].RuleID != "LL1001" {
+		t.Fatalf("an instantiated generic method that drops cancel must be inspected through its origin; got diagnostics = %#v", dropped)
+	}
+
+	consumed := analyzeSource(t, `package p
+import "context"
+type Handler[T any] struct{}
+func (Handler[T]) Consume(c context.CancelFunc) { c() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var h Handler[int]
+	h.Consume(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(consumed) != 0 {
+		t.Fatalf("an instantiated generic method that consumes cancel must keep the verified discharge; got diagnostics = %#v", consumed)
+	}
+}
+
+// The reverse parameter-effect dependency graph needs the same normalization.
+// Forward is intentionally declared before Consume so its first worklist visit
+// sees Consume's effect as pending and must be revisited after Consume grows.
+func TestParameterPassing_InstantiatedGenericMethodDependencyUsesOrigin(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+type Handler[T any] struct{}
+func (h Handler[T]) Forward(c context.CancelFunc) { h.Consume(c) }
+func (Handler[T]) Consume(c context.CancelFunc) { c() }
+func Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var h Handler[int]
+	h.Forward(cancel)
+	go func() { <-ctx.Done() }()
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("generic-method parameter effects must be revisited through origin-normalized dependency edges; got diagnostics = %#v", diags)
+	}
+}
+
 // TestParameterPassing_MethodReceiverCalleeVerified confirms a same-
 // package method call (h.Do(cancel)) is verified exactly like a plain
 // function call, for both a value and a pointer receiver: calledObject
