@@ -39,6 +39,12 @@ func TestFrontendWorkBudgets(t *testing.T) {
 		if stats.StructuralCFGBuilds > functions {
 			t.Fatalf("built %d structural CFGs for %d functions; cache should build at most once per body", stats.StructuralCFGBuilds, functions)
 		}
+		// The recursion graph for this chain has functions nodes and links edges.
+		// One graph build plus two SCC traversals should remain linear, regardless
+		// of how many individual parameter passes ask about recursion.
+		if max := 4*(functions+links) + 16; stats.RecursionSCCWork > max {
+			t.Fatalf("recursion SCC work = %d; linear budget %d (functions=%d edges=%d)", stats.RecursionSCCWork, max, functions, links)
+		}
 	})
 
 	t.Run("constructor-forwarding-chain", func(t *testing.T) {
@@ -71,12 +77,12 @@ func TestFrontendWorkBudgets(t *testing.T) {
 
 func TestWorkStatsResetPerBuild(t *testing.T) {
 	fixture := newBenchmarkFixture(t, paramDelegationChainSource(8))
-	stats := WorkStats{ParameterEffectEvaluations: 1_000_000, ConstructorEvaluations: 1_000_000, StructuralCFGBuilds: 1_000_000, GroupBalanceStatementVisits: 1_000_000}
+	stats := WorkStats{ParameterEffectEvaluations: 1_000_000, ConstructorEvaluations: 1_000_000, StructuralCFGBuilds: 1_000_000, GroupBalanceStatementVisits: 1_000_000, RecursionSCCWork: 1_000_000}
 	fixture.in.WorkStats = &stats
 	if _, err := Build(fixture.in, fixture.cfg); err != nil {
 		t.Fatal(err)
 	}
-	if stats.ParameterEffectEvaluations >= 1_000_000 || stats.StructuralCFGBuilds >= 1_000_000 {
+	if stats.ParameterEffectEvaluations >= 1_000_000 || stats.StructuralCFGBuilds >= 1_000_000 || stats.RecursionSCCWork >= 1_000_000 {
 		t.Fatalf("Build did not reset WorkStats: %+v", stats)
 	}
 }

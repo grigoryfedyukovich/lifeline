@@ -41,6 +41,12 @@ type WorkStats struct {
 	// GroupBalanceStatementVisits counts statements that survive the per-group skip
 	// index and are semantically visited by WaitGroup balance/round accounting.
 	GroupBalanceStatementVisits int
+
+	// RecursionSCCWork counts declaration/edge visits used to build the static
+	// same-package call graph and compute its strongly connected components.
+	// It is intentionally independent of the number of recursion queries: the
+	// SCC partition is built once and then queried in O(1).
+	RecursionSCCWork int
 }
 
 type Input struct {
@@ -312,10 +318,11 @@ type builder struct {
 	// (see deadFuncLits) in the function body currently being built.
 	deadLiterals []posRange
 	// prepassFunc is the function whose parameters computeParameterEffects
-	// is analyzing right now; staticCalls is the same-package static call
-	// graph, built on first use, for recursion-cycle questions.
+	// is analyzing right now. recursionSCC is the same-package static call
+	// graph's strongly connected component partition, built once on first
+	// recursion-cycle query and then reused in O(1).
 	prepassFunc        *types.Func
-	staticCalls        map[*types.Func][]*types.Func
+	recursionSCC       map[*types.Func]int
 	pendingObligations []pendingObligation
 	callerFindings     []callerFinding
 	contextInterface   *types.Interface
@@ -2214,8 +2221,8 @@ func (b *builder) paramEffectOf(body *ast.BlockStmt, g *model.CFG, sites map[*as
 
 // isRecursivePass reports whether call, made while a function's parameters
 // are being analyzed, calls a function in the same recursion cycle as that
-// function: it can reach the function again, and the function calls it, so
-// the two are in one strongly connected component of the static call graph.
+// function. The caller itself has the call edge to callee, so this is exactly
+// an SCC-membership question; no per-query reachability search is needed.
 func (b *builder) isRecursivePass(call *ast.CallExpr) bool {
 	if !b.inParamPrepass || b.prepassFunc == nil {
 		return false
@@ -2224,48 +2231,158 @@ func (b *builder) isRecursivePass(call *ast.CallExpr) bool {
 	if callee == nil || b.funcs[callee] == nil {
 		return false
 	}
-	return b.reaches(callee, b.prepassFunc)
+	return b.sameRecursionCycle(callee, b.prepassFunc)
 }
 
-// reaches reports whether from can reach to through same-package static
-// calls (from == to counts: direct self-recursion).
-func (b *builder) reaches(from, to *types.Func) bool {
-	if b.staticCalls == nil {
-		b.staticCalls = map[*types.Func][]*types.Func{}
-		for fn, decl := range b.funcs {
-			if decl.Body == nil {
-				continue
-			}
-			seen := map[*types.Func]bool{}
-			b.inspect(decl.Body, func(n ast.Node) bool {
-				if call, ok := n.(*ast.CallExpr); ok {
-					if callee := b.resolveCalleeFunc(call.Fun); callee != nil && b.funcs[callee] != nil && !seen[callee] {
-						seen[callee] = true
-						b.staticCalls[fn] = append(b.staticCalls[fn], callee)
-					}
-				}
-				return true
-			})
-		}
-	}
-	visited := map[*types.Func]bool{}
-	var walk func(*types.Func) bool
-	walk = func(fn *types.Func) bool {
-		if fn == to {
-			return true
-		}
-		if visited[fn] {
-			return false
-		}
-		visited[fn] = true
-		for _, next := range b.staticCalls[fn] {
-			if walk(next) {
-				return true
-			}
-		}
+// sameRecursionCycle reports whether from and to belong to one strongly
+// connected component of the selected same-package static call graph. The
+// partition is computed once, on demand, so repeated parameter/Done queries do
+// not re-walk long call chains.
+func (b *builder) sameRecursionCycle(from, to *types.Func) bool {
+	if from == nil || to == nil || b.funcs[from] == nil || b.funcs[to] == nil {
 		return false
 	}
-	return walk(from)
+	if !b.ensureRecursionSCCs() {
+		return false
+	}
+	fromID, fromOK := b.recursionSCC[from]
+	toID, toOK := b.recursionSCC[to]
+	return fromOK && toOK && fromID == toID
+}
+
+// ensureRecursionSCCs builds the selected-function call graph and computes one
+// SCC partition with iterative Kosaraju traversals. WorkStats charges each
+// selected declaration and each unique call edge once during graph building,
+// then each node/edge once per SCC pass. This makes the work budget linear in
+// graph size instead of linear per recursion query.
+func (b *builder) ensureRecursionSCCs() bool {
+	if b.recursionSCC != nil {
+		return true
+	}
+
+	graph := make(map[*types.Func][]*types.Func, len(b.funcs))
+	reverse := make(map[*types.Func][]*types.Func, len(b.funcs))
+	for fn := range b.funcs {
+		graph[fn] = nil
+		reverse[fn] = nil
+	}
+	for fn, decl := range b.funcs {
+		if b.cancelled() {
+			return false
+		}
+		if b.stats != nil {
+			b.stats.RecursionSCCWork++
+		}
+		if decl == nil || decl.Body == nil {
+			continue
+		}
+		seen := map[*types.Func]bool{}
+		singleAssign := singleAssignmentTargets(decl.Body, b.in.Info)
+		b.inspect(decl.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callee := b.resolveCalleeFuncWithTargets(call.Fun, singleAssign)
+			if callee == nil || b.funcs[callee] == nil || seen[callee] {
+				return true
+			}
+			seen[callee] = true
+			graph[fn] = append(graph[fn], callee)
+			reverse[callee] = append(reverse[callee], fn)
+			if b.stats != nil {
+				b.stats.RecursionSCCWork++
+			}
+			return true
+		})
+		if b.cancelled() {
+			return false
+		}
+	}
+
+	// First pass: iterative DFS postorder over the forward graph.
+	type frame struct {
+		fn   *types.Func
+		next int
+	}
+	visited := make(map[*types.Func]bool, len(graph))
+	order := make([]*types.Func, 0, len(graph))
+	for root := range graph {
+		if visited[root] {
+			continue
+		}
+		visited[root] = true
+		if b.stats != nil {
+			b.stats.RecursionSCCWork++
+		}
+		stack := []frame{{fn: root}}
+		for len(stack) > 0 {
+			if b.cancelled() {
+				return false
+			}
+			top := &stack[len(stack)-1]
+			edges := graph[top.fn]
+			if top.next < len(edges) {
+				next := edges[top.next]
+				top.next++
+				if b.stats != nil {
+					b.stats.RecursionSCCWork++
+				}
+				if !visited[next] {
+					visited[next] = true
+					if b.stats != nil {
+						b.stats.RecursionSCCWork++
+					}
+					stack = append(stack, frame{fn: next})
+				}
+				continue
+			}
+			order = append(order, top.fn)
+			stack = stack[:len(stack)-1]
+		}
+	}
+
+	// Second pass over reversed edges assigns one component ID per SCC.
+	components := make(map[*types.Func]int, len(graph))
+	assigned := make(map[*types.Func]bool, len(graph))
+	componentID := 0
+	for i := len(order) - 1; i >= 0; i-- {
+		root := order[i]
+		if assigned[root] {
+			continue
+		}
+		assigned[root] = true
+		components[root] = componentID
+		if b.stats != nil {
+			b.stats.RecursionSCCWork++
+		}
+		stack := []*types.Func{root}
+		for len(stack) > 0 {
+			if b.cancelled() {
+				return false
+			}
+			last := len(stack) - 1
+			fn := stack[last]
+			stack = stack[:last]
+			for _, next := range reverse[fn] {
+				if b.stats != nil {
+					b.stats.RecursionSCCWork++
+				}
+				if assigned[next] {
+					continue
+				}
+				assigned[next] = true
+				components[next] = componentID
+				if b.stats != nil {
+					b.stats.RecursionSCCWork++
+				}
+				stack = append(stack, next)
+			}
+		}
+		componentID++
+	}
+	b.recursionSCC = components
+	return true
 }
 
 // usedInUnresolvedLiteral reports whether obj is captured by a function
@@ -6340,7 +6457,7 @@ func (b *builder) doneCalls(body ast.Node, obj types.Object, self *types.Func) (
 		if paramObj == nil {
 			return true
 		}
-		if self != nil && b.reaches(funcObj, self) {
+		if self != nil && b.sameRecursionCycle(funcObj, self) {
 			rec = append(rec, call)
 		}
 		switch effect := b.paramDoneEffects[paramObj]; {
