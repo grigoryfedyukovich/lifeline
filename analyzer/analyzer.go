@@ -140,6 +140,7 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		if pass.ImportObjectFact == nil || fn == nil {
 			return model.Goroutine{}, false
 		}
+		fn = fn.Origin()
 		var fact FunctionFact
 		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
 			return model.Goroutine{}, false
@@ -162,6 +163,7 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		if pass.ImportObjectFact == nil || fn == nil {
 			return 0, false
 		}
+		fn = fn.Origin()
 		var fact FunctionFact
 		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
 			return 0, false
@@ -173,6 +175,7 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		if pass.ImportObjectFact == nil || fn == nil {
 			return 0, false
 		}
+		fn = fn.Origin()
 		var fact FunctionFact
 		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
 			return 0, false
@@ -184,6 +187,7 @@ func run(pass *analysis.Pass, opts *options) (any, error) {
 		if pass.ImportObjectFact == nil || fn == nil {
 			return nil, false
 		}
+		fn = fn.Origin()
 		var fact FunctionFact
 		if !pass.ImportObjectFact(fn, &fact) || fact.Version != version.FactVersion {
 			return nil, false

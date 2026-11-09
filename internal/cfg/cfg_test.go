@@ -745,3 +745,28 @@ func b() {}
 		t.Fatalf("calls in different if/else branches should land in different blocks, both got block %d", siteA.Block)
 	}
 }
+
+func TestCalledObjectNormalizesInstantiatedGenericMethod(t *testing.T) {
+	_, _, info, body := buildWithCallSites(t, `package p
+	type Handler[T any] struct{}
+	func (Handler[T]) Stop() {}
+	func use() { var h Handler[int]; h.Stop() }
+`, "use")
+	var call *ast.CallExpr
+	ast.Inspect(body, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok {
+			call = c
+		}
+		return true
+	})
+	if call == nil {
+		t.Fatal("method call not found")
+	}
+	fn, ok := calledObject(call.Fun, info).(*types.Func)
+	if !ok || fn == nil {
+		t.Fatalf("calledObject = %#v", calledObject(call.Fun, info))
+	}
+	if fn != fn.Origin() {
+		t.Fatalf("calledObject returned instantiated method %v instead of origin %v", fn, fn.Origin())
+	}
+}

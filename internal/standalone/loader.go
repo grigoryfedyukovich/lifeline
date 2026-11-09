@@ -106,7 +106,16 @@ func qualifierPath(p *types.Package) string {
 }
 
 func standaloneFactKey(fn *types.Func) string {
-	if fn == nil || fn.Pkg() == nil {
+	if fn == nil {
+		return ""
+	}
+	// A method selected from an instantiated generic receiver has a distinct
+	// *types.Func identity and signature (for example Handler[int].Stop) even
+	// though facts are recorded on the declaration object (Handler[T].Stop).
+	// Normalize every lookup/record key to the declaration identity so
+	// inter-package standalone summaries do not silently miss generic methods.
+	fn = fn.Origin()
+	if fn.Pkg() == nil {
 		return ""
 	}
 	recv := ""

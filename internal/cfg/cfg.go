@@ -799,14 +799,16 @@ func calleeName(info *types.Info, call *ast.CallExpr) string {
 }
 
 func calledObject(fun ast.Expr, info *types.Info) types.Object {
+	var obj types.Object
 	switch x := fun.(type) {
 	case *ast.Ident:
-		return info.ObjectOf(x)
+		obj = info.ObjectOf(x)
 	case *ast.SelectorExpr:
 		if sel := info.Selections[x]; sel != nil {
-			return sel.Obj()
+			obj = sel.Obj()
+		} else {
+			obj = info.ObjectOf(x.Sel)
 		}
-		return info.ObjectOf(x.Sel)
 	case *ast.IndexExpr:
 		return calledObject(x.X, info)
 	case *ast.IndexListExpr:
@@ -816,6 +818,10 @@ func calledObject(fun ast.Expr, info *types.Info) types.Object {
 	default:
 		return nil
 	}
+	if fn, ok := obj.(*types.Func); ok {
+		return fn.Origin()
+	}
+	return obj
 }
 
 // renderExpr and its list/comm-clause variants produce a short, best-effort

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -990,5 +991,47 @@ func F() {}
 	}
 	if status.Units.ExcludedFiles != 1 || status.Units.Discovered != 0 || status.Units.Analyzed != 0 {
 		t.Fatalf("status units=%#v, want one excluded file and no function units", status.Units)
+	}
+}
+
+func TestStandaloneFactKeyNormalizesInstantiatedGenericMethod(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "generic.go", `package p
+	type Handler[T any] struct{}
+	func (Handler[T]) Stop() {}
+	func use() { var h Handler[int]; h.Stop() }
+`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Defs:       map[*ast.Ident]types.Object{},
+		Uses:       map[*ast.Ident]types.Object{},
+		Types:      map[ast.Expr]types.TypeAndValue{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+	}
+	if _, err := (&types.Config{}).Check("example.test/p", fset, []*ast.File{file}, info); err != nil {
+		t.Fatal(err)
+	}
+	var instantiated *types.Func
+	ast.Inspect(file, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Stop" {
+			return true
+		}
+		if selection := info.Selections[sel]; selection != nil {
+			instantiated, _ = selection.Obj().(*types.Func)
+		}
+		return true
+	})
+	if instantiated == nil {
+		t.Fatal("instantiated method selection not found")
+	}
+	origin := instantiated.Origin()
+	if instantiated == origin {
+		t.Fatal("test did not obtain an instantiated method object")
+	}
+	if got, want := standaloneFactKey(instantiated), standaloneFactKey(origin); got != want {
+		t.Fatalf("instantiated fact key = %q, origin key = %q", got, want)
 	}
 }

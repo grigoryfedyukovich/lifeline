@@ -11,8 +11,6 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
-
-	"golang.org/x/tools/go/types/typeutil"
 )
 
 type Op string
@@ -115,7 +113,7 @@ func calleeName(info *types.Info, call *ast.CallExpr) string {
 	if call == nil {
 		return ""
 	}
-	obj := typeutil.Callee(info, call)
+	obj := calledObject(call.Fun, info)
 	fn, ok := obj.(*types.Func)
 	if !ok {
 		if obj != nil {
@@ -123,6 +121,7 @@ func calleeName(info *types.Info, call *ast.CallExpr) string {
 		}
 		return ""
 	}
+	fn = fn.Origin()
 	if fn.Pkg() == nil {
 		return fn.Name()
 	}
@@ -136,6 +135,35 @@ func calleeName(info *types.Info, call *ast.CallExpr) string {
 		}
 	}
 	return fn.Pkg().Path() + "." + fn.Name()
+}
+
+func calledObject(fun ast.Expr, info *types.Info) types.Object {
+	if info == nil {
+		return nil
+	}
+	var obj types.Object
+	switch x := fun.(type) {
+	case *ast.Ident:
+		obj = info.ObjectOf(x)
+	case *ast.SelectorExpr:
+		if sel := info.Selections[x]; sel != nil {
+			obj = sel.Obj()
+		} else {
+			obj = info.ObjectOf(x.Sel)
+		}
+	case *ast.IndexExpr:
+		return calledObject(x.X, info)
+	case *ast.IndexListExpr:
+		return calledObject(x.X, info)
+	case *ast.ParenExpr:
+		return calledObject(x.X, info)
+	default:
+		return nil
+	}
+	if fn, ok := obj.(*types.Func); ok {
+		return fn.Origin()
+	}
+	return obj
 }
 
 func identifierUses(n ast.Node, info *types.Info, versions map[types.Object]int) []string {
