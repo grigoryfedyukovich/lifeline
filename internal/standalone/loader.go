@@ -580,7 +580,7 @@ func classifySourceExclusions(ctx context.Context, p listedPackage, includeTests
 		}
 		// A package-clause-only parse is sufficient for the generated-code
 		// convention because the marker must occur before the package clause.
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly|parser.ParseComments)
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly|parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			return nil, 0, fmt.Errorf("classify %s: %w", path, err)
 		}
@@ -1064,7 +1064,7 @@ func (l *packageLoader) loadOneFiltered(ctx context.Context, p listedPackage, in
 			actual = abs
 		}
 		actual = filepath.Clean(actual)
-		parseMode := parser.AllErrors
+		parseMode := parser.AllErrors | parser.SkipObjectResolution
 		// Type checking never consumes comments. For ordinary source files that
 		// were already excluded by path/generated-marker classification, avoid
 		// allocating their comment AST as well. cgo translated inputs need

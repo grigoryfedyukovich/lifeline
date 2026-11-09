@@ -1035,3 +1035,33 @@ func TestStandaloneFactKeyNormalizesInstantiatedGenericMethod(t *testing.T) {
 		t.Fatalf("instantiated fact key = %q, origin key = %q", got, want)
 	}
 }
+
+func TestLoadOneDeepSourceSkipsParserObjectResolution(t *testing.T) {
+	const depth = 1200 // exceeds go/parser's legacy object-resolution scope limit
+	var src strings.Builder
+	src.WriteString("package p\nfunc Deep() {\n")
+	for i := 0; i < depth; i++ {
+		src.WriteString("{\n")
+	}
+	src.WriteString("var x int\n_ = x\n")
+	for i := 0; i < depth; i++ {
+		src.WriteString("}\n")
+	}
+	src.WriteString("}\n")
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "deep.go"), []byte(src.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadOne(context.Background(), listedPackage{
+		Dir:        dir,
+		ImportPath: "example.test/deep",
+		GoFiles:    []string{"deep.go"},
+	}, nil, false)
+	if err != nil {
+		t.Fatalf("deep valid Go source failed standalone loading: %v", err)
+	}
+	if loaded == nil || len(loaded.Files) != 1 {
+		t.Fatalf("loaded package = %#v, want one parsed file", loaded)
+	}
+}
