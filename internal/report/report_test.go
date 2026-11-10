@@ -3,6 +3,8 @@ package report
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -162,5 +164,61 @@ func TestReport_SARIFCarriesTheStatus(t *testing.T) {
 	}
 	if len(log.Runs) != 1 || !log.Runs[0].Properties.Incomplete || log.Runs[0].Properties.Status.Units.Skipped != 3 {
 		t.Errorf("SARIF run properties must carry the status: %s", out)
+	}
+}
+
+func TestReport_SARIFUsesUTF16ColumnsAndEncodedArtifactURI(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "space ü.go")
+	const source = "package p\nvar s = \"😀\"; bad()\n"
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	diag := engine.Diagnostic{
+		RuleID:  "LL1001",
+		Verdict: engine.Warning,
+		Message: "test",
+		Position: model.Span{
+			File: path, StartLine: 2, StartColumn: 17,
+			EndLine: 2, EndColumn: 20,
+		},
+	}
+	var buf bytes.Buffer
+	if err := Write(&buf, "sarif", []engine.Diagnostic{diag}, engine.Coverage{}, engine.Status{}, dir); err != nil {
+		t.Fatal(err)
+	}
+	var log struct {
+		Runs []struct {
+			ColumnKind string `json:"columnKind"`
+			Results    []struct {
+				Locations []struct {
+					PhysicalLocation struct {
+						ArtifactLocation struct {
+							URI string `json:"uri"`
+						} `json:"artifactLocation"`
+						Region struct {
+							StartColumn int `json:"startColumn"`
+							EndColumn   int `json:"endColumn"`
+						} `json:"region"`
+					} `json:"physicalLocation"`
+				} `json:"locations"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &log); err != nil {
+		t.Fatal(err)
+	}
+	if len(log.Runs) != 1 || log.Runs[0].ColumnKind != "utf16CodeUnits" {
+		t.Fatalf("columnKind = %#v", log.Runs)
+	}
+	loc := log.Runs[0].Results[0].Locations[0].PhysicalLocation
+	if got, want := loc.ArtifactLocation.URI, "space%20%C3%BC.go"; got != want {
+		t.Fatalf("artifact URI = %q, want %q", got, want)
+	}
+	if got, want := loc.Region.StartColumn, 15; got != want {
+		t.Fatalf("UTF-16 startColumn = %d, want %d", got, want)
+	}
+	if got, want := loc.Region.EndColumn, 18; got != want {
+		t.Fatalf("UTF-16 endColumn = %d, want %d", got, want)
 	}
 }

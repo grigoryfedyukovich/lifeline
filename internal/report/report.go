@@ -2,12 +2,16 @@ package report
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gfedyukovich/lifeline/internal/engine"
 	"github.com/gfedyukovich/lifeline/internal/model"
@@ -241,6 +245,7 @@ type sarifLog struct {
 type sarifRun struct {
 	Tool       sarifTool      `json:"tool"`
 	Results    []sarifResult  `json:"results"`
+	ColumnKind string         `json:"columnKind,omitempty"`
 	Properties map[string]any `json:"properties,omitempty"`
 }
 
@@ -281,10 +286,67 @@ type sarifPhysical struct {
 	} `json:"artifactLocation"`
 	Region struct {
 		StartLine   int `json:"startLine"`
-		StartColumn int `json:"startColumn"`
+		StartColumn int `json:"startColumn,omitempty"`
 		EndLine     int `json:"endLine,omitempty"`
 		EndColumn   int `json:"endColumn,omitempty"`
 	} `json:"region"`
+}
+
+func sourcePath(path, cwd string) string {
+	if path == "" || filepath.IsAbs(path) || cwd == "" {
+		return path
+	}
+	return filepath.Join(cwd, path)
+}
+
+func sarifArtifactURI(path, cwd string) string {
+	displayed := filepath.ToSlash(displayPath(path, cwd))
+	// URL.Path escapes spaces, non-ASCII bytes, '#', '%' and other URI syntax
+	// while preserving path separators. SARIF artifactLocation.uri is a URI,
+	// not an OS path, even when the artifact is relative to the invocation cwd.
+	u := url.URL{Path: displayed}
+	return u.EscapedPath()
+}
+
+// utf16Column converts Go token.Position's one-based UTF-8 byte column into
+// SARIF's one-based UTF-16 code-unit column. A false result means the source
+// line/column could not be verified; callers then omit the column rather than
+// falsely labeling a byte column as utf16CodeUnits.
+func utf16Column(data []byte, line, byteColumn int) (int, bool) {
+	if line < 1 || byteColumn < 1 {
+		return 0, false
+	}
+	lineStart := 0
+	currentLine := 1
+	for currentLine < line {
+		i := bytes.IndexByte(data[lineStart:], '\n')
+		if i < 0 {
+			return 0, false
+		}
+		lineStart += i + 1
+		currentLine++
+	}
+	lineEnd := len(data)
+	if i := bytes.IndexByte(data[lineStart:], '\n'); i >= 0 {
+		lineEnd = lineStart + i
+	}
+	prefixBytes := byteColumn - 1
+	if prefixBytes < 0 || lineStart+prefixBytes > lineEnd {
+		return 0, false
+	}
+	prefix := data[lineStart : lineStart+prefixBytes]
+	if !utf8.Valid(prefix) {
+		return 0, false
+	}
+	units := 0
+	for _, r := range string(prefix) {
+		if r > 0xFFFF {
+			units += 2
+		} else {
+			units++
+		}
+	}
+	return units + 1, true
 }
 
 func makeSARIF(diags []engine.Diagnostic, coverage engine.Coverage, status engine.Status, cwd string) sarifLog {
@@ -301,7 +363,7 @@ func makeSARIF(diags []engine.Diagnostic, coverage engine.Coverage, status engin
 	// per-target results: unsupported targets are not rule violations, and
 	// giving them a fabricated ruleId would misrepresent them as findings
 	// against a registered rule to SARIF consumers.
-	run := sarifRun{Tool: sarifTool{Driver: driver}, Results: []sarifResult{}, Properties: map[string]any{"backend": version.Backend, "coverage": relativeCoverage(coverage, cwd), "status": status, "incomplete": status.Incomplete}}
+	run := sarifRun{Tool: sarifTool{Driver: driver}, Results: []sarifResult{}, ColumnKind: "utf16CodeUnits", Properties: map[string]any{"backend": version.Backend, "coverage": relativeCoverage(coverage, cwd), "status": status, "incomplete": status.Incomplete}}
 	for _, d := range diags {
 		level := "warning"
 		if d.Verdict == engine.Unknown {
@@ -311,11 +373,19 @@ func makeSARIF(diags []engine.Diagnostic, coverage engine.Coverage, status engin
 		r.Message.Text = d.Message
 		if d.Position.File != "" {
 			var loc sarifLocation
-			loc.PhysicalLocation.ArtifactLocation.URI = filepath.ToSlash(displayPath(d.Position.File, cwd))
+			loc.PhysicalLocation.ArtifactLocation.URI = sarifArtifactURI(d.Position.File, cwd)
 			loc.PhysicalLocation.Region.StartLine = max(1, d.Position.StartLine)
-			loc.PhysicalLocation.Region.StartColumn = max(1, d.Position.StartColumn)
-			loc.PhysicalLocation.Region.EndLine = d.Position.EndLine
-			loc.PhysicalLocation.Region.EndColumn = d.Position.EndColumn
+			if d.Position.EndLine > 0 {
+				loc.PhysicalLocation.Region.EndLine = d.Position.EndLine
+			}
+			if data, err := os.ReadFile(sourcePath(d.Position.File, cwd)); err == nil {
+				if col, ok := utf16Column(data, d.Position.StartLine, d.Position.StartColumn); ok {
+					loc.PhysicalLocation.Region.StartColumn = col
+				}
+				if col, ok := utf16Column(data, d.Position.EndLine, d.Position.EndColumn); ok {
+					loc.PhysicalLocation.Region.EndColumn = col
+				}
+			}
 			r.Locations = []sarifLocation{loc}
 		}
 		run.Results = append(run.Results, r)
