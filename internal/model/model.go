@@ -201,6 +201,7 @@ const (
 	EdgeGoto        EdgeKind = "goto"         // an explicit goto to a labeled statement
 	EdgeReturn      EdgeKind = "return"       // return, to the function's Exit block
 	EdgePanic       EdgeKind = "panic"        // panic(...), to the function's Exit block
+	EdgeTerminate   EdgeKind = "terminate"    // a known non-returning process/goroutine terminator (os.Exit/runtime.Goexit), to Exit
 	EdgeTrustedStop EdgeKind = "trusted-stop" // from a recognized stop-wrapper call or context delegation straight to Exit: the callee is trusted to be ABLE to end the worker; the block also keeps its ordinary edge to the code after the call, since the call may return normally
 )
 

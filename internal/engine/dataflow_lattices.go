@@ -155,7 +155,7 @@ func StopCapabilityDataflow(g *model.CFG, hasContext bool) map[model.BlockID]Sto
 		}
 		for _, e := range blk.Successors {
 			switch e.Kind {
-			case model.EdgeTrustedStop, model.EdgeReturn, model.EdgePanic:
+			case model.EdgeTrustedStop, model.EdgeReturn, model.EdgePanic, model.EdgeTerminate:
 				return true
 			}
 		}

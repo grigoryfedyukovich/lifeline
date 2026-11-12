@@ -418,6 +418,39 @@ func F() {
 	}
 }
 
+func TestStandardLibraryHardTerminatorsReachExit(t *testing.T) {
+	tests := []struct {
+		name, source string
+	}{
+		{"os.Exit", `package p
+import "os"
+func F() {
+	os.Exit(2)
+	println("unreachable")
+}
+`},
+		{"runtime.Goexit", `package p
+import "runtime"
+func F() {
+	runtime.Goexit()
+	println("unreachable")
+}
+`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := build(t, tc.source, "F")
+			terminates := edgesOfKind(g, model.EdgeTerminate)
+			if len(terminates) != 1 {
+				t.Fatalf("terminate edges = %d, want 1", len(terminates))
+			}
+			if terminates[0].To != g.Exit {
+				t.Fatalf("hard terminator should target Exit directly")
+			}
+		})
+	}
+}
+
 func TestGotoForwardAndBackward(t *testing.T) {
 	g := build(t, `package p
 func F() {

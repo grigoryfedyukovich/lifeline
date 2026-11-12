@@ -1872,6 +1872,19 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 			b.observeReturn(x, cancels, groups, claimed)
 		case *ast.AssignStmt:
 			b.observeEscapeAssignment(x, cancels, groups)
+		case *ast.SendStmt:
+			// Sending a cancel function through a channel transfers ownership to
+			// the receiver. We intentionally stop at this direct syntactic handoff:
+			// recovering the value at the other end would require the broader alias
+			// analysis that remains outside Lifeline's documented model.
+			used := objectsUsedInExpressions([]ast.Expr{x.Value}, b.in.Info, true)
+			for _, c := range cancels {
+				if c.cancelObj == nil || !hasObject(used, c.cancelObj) {
+					continue
+				}
+				c.binding.Escapes = true
+				c.binding.Evidence = append(c.binding.Evidence, model.Evidence{Kind: "channel-transfer", Message: "cleanup is sent through a channel; ownership is transferred to the receiver", Span: ptrSpan(b.span(x))})
+			}
 		case *ast.CompositeLit:
 			b.observeContainerEscape(x, cancels, groups, claimed)
 		case *ast.ValueSpec:
@@ -8884,6 +8897,10 @@ func (b *builder) loopExitEvidence(loop *ast.ForStmt, label string, contexts map
 			return true
 		case *ast.CallExpr:
 			callName := b.callName(x)
+			if callName == "os.Exit" || callName == "runtime.Goexit" {
+				explicitStop = true
+				evidence = append(evidence, model.Evidence{Kind: "explicit-termination", Message: "non-returning termination operation: " + callName, Span: ptrSpan(b.span(x))})
+			}
 			if b.hasWrapper(b.stopWrappers, callName) {
 				explicitStop = true
 				evidence = append(evidence, model.Evidence{Kind: "configured-stop", Message: "configured stop operation: " + callName, Span: ptrSpan(b.span(x))})

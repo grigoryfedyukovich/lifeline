@@ -393,6 +393,12 @@ func (b *builder) simpleStmt(s ast.Node) {
 		b.current = invalidBlock
 		return
 	}
+	if call, ok := b.findCall(s, b.isHardTerminatorCall); ok {
+		b.emit("terminate", s, calleeName(b.info, call), nil, nil)
+		b.addEdge(b.ensureCurrent(), b.exit, model.EdgeTerminate, "", b.spanOf(s))
+		b.current = invalidBlock
+		return
+	}
 	if b.isTrustedTerminator != nil {
 		if call, ok := b.findCall(s, b.isTrustedTerminator); ok {
 			// A trusted call is an assumption about what the callee does
@@ -499,6 +505,27 @@ func (b *builder) isPanicCall(call *ast.CallExpr) bool {
 	}
 	_, isBuiltin := obj.(*types.Builtin)
 	return isBuiltin
+}
+
+// isHardTerminatorCall recognizes standard-library calls whose documented
+// control-flow semantics never continue at the following statement. os.Exit
+// terminates the process; runtime.Goexit terminates the current goroutine.
+// Resolve by types.Object rather than spelling so local lookalikes cannot be
+// mistaken for terminators.
+func (b *builder) isHardTerminatorCall(call *ast.CallExpr) bool {
+	if call == nil || b.info == nil {
+		return false
+	}
+	fn, ok := calledObject(call.Fun, b.info).(*types.Func)
+	if !ok || fn.Pkg() == nil {
+		return false
+	}
+	switch fn.Pkg().Path() + "." + fn.Name() {
+	case "os.Exit", "runtime.Goexit":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *builder) ifStmt(x *ast.IfStmt) {
