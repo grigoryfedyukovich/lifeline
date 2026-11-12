@@ -134,3 +134,103 @@ func TestLoadFromResolvesRelativePathAgainstModuleRoot(t *testing.T) {
 		t.Fatalf("timeout = %q, want 17s", cfg.Timeout)
 	}
 }
+
+func TestDuplicateKeysAreRejected(t *testing.T) {
+	tests := []struct {
+		name, ext, data string
+	}{
+		{"yaml scalar", ".yaml", "schema_version: 1\ntimeout: 1s\ntimeout: 2s\n"},
+		{"yaml block then inline", ".yaml", "schema_version: 1\nfail_on:\n  - LL1001\nfail_on: [LL1002]\n"},
+		{"toml", ".toml", "schema_version = 1\ntimeout = \"1s\"\ntimeout = \"2s\"\n"},
+		{"json", ".json", `{"schema_version":1,"timeout":"1s","timeout":"2s"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "lifeline"+tc.ext)
+			if err := os.WriteFile(path, []byte(tc.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), "duplicate key") {
+				t.Fatalf("expected duplicate-key error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsUTF8BOM(t *testing.T) {
+	tests := []struct {
+		ext, data string
+	}{
+		{".yaml", "schema_version: 1\ntimeout: 9s\n"},
+		{".toml", "schema_version = 1\ntimeout = \"9s\"\n"},
+		{".json", `{"schema_version":1,"timeout":"9s"}`},
+	}
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	for _, tc := range tests {
+		t.Run(tc.ext, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "lifeline"+tc.ext)
+			data := append(append([]byte{}, bom...), []byte(tc.data)...)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Timeout != "9s" {
+				t.Fatalf("timeout = %q, want 9s", cfg.Timeout)
+			}
+		})
+	}
+}
+
+func TestQuotedValuesPreserveCommentMarkersAndEscapes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lifeline.yaml")
+	data := "schema_version: 1\ncontext_wrappers: [\"example.com/a\\\"#b.WithCancel\", 'example.com/it''s#ok.WithCancel'] # comment\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`example.com/a"#b.WithCancel`, "example.com/it's#ok.WithCancel"}
+	if !reflect.DeepEqual(cfg.ContextWrappers, want) {
+		t.Fatalf("context_wrappers = %#v, want %#v", cfg.ContextWrappers, want)
+	}
+}
+
+func TestFindStopsAtNearestModuleRoot(t *testing.T) {
+	outer := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outer, "lifeline.yaml"), []byte("schema_version: 1\ntimeout: 41s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	module := filepath.Join(outer, "module")
+	pkg := filepath.Join(module, "nested", "pkg")
+	if err := os.MkdirAll(pkg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, "go.mod"), []byte("module example.com/inner\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	found, err := Find(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found != "" {
+		t.Fatalf("Find crossed module root and returned %q", found)
+	}
+	inside := filepath.Join(module, ".lifeline.toml")
+	if err := os.WriteFile(inside, []byte("schema_version = 1\ntimeout = \"13s\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	found, err = Find(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found != inside {
+		t.Fatalf("Find = %q, want module-root config %q", found, inside)
+	}
+}

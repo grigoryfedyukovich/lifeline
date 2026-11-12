@@ -166,6 +166,7 @@ func LoadFrom(path, baseDir string) (Config, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read config %s: %w", path, err)
 	}
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".json":
@@ -191,20 +192,9 @@ func LoadFrom(path, baseDir string) (Config, error) {
 // found, the absolute starting directory is returned so callers still have a
 // stable path base outside module mode.
 func ModuleRoot(start string) (string, error) {
-	if start == "" {
-		var err error
-		start, err = os.Getwd()
-		if err != nil {
-			return "", err
-		}
-	}
-	abs, err := filepath.Abs(start)
+	dir, err := startingDir(start)
 	if err != nil {
 		return "", err
-	}
-	dir := abs
-	if st, statErr := os.Stat(abs); statErr == nil && !st.IsDir() {
-		dir = filepath.Dir(abs)
 	}
 	fallback := dir
 	for {
@@ -220,6 +210,32 @@ func ModuleRoot(start string) (string, error) {
 }
 
 func Find(start string) (string, error) {
+	dir, err := startingDir(start)
+	if err != nil {
+		return "", err
+	}
+	moduleRoot, hasModule := nearestModuleRoot(dir)
+	names := []string{"lifeline.yaml", ".lifeline.yaml", "lifeline.yml", ".lifeline.yml", "lifeline.toml", ".lifeline.toml", "lifeline.json", ".lifeline.json"}
+	for {
+		for _, name := range names {
+			p := filepath.Join(dir, name)
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				return p, nil
+			}
+		}
+		if hasModule && dir == moduleRoot {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return "", nil
+}
+
+func startingDir(start string) (string, error) {
 	if start == "" {
 		var err error
 		start, err = os.Getwd()
@@ -227,27 +243,32 @@ func Find(start string) (string, error) {
 			return "", err
 		}
 	}
-	start, err := filepath.Abs(start)
+	abs, err := filepath.Abs(start)
 	if err != nil {
 		return "", err
 	}
-	names := []string{"lifeline.yaml", ".lifeline.yaml", "lifeline.yml", ".lifeline.yml", "lifeline.toml", ".lifeline.toml", "lifeline.json", ".lifeline.json"}
-	for dir := start; ; dir = filepath.Dir(dir) {
-		for _, name := range names {
-			p := filepath.Join(dir, name)
-			if st, err := os.Stat(p); err == nil && !st.IsDir() {
-				return p, nil
-			}
+	if st, statErr := os.Stat(abs); statErr == nil && !st.IsDir() {
+		return filepath.Dir(abs), nil
+	}
+	return abs, nil
+}
+
+func nearestModuleRoot(startDir string) (string, bool) {
+	for dir := startDir; ; dir = filepath.Dir(dir) {
+		if st, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil && !st.IsDir() {
+			return dir, true
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			break
+			return "", false
 		}
 	}
-	return "", nil
 }
 
 func decodeJSON(data []byte, cfg *Config) error {
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
@@ -255,6 +276,40 @@ func decodeJSON(data []byte, cfg *Config) error {
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return errors.New("config contains multiple JSON values")
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return errors.New("config must be a JSON object")
+	}
+	seen := map[string]struct{}{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return errors.New("config contains a non-string JSON key")
+		}
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("duplicate key %q", key)
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -283,8 +338,22 @@ var setters = map[string]func(*Config, any) error{
 func decodeFlat(data []byte, sep byte, cfg *Config) error {
 	s := bufio.NewScanner(bytes.NewReader(data))
 	lineNo := 0
-	pending := ""
-	lists := map[string][]string{}
+	pendingKey := ""
+	pendingLine := 0
+	var pendingValues []string
+	seen := map[string]int{}
+	flushPending := func() error {
+		if pendingKey == "" {
+			return nil
+		}
+		if err := setters[pendingKey](cfg, pendingValues); err != nil {
+			return fmt.Errorf("line %d: key %s: %w", pendingLine, pendingKey, err)
+		}
+		pendingKey = ""
+		pendingLine = 0
+		pendingValues = nil
+		return nil
+	}
 	for s.Scan() {
 		lineNo++
 		raw := strings.TrimSpace(stripComment(s.Text()))
@@ -292,15 +361,18 @@ func decodeFlat(data []byte, sep byte, cfg *Config) error {
 			continue
 		}
 		if strings.HasPrefix(raw, "-") {
-			if sep != ':' || pending == "" {
+			if sep != ':' || pendingKey == "" {
 				return fmt.Errorf("line %d: list item without a preceding key", lineNo)
 			}
 			item, err := asString(strings.TrimSpace(strings.TrimPrefix(raw, "-")))
 			if err != nil {
 				return fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			lists[pending] = append(lists[pending], item)
+			pendingValues = append(pendingValues, item)
 			continue
+		}
+		if err := flushPending(); err != nil {
+			return err
 		}
 		idx := strings.IndexByte(raw, sep)
 		if idx <= 0 {
@@ -312,10 +384,14 @@ func decodeFlat(data []byte, sep byte, cfg *Config) error {
 		if !ok {
 			return fmt.Errorf("line %d: unknown key %q", lineNo, key)
 		}
-		pending = ""
+		if firstLine, exists := seen[key]; exists {
+			return fmt.Errorf("line %d: duplicate key %q (first set on line %d)", lineNo, key, firstLine)
+		}
+		seen[key] = lineNo
 		if val == "" && sep == ':' {
-			pending = key
-			lists[key] = nil
+			pendingKey = key
+			pendingLine = lineNo
+			pendingValues = nil
 			continue
 		}
 		parsed, err := parseValue(val)
@@ -329,23 +405,27 @@ func decodeFlat(data []byte, sep byte, cfg *Config) error {
 	if err := s.Err(); err != nil {
 		return err
 	}
-	for key, values := range lists {
-		if err := setters[key](cfg, values); err != nil {
-			return fmt.Errorf("key %s: %w", key, err)
-		}
-	}
-	return nil
+	return flushPending()
 }
 
 func stripComment(s string) string {
-	quote := rune(0)
-	for i, r := range s {
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote == '"' && c == '\\' {
+			i++ // the escaped byte remains inside the double-quoted string
+			continue
+		}
+		if quote == '\'' && c == '\'' && i+1 < len(s) && s[i+1] == '\'' {
+			i++ // YAML-style doubled single quote
+			continue
+		}
 		switch {
-		case quote == 0 && (r == '\'' || r == '"'):
-			quote = r
-		case quote != 0 && r == quote:
+		case quote == 0 && (c == '\'' || c == '"'):
+			quote = c
+		case quote != 0 && c == quote:
 			quote = 0
-		case quote == 0 && r == '#':
+		case quote == 0 && c == '#':
 			return s[:i]
 		}
 	}
@@ -396,8 +476,12 @@ func splitArrayElements(s string) ([]string, error) {
 			escaped = false
 			continue
 		}
-		if quote != 0 && c == '\\' {
+		if quote == '"' && c == '\\' {
 			escaped = true
+			continue
+		}
+		if quote == '\'' && c == '\'' && i+1 < len(s) && s[i+1] == '\'' {
+			i++
 			continue
 		}
 		switch {
@@ -430,8 +514,25 @@ func asString(v any) (string, error) {
 		return "", fmt.Errorf("expected string, got %T", v)
 	}
 	s = strings.TrimSpace(s)
-	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
-		s = s[1 : len(s)-1]
+	if s == "" {
+		return "", errors.New("string value cannot be empty")
+	}
+	if s[0] == '"' {
+		if len(s) < 2 || s[len(s)-1] != '"' {
+			return "", errors.New("unterminated double-quoted string")
+		}
+		unquoted, err := strconv.Unquote(s)
+		if err != nil {
+			return "", fmt.Errorf("invalid double-quoted string: %w", err)
+		}
+		s = unquoted
+	} else if s[0] == '\'' {
+		if len(s) < 2 || s[len(s)-1] != '\'' {
+			return "", errors.New("unterminated single-quoted string")
+		}
+		s = strings.ReplaceAll(s[1:len(s)-1], "''", "'")
+	} else if s[len(s)-1] == '"' || s[len(s)-1] == '\'' {
+		return "", errors.New("unexpected closing quote in string value")
 	}
 	if s == "" {
 		return "", errors.New("string value cannot be empty")

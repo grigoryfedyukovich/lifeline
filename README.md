@@ -72,15 +72,16 @@ The analyzer deliberately does not report one-shot goroutines merely because the
 
 ## Configuration
 
-Lifeline searches upward from the Go module root (or the working directory
-outside module mode) for:
+Lifeline configuration discovery searches upward but never crosses the nearest
+Go module root (and searches to the filesystem root outside module mode) for:
 
 ```text
 lifeline.yaml  .lifeline.yaml  lifeline.yml  .lifeline.yml
 lifeline.toml  .lifeline.toml  lifeline.json .lifeline.json
 ```
 
-An explicit relative `-config` path is also resolved from the module root in
+The standalone and `go vet` drivers start discovery at the module root. An
+explicit relative `-config` path is also resolved from the module root in
 both standalone and `go vet` modes. This keeps one vet invocation from
 reinterpreting the path separately for each package.
 
