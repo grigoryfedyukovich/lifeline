@@ -163,8 +163,20 @@ Under `go vet`, which shows only diagnostics, the same data is available as a re
 -timeout DURATION     analysis timeout across selected roots, starting after package discovery
 -max-functions N      per-package analysis bound
 -tests                include package tests, including external package_test files
+-dump KIND            bypass diagnostics and dump cfg or facts
+-dump-format FORMAT   dump format: cfg=text|dot, facts=text|json
 -print-config         print effective configuration
 -version              print tool and backend versions
+```
+
+For structural inspection, `-dump cfg` emits the control-flow graph without
+running diagnostics (`-dump-format text` or `dot`), while `-dump facts` emits
+the per-worker lifecycle facts used by the analyzer (`-dump-format text` or
+`json`). For example:
+
+```bash
+lifeline -dump cfg -dump-format dot ./...
+lifeline -dump facts -dump-format json ./...
 ```
 
 Exit codes:

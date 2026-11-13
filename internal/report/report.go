@@ -81,7 +81,18 @@ func writeText(w io.Writer, diags []engine.Diagnostic, coverage engine.Coverage,
 		if file == "" {
 			file = d.PackagePath
 		}
-		if _, err := fmt.Fprintf(buffered, "%s:%d:%d: [%s] %s\n", file, d.Position.StartLine, d.Position.StartColumn, d.RuleID, d.Message); err != nil {
+		var err error
+		switch {
+		case d.Position.StartLine > 0 && d.Position.StartColumn > 0:
+			_, err = fmt.Fprintf(buffered, "%s:%d:%d: [%s] %s\n", file, d.Position.StartLine, d.Position.StartColumn, d.RuleID, d.Message)
+		case d.Position.StartLine > 0:
+			_, err = fmt.Fprintf(buffered, "%s:%d: [%s] %s\n", file, d.Position.StartLine, d.RuleID, d.Message)
+		case file != "":
+			_, err = fmt.Fprintf(buffered, "%s: [%s] %s\n", file, d.RuleID, d.Message)
+		default:
+			_, err = fmt.Fprintf(buffered, "[%s] %s\n", d.RuleID, d.Message)
+		}
+		if err != nil {
 			return err
 		}
 		if len(d.Evidence) > 0 {

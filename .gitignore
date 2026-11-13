@@ -1,5 +1,4 @@
 /bin/
-*txt
-*.sarif
-lifeline.json
+/lifeline.json
+/lifeline.sarif
 .DS_Store

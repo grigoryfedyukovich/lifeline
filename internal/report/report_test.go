@@ -96,6 +96,16 @@ func TestReport_TextSaysIncompleteEvenWhenTheNoticeIsHidden(t *testing.T) {
 	}
 }
 
+func TestReport_PositionlessLL9001DoesNotPrintZeroCoordinates(t *testing.T) {
+	out := render(t, "text", truncated(), nil)
+	if !strings.Contains(out, "[LL9001]") {
+		t.Fatalf("expected LL9001 in text output:\n%s", out)
+	}
+	if strings.Contains(out, ":0:0:") || strings.Contains(out, ":0:") {
+		t.Fatalf("positionless LL9001 must not print synthetic zero coordinates:\n%s", out)
+	}
+}
+
 func modeledClean() model.Program {
 	yes := true
 	return model.Program{PackagePath: "example.test/p", FunctionCount: 1, Functions: []model.Function{{Name: "example.test/p.f", Cancels: []model.CancelBinding{{Factory: "context.WithCancel", Called: true, CalledOnAllPaths: &yes}}}}}
