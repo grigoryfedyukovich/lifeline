@@ -120,14 +120,16 @@ func (c Config) Validate() error {
 		if id == "all" {
 			continue
 		}
-		if !knownRule(id) {
+		if !IsKnownRule(id) {
 			return fmt.Errorf("unknown rule identifier %q", id)
 		}
 	}
 	return nil
 }
 
-func knownRule(id string) bool {
+// IsKnownRule reports whether id names a diagnostic rule accepted by
+// configuration and source suppression directives.
+func IsKnownRule(id string) bool {
 	switch id {
 	case "LL1001", "LL1002", "LL1003", "LL1004", "LL1005", "LL9001":
 		return true

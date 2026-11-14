@@ -32,7 +32,8 @@ type statusReport struct {
 			HandedOff int `json:"handed_off_obligations"`
 		} `json:"unsupported"`
 		Suppressed struct {
-			ByConfig int `json:"by_config"`
+			ByConfig  int `json:"by_config"`
+			ByComment int `json:"by_comment"`
 		} `json:"suppressed"`
 	} `json:"status"`
 }
@@ -64,6 +65,26 @@ func writeConfig(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestStatus_InlineSuppressionParsing(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	report, code := runJSON(t, root, binary, "./tests/testdata/suppressions")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if len(report.Diagnostics) != 2 {
+		t.Fatalf("diagnostics = %#v, want two unsuppressed near-miss/invalid directives", report.Diagnostics)
+	}
+	for _, diagnostic := range report.Diagnostics {
+		if diagnostic.RuleID != "LL1001" {
+			t.Fatalf("diagnostics = %#v, want only LL1001", report.Diagnostics)
+		}
+	}
+	if report.Status.Suppressed.ByComment != 1 {
+		t.Fatalf("comment suppressions = %d, want 1 valid directive", report.Status.Suppressed.ByComment)
+	}
 }
 
 func TestStatus_StandaloneSuppressedTruncationStaysIncomplete(t *testing.T) {
