@@ -2,7 +2,7 @@ package version
 
 const (
 	Tool           = "lifeline"
-	Version        = "0.1.2"
+	Version        = "0.2.0"
 	InformationURI = "https://github.com/gfedyukovich/lifeline"
 	ReportSchema   = "lifeline.report/v1"
 	// FactVersion 3 (Phase 4, docs/cfg-migration-plan.md) added

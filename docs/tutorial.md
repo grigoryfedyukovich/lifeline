@@ -14,7 +14,7 @@ go build -o ./bin/lifeline ./cmd/lifeline
 A successful version command has this shape:
 
 ```text
-lifeline 0.1.2 (local-ast-types-ssa-summary/v2)
+lifeline 0.2.0 (local-ast-types-ssa-summary/v2)
 ```
 
 You can also install it into `GOBIN`:

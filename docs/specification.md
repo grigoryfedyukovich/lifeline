@@ -1,6 +1,6 @@
 # Lifeline — validated implementation specification
 
-**Specification version:** 0.1.2  
+**Specification version:** 0.2.0  
 **Primary language:** Go 1.25+  
 **Category:** conservative goroutine lifecycle analyzer  
 **Report schema:** `lifeline.report/v1`  
@@ -140,7 +140,7 @@ Stop-signal recognition is correlated per group to the workers that group starts
 - Vet mode exports and imports versioned object facts for named function lifecycle summaries. Since fact schema version 3 (Phase 4, `docs/cfg-migration-plan.md`; the current version is 10, see `internal/version`), the exported fact includes a CFG/SCC-derived `LoopUnresolved` verdict alongside the prior flat booleans, so a cross-package `LL1002` target gets the same precision a same-package or closure target has from `internal/cfg`/`internal/engine`. An incompatible fact version is unavailable, not reinterpreted. Standalone mode computes equivalent in-memory summaries for requested packages and non-standard source dependencies (including third-party modules exposed by `go list`), dependency-first, and also source-summarizes standard-library packages imported directly by requested roots. Those summaries are supplied through the same frontend `Lookup*` interfaces; transitive stdlib packages remain summary-unavailable and conservative.
 - Rendering is isolated in `internal/report`.
 
-There is no Lifeline-managed persistent result cache in v0.1.2. If one is introduced, its key must include the tool and fact versions, Go toolchain/build configuration, source and dependency digests, effective configuration, and backend mode.
+There is no Lifeline-managed persistent result cache in v0.2.0. If one is introduced, its key must include the tool and fact versions, Go toolchain/build configuration, source and dependency digests, effective configuration, and backend mode.
 
 ## 9. Configuration
 
@@ -164,7 +164,7 @@ import/path.Type.Method
 
 The YAML/TOML parser deliberately supports a strict flat subset: scalar values, quoted inline string arrays, and YAML string lists. JSON uses the standard library decoder with unknown-field rejection.
 
-`include_tests` controls `_test.go` lifecycle analysis in both standalone and vet modes and defaults to false; standalone `-tests` enables it from the command line. `ignore_paths` excludes files by path from analysis (not just from reported output): each pattern is matched with `filepath.Match` semantics against both the file's path relative to the Go module root and its base filename. A file carrying the standard `// Code generated ... DO NOT EDIT.` marker is excluded automatically, unconditionally of config. A specific finding can additionally be suppressed inline with a comment-start `//lifeline:ignore` directive, optionally followed by a validated comma-separated rule list and a `-- reason`. An unknown ID invalidates the entire directive; see `docs/limitations.md` for exact matching rules.
+`include_tests` controls `_test.go` lifecycle analysis in both standalone and vet modes and defaults to false; standalone `-tests` enables it from the command line. `ignore_paths` excludes files by path from analysis (not just from reported output): each pattern is matched with `filepath.Match` semantics against both the file's path relative to the Go module root and its base filename. A file carrying the standard `// Code generated ... DO NOT EDIT.` marker is excluded automatically, unconditionally of config. A specific finding can additionally be suppressed inline with a `//lifeline:ignore` (optionally `//lifeline:ignore LL1001,LL1002`) comment; see `docs/limitations.md` for exact matching rules.
 
 ## 10. Output contract
 

@@ -552,16 +552,9 @@ type Program struct {
 	// looked at, reported in the run status so a clean result is not read
 	// as covering it.
 	ExcludedFiles int `json:"excluded_files,omitempty"`
-	// Suppressions maps file -> source line -> parsed suppression directives.
-	// This is an internal control input for the engine, not part of the public
-	// report, so it is excluded from JSON output.
-	Suppressions map[string]map[int][]Suppression `json:"-"`
-}
-
-// Suppression is one validated source directive. Rules contains "*" for a
-// bare suppress-all directive; Reason preserves optional text following "--"
-// so callers do not lose the audit trail even though reasons are not required.
-type Suppression struct {
-	Rules  []string
-	Reason string
+	// Suppressions maps file -> source line -> suppressed rule IDs, derived
+	// from "//lifeline:ignore" comments. "*" means every rule is suppressed
+	// on that line. This is an internal control input for the engine, not
+	// part of the public report, so it is excluded from JSON output.
+	Suppressions map[string]map[int][]string `json:"-"`
 }
