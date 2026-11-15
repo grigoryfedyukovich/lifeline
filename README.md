@@ -14,8 +14,16 @@ Use the analyzer for review, onboarding, and opt-in CI checks of lifecycle proto
 
 ## Two-minute demo
 
+Run the release-checked quick start:
+
 ```bash
-go build -o ./bin/lifeline ./cmd/lifeline
+./scripts/quick_start.sh
+```
+
+The equivalent manual flow starts with:
+
+```bash
+go build -mod=readonly -trimpath -o ./bin/lifeline ./cmd/lifeline
 
 # Diagnostics do not fail the command by default.
 ./bin/lifeline ./examples/ignored_context

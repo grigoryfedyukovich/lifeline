@@ -15,3 +15,21 @@ Run the version-consistency check against a built CLI with:
 
 The check is intentionally strict. A release candidate is invalid if any
 current-version reference diverges, even if the executable itself still builds.
+
+## Clean-clone release gate
+
+Run:
+
+```bash
+./scripts/validate_release.sh
+```
+
+The gate requires the invoking checkout to be clean, records committed `HEAD`,
+clones that exact commit into a temporary directory, runs the complete local CI
+suite there, executes the documented quick start, creates a source package with
+`git archive`, validates every package path against
+`release/package-allowlist.txt`, and confirms the clone is still clean.
+
+Because packaging is based on committed `HEAD`, unrelated untracked files and
+machine-local evidence cannot enter the source archive. There is no dirty-tree
+escape hatch analogous to `--allow-dirty`.
