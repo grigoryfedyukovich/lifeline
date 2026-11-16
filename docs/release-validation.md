@@ -33,3 +33,30 @@ suite there, executes the documented quick start, creates a source package with
 Because packaging is based on committed `HEAD`, unrelated untracked files and
 machine-local evidence cannot enter the source archive. There is no dirty-tree
 escape hatch analogous to `--allow-dirty`.
+
+## Benchmark provenance gate
+
+Release benchmarking is separate from ordinary CI:
+
+```bash
+./scripts/benchmark_release.sh --output /tmp/lifeline-benchmark-v0.2.0
+```
+
+The wrapper requires a clean checkout, runs the complete validation suite,
+builds the release binary with `-mod=readonly -trimpath`, verifies the binary's
+embedded VCS revision and `-version` output against committed `HEAD` and
+`VERSION`, executes every group in `release/benchmark-groups.txt`, and requires
+the configured number of samples for every group. It writes raw benchmark
+output, binary build metadata, release metadata, and median/nearest-rank-p95
+summary rows into the selected output directory.
+
+Existing evidence can be checked independently with:
+
+```bash
+./scripts/validate_benchmark_evidence.sh /path/to/evidence
+```
+
+That command rejects stale commits, wrong versions, dirty-source binaries,
+failed validation status, unknown benchmark groups, and partial sample sets.
+`./scripts/benchmark_release.sh --self-test` exercises those rejection paths
+without running the benchmark matrix.

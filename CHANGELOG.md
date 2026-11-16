@@ -6,6 +6,7 @@
 
 - Release hardening: establish a single checked release identity across source, current documentation, changelog, CLI output, and version-bearing golden output.
 - Release hardening: validate releases from an exact clean clone, execute the documented quick start, and package only allowlisted tracked files from committed `HEAD`.
+- Release hardening: add a release benchmark wrapper with clean-tree enforcement, VCS-stamped binary provenance, complete-matrix sample validation, and stale/partial/wrong-version evidence rejection.
 
 - Fixed interprocedural resolution for instantiated generic methods: call targets are normalized through `types.Func.Origin()` before declaration-keyed summaries, dependency graphs, lifecycle facts, and constructor ownership lookups, preventing generic method calls from silently falling back to unverified transfer semantics.
 - Fixed vet/standalone test-file parity: `include_tests: false` now excludes `_test.go` lifecycle analysis in vet mode as well as standalone mode, while `include_tests: true` preserves vet diagnostics from test files.
