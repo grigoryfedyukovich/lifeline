@@ -60,3 +60,15 @@ That command rejects stale commits, wrong versions, dirty-source binaries,
 failed validation status, unknown benchmark groups, and partial sample sets.
 `./scripts/benchmark_release.sh --self-test` exercises those rejection paths
 without running the benchmark matrix.
+
+## Shared local and hosted orchestration
+
+`./scripts/validate_ci.sh` is the canonical ordinary validation entry point.
+`make ci` delegates to it, and `.github/workflows/ci.yml` invokes the same script
+on both Ubuntu and macOS. The workflow intentionally does not duplicate the Go
+command list.
+
+`./scripts/check_validation_contract.sh` checks those delegation points plus the
+documented quick-start/release commands. Ordinary CI runs only a one-iteration
+benchmark smoke plus `benchmark_release.sh --self-test`; the complete benchmark
+matrix remains a release-preparation action.

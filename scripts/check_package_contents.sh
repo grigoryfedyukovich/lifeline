@@ -13,15 +13,18 @@ prefix="lifeline-v$version/"
 allowlist="$ROOT/release/package-allowlist.txt"
 [[ -f "$allowlist" ]] || { echo 'package allowlist is missing' >&2; exit 1; }
 
-mapfile -t entries < <(tar -tzf "$archive")
-((${#entries[@]} > 0)) || { echo 'package archive is empty' >&2; exit 1; }
+entries=$(mktemp)
+trap 'rm -f "$entries"' EXIT
+tar -tzf "$archive" > "$entries"
+entry_count=$(wc -l < "$entries" | tr -d ' ')
+((entry_count > 0)) || { echo 'package archive is empty' >&2; exit 1; }
 
 seen_version=0
 seen_mod=0
 seen_sum=0
 seen_license=0
 seen_source=0
-for entry in "${entries[@]}"; do
+while IFS= read -r entry || [[ -n "$entry" ]]; do
   [[ "$entry" == "$prefix"* ]] || { echo "package entry outside $prefix: $entry" >&2; exit 1; }
   rel=${entry#"$prefix"}
   [[ -n "$rel" ]] || continue
@@ -47,11 +50,11 @@ for entry in "${entries[@]}"; do
     LICENSE) seen_license=1 ;;
     internal/version/version.go) seen_source=1 ;;
   esac
-done
+done < "$entries"
 
 ((seen_version && seen_mod && seen_sum && seen_license && seen_source)) || {
   echo 'package archive is missing one or more required release files' >&2
   exit 1
 }
 
-printf 'package contents: PASS (%d entries)\n' "${#entries[@]}"
+printf 'package contents: PASS (%s entries)\n' "$entry_count"

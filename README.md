@@ -227,17 +227,17 @@ Every emitted fix is applied to source and type-checked in the test suite (`inte
 
 ## Development
 
-Dependency versions are pinned in `go.mod`. This source archive contains neither a `go.sum` nor a hosted CI workflow: run `go mod tidy` (or `go mod download`) once to generate `go.sum`, and run the checks locally. Dependencies are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
+Dependency versions are pinned in `go.mod` and checksummed in `go.sum`. The repository includes hosted CI, and local plus hosted validation delegate to the same scripts. Dependencies are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
 
-The `Makefile` defines module-tidiness, test, vet, race, work-budget, benchmark, and build targets. Run the core verification with:
+The `Makefile` retains focused developer targets, but the canonical local and hosted gates are shared scripts. Run ordinary validation, clean-clone release validation, or release benchmarking with:
 
 ```bash
-make modcheck
-make check
-make race
-make perfcheck
-make bench
+make ci
+make release
+make release-bench RELEASE_BENCH_OUT=/tmp/lifeline-release-benchmark
 ```
+
+Use `make bench` for ad hoc benchmark work and `make benchmark-validator` for the short provenance-validator self-test.
 
 `make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
 

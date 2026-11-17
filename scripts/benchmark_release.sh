@@ -95,17 +95,17 @@ if ((self_test)); then
   ./scripts/validate_benchmark_evidence.sh "$tmp" >/dev/null
 
   cp "$tmp/metadata.json" "$tmp/metadata.good.json"
-  perl -0pi -e 's/"source_commit": "[^"]+"/"source_commit": "deadbeef"/' "$tmp/metadata.json"
+  sed 's/"source_commit": "[^"]*"/"source_commit": "deadbeef"/' "$tmp/metadata.good.json" > "$tmp/metadata.json"
   if ./scripts/validate_benchmark_evidence.sh "$tmp" >/dev/null 2>&1; then echo 'self-test failed to reject stale commit' >&2; exit 1; fi
   mv "$tmp/metadata.good.json" "$tmp/metadata.json"
 
   cp "$tmp/metadata.json" "$tmp/metadata.good.json"
-  perl -0pi -e 's/"binary_version": "[^"]+"/"binary_version": "9.9.9"/' "$tmp/metadata.json"
+  sed 's/"binary_version": "[^"]*"/"binary_version": "9.9.9"/' "$tmp/metadata.good.json" > "$tmp/metadata.json"
   if ./scripts/validate_benchmark_evidence.sh "$tmp" >/dev/null 2>&1; then echo 'self-test failed to reject wrong version' >&2; exit 1; fi
   mv "$tmp/metadata.good.json" "$tmp/metadata.json"
 
   cp "$tmp/benchmarks.txt" "$tmp/benchmarks.good.txt"
-  sed -i '1d' "$tmp/benchmarks.txt"
+  tail -n +2 "$tmp/benchmarks.good.txt" > "$tmp/benchmarks.txt"
   if ./scripts/validate_benchmark_evidence.sh "$tmp" >/dev/null 2>&1; then echo 'self-test failed to reject partial evidence' >&2; exit 1; fi
   mv "$tmp/benchmarks.good.txt" "$tmp/benchmarks.txt"
 
@@ -123,7 +123,7 @@ mkdir -p "$out/bin"
 out=$(cd "$out" && pwd)
 
 # Release evidence is valid only when the same commit passes the complete validation suite.
-make ci
+./scripts/validate_ci.sh
 ./scripts/check_clean_tree.sh >/dev/null
 
 go build -mod=readonly -trimpath -o "$out/bin/lifeline" ./cmd/lifeline

@@ -20,7 +20,7 @@ git -C "$clone" checkout --quiet --detach "$head"
 
 (
   cd "$clone"
-  make ci
+  ./scripts/validate_ci.sh
   ./scripts/quick_start.sh
   ./scripts/check_clean_tree.sh
   ./scripts/package_source.sh "$tmp/lifeline-v$version.tar.gz"
