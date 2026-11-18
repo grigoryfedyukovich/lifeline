@@ -10,6 +10,10 @@ printf 'validation: contract\n'
 ./scripts/check_validation_contract.sh
 printf 'validation: module files\n'
 go mod tidy -diff
+printf 'validation: markdown links\n'
+./scripts/check_markdown_links.sh
+printf 'validation: performance claims\n'
+./scripts/check_performance_claims.sh
 printf 'validation: tests\n'
 go test -mod=readonly -count=1 ./...
 printf 'validation: vet\n'
@@ -28,4 +32,6 @@ printf 'validation: release identity\n'
 ./scripts/check_version_consistency.sh ./bin/lifeline
 printf 'validation: benchmark evidence validator\n'
 ./scripts/benchmark_release.sh --self-test
+printf 'validation: dependency vulnerabilities\n'
+./scripts/check_vulnerabilities.sh
 printf 'validation: PASS\n'

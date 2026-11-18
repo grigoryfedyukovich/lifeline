@@ -72,3 +72,17 @@ command list.
 documented quick-start/release commands. Ordinary CI runs only a one-iteration
 benchmark smoke plus `benchmark_release.sh --self-test`; the complete benchmark
 matrix remains a release-preparation action.
+
+## Hardening checks
+
+The shared gate also validates local Markdown links and the structured contract
+for release performance claims. A release-facing performance claim is accepted
+only when it identifies the exact Git commit, platform, workload, repetition
+count, median, and p95. Historical measurements that lack those fields remain
+labeled as historical observations rather than being promoted to release claims.
+
+Dependency vulnerability scanning uses an existing `govulncheck` executable
+when one is already installed. Otherwise the shared gate runs the pinned
+`golang.org/x/vuln` v1.9.0 scanner without adding it to the module dependency
+set. The clean-clone release gate continues to inspect the source package
+against `release/package-allowlist.txt`.
