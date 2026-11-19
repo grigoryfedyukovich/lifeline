@@ -26,15 +26,24 @@ require_make_recipe() {
 require_make_recipe ci './scripts/validate_ci.sh'
 require_make_recipe release './scripts/validate_release.sh'
 require_literal .github/workflows/ci.yml './scripts/validate_ci.sh'
+require_literal .github/workflows/release.yml './scripts/validate_release.sh'
+require_literal .github/workflows/release.yml './scripts/benchmark_release.sh --output'
+require_literal .github/workflows/release.yml './scripts/check_tag_version.sh'
+require_literal .github/workflows/release.yml 'os: [ubuntu-latest, macos-latest]'
+require_literal .github/workflows/release.yml 'actions/upload-artifact@v7'
+require_literal .github/workflows/release.yml 'actions/download-artifact@v8'
 require_literal README.md './scripts/quick_start.sh'
 require_literal README.md 'make ci'
 require_literal README.md 'make release'
 require_literal docs/release-validation.md './scripts/validate_release.sh'
 require_literal docs/release-validation.md './scripts/benchmark_release.sh --self-test'
 
-# Hosted CI must delegate validation rather than duplicate the command sequence.
 if grep -Eq 'run:[[:space:]]+(go test|go vet|go build|go mod tidy|make (check|race|perfcheck|modcheck|build))' .github/workflows/ci.yml; then
   echo 'validation contract: hosted CI duplicates validation commands instead of calling the shared script' >&2
+  exit 1
+fi
+if grep -R --exclude='check_validation_contract.sh' -- '--allow-dirty' scripts .github/workflows >/dev/null 2>&1; then
+  echo 'validation contract: dirty release/package escape hatch is forbidden' >&2
   exit 1
 fi
 

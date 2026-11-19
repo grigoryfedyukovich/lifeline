@@ -86,3 +86,24 @@ when one is already installed. Otherwise the shared gate runs the pinned
 `golang.org/x/vuln` v1.9.0 scanner without adding it to the module dependency
 set. The clean-clone release gate continues to inspect the source package
 against `release/package-allowlist.txt`.
+
+## Tag-triggered publication and evidence handling
+
+`.github/workflows/release.yml` runs only for `v*` tags. It first requires the
+tag to equal `v` plus the root `VERSION`, then runs the same clean-clone release
+gate on Ubuntu and macOS. After both platforms pass, an Ubuntu job runs the
+complete release benchmark matrix and a separate job builds and inspects the
+commit-derived source package. The GitHub release is created only after all of
+those jobs succeed, using the matching changelog section as release notes.
+
+Lifeline is a Go module, so there is no crates.io-style registry publication or
+long-lived registry token to configure. The immutable Git tag is the module
+publication identity; the workflow creates the corresponding GitHub release and
+attaches the inspected source package plus selected benchmark provenance and
+summary files.
+
+Raw benchmark samples and generated validation evidence remain ignored in local
+checkouts. Tag workflows upload them as GitHub Actions artifacts with 14-day
+retention. The release itself receives only selected benchmark metadata,
+summary/build provenance, and the inspected source archive/checksum. Generated
+evidence must not contain committed machine-local paths.

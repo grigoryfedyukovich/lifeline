@@ -9,6 +9,7 @@
 - Release hardening: add a release benchmark wrapper with clean-tree enforcement, VCS-stamped binary provenance, complete-matrix sample validation, and stale/partial/wrong-version evidence rejection.
 - Release hardening: route local and hosted validation through shared scripts on Ubuntu and macOS, with contract tests preventing command-list drift and only a short benchmark validator in ordinary CI.
 - Release hardening: add local Markdown-link validation, Go dependency vulnerability scanning, package allowlist enforcement, and a structured commit/platform/workload/repetitions/median/p95 contract for release performance claims.
+- Release hardening: add a tag-triggered v0.2.0 publication workflow that validates Linux and macOS, runs the complete benchmark matrix, inspects the committed source package, retains raw evidence as bounded CI artifacts, and publishes selected provenance with changelog notes only after all gates pass.
 
 - Fixed interprocedural resolution for instantiated generic methods: call targets are normalized through `types.Func.Origin()` before declaration-keyed summaries, dependency graphs, lifecycle facts, and constructor ownership lookups, preventing generic method calls from silently falling back to unverified transfer semantics.
 - Fixed vet/standalone test-file parity: `include_tests: false` now excludes `_test.go` lifecycle analysis in vet mode as well as standalone mode, while `include_tests: true` preserves vet diagnostics from test files.

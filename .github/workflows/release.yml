@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: release gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify tag identity
+        run: ./scripts/check_tag_version.sh "$GITHUB_REF_NAME"
+
+      - name: Run clean-clone release gate
+        run: ./scripts/validate_release.sh
+
+      - name: Record validation provenance
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/validation-$RUNNER_OS.txt"
+          {
+            echo 'status=passed'
+            echo "tag=$GITHUB_REF_NAME"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "version=$(cat VERSION)"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "go_version=$(go env GOVERSION)"
+          } > "$out"
+
+      - name: Upload validation evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: validation-${{ runner.os }}-${{ github.ref_name }}
+          path: ${{ runner.temp }}/validation-${{ runner.os }}.txt
+          retention-days: 14
+
+  benchmark:
+    name: release benchmark matrix
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify tag identity
+        run: ./scripts/check_tag_version.sh "$GITHUB_REF_NAME"
+
+      - name: Run complete benchmark matrix
+        run: ./scripts/benchmark_release.sh --output "$RUNNER_TEMP/lifeline-benchmark" --samples 5
+
+      - name: Upload raw benchmark evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-evidence-${{ github.ref_name }}
+          path: ${{ runner.temp }}/lifeline-benchmark
+          retention-days: 14
+
+  package:
+    name: inspect source package
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag identity
+        run: ./scripts/check_tag_version.sh "$GITHUB_REF_NAME"
+
+      - name: Build and inspect committed source package
+        shell: bash
+        run: |
+          version=$(cat VERSION)
+          package="$RUNNER_TEMP/lifeline-v$version.tar.gz"
+          ./scripts/package_source.sh "$package"
+          sha256sum "$package" > "$package.sha256"
+
+      - name: Upload inspected source package
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-package-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/lifeline-*.tar.gz
+            ${{ runner.temp }}/lifeline-*.tar.gz.sha256
+          retention-days: 14
+
+  publish:
+    name: create GitHub release
+    needs: [validate, benchmark, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag identity
+        run: ./scripts/check_tag_version.sh "$GITHUB_REF_NAME"
+
+      - name: Download release-run artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+
+      - name: Prepare changelog notes
+        shell: bash
+        run: ./scripts/changelog_notes.sh "$(cat VERSION)" > release-notes.md
+
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version=$(cat VERSION)
+          source_dir="release-assets/source-package-$tag"
+          bench_dir="release-assets/benchmark-evidence-$tag"
+          source_tar="$source_dir/lifeline-v$version.tar.gz"
+          source_sha="$source_tar.sha256"
+          assets=(
+            "$source_tar"
+            "$source_sha"
+            "$bench_dir/metadata.json"
+            "$bench_dir/summary.tsv"
+            "$bench_dir/binary-build-info.txt"
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "Lifeline $tag" --notes-file release-notes.md
+            gh release upload "$tag" --clobber "${assets[@]}"
+          else
+            gh release create "$tag" --verify-tag --title "Lifeline $tag" --notes-file release-notes.md "${assets[@]}"
+          fi
