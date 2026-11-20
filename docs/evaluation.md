@@ -176,16 +176,18 @@ No new canonical performance numbers are recorded here yet. This repository targ
 
 ## Reproducible CI and module state (added 2026-10-09)
 
-The October 2026 evaluation notes describe a `go.sum` and `.github/workflows/ci.yml` workflow, but **neither file is present in this source archive**. The following list describes the documented *intended* `ubuntu-latest` gates; they cannot be verified from this archive as shipped:
+The October 2026 evaluation notes were written against an earlier snapshot that lacked the checked-in reproducibility files. The 0.2.0 source now includes both `go.sum` and hosted workflows. Local and hosted ordinary validation share `scripts/validate_ci.sh`; release preparation adds the clean-clone gate in `scripts/validate_release.sh`. The shared ordinary gate covers:
 
-1. `make modcheck` (`go mod tidy -diff`) so dependency metadata drift fails without rewriting files;
-2. `make check` for the ordinary test suite plus `go vet`;
-3. `make race`;
-4. `make perfcheck` for machine-independent algorithmic scaling budgets;
+1. `go mod tidy -diff` so dependency metadata drift fails without rewriting files;
+2. the ordinary test suite plus `go vet`;
+3. the race detector;
+4. machine-independent algorithmic scaling budgets;
 5. a one-iteration `BenchmarkBuild...` smoke run;
-6. `make build` for the standalone executable.
+6. whole-module and standalone executable builds;
+7. release identity, documentation-link, performance-claim, and benchmark-evidence contract checks; and
+8. the dependency vulnerability scan.
 
-This closes the earlier snapshot-level reproducibility gap where neither a checksum file nor a checked-in workflow was present.
+Ubuntu and macOS CI both invoke this shared script rather than carrying separate command lists. Release preparation additionally validates an exact clean clone, executes the documented quick start, and inspects an allowlisted source package derived from committed `HEAD`.
 
 ## Machine-independent scaling budgets (added 2026-10-09)
 

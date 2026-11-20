@@ -17,7 +17,7 @@
 - Fixed vet/standalone path parity: relative explicit config paths and directory-bearing `ignore_paths` entries now resolve from the Go module root, so `go vet` package working directories cannot change their meaning.
 - Documentation: moved the historical `specification-original.md`, `spec-validation.md`, and `review-resolution.md` into `docs/archive/` and marked them as archived records.
 - Documentation: merged the two concatenated changelogs in this file into one, and folded the old "Unreleased"/"Earlier 0.1.1 development history" notes into the 0.1.2 section below.
-- Documentation: merged the duplicate README development sections, removed the claim that `go.sum` is committed (it is absent from this archive), and refreshed version references (0.1.2, fact schema 10) and the unsupported-coverage wording in the specification, semantics, tutorial, and architecture docs.
+- Documentation: merged the duplicate README development sections and refreshed version references (0.1.2, fact schema 10) and unsupported-coverage wording in the specification, semantics, tutorial, and architecture docs; the 0.2.0 release-hardening work restores explicit checked-in module and CI reproducibility guarantees.
 - Documentation: added the `examples/README.md` index that the README, tutorial, and integration tests already referred to.
 - Examples: removed byte-identical duplicates (`two_loops_one_unstoppable`, `nested_loops_mixed_resolution`) and the empty `cross_package_mixed_loop_resolution/consumer` stub package.
 - Examples: fixed stale configs (`dead_stop_then_continue` and `goto_skips_stop` named the old `cfg_diff_explicit` package; `ignore_path` matched a non-existent `ignored.go`) and the truncated package name in `unreachable_return_in_loop`.
