@@ -176,18 +176,16 @@ No new canonical performance numbers are recorded here yet. This repository targ
 
 ## Reproducible CI and module state (added 2026-10-09)
 
-The October 2026 evaluation notes were written against an earlier snapshot that lacked the checked-in reproducibility files. The 0.2.0 source now includes both `go.sum` and hosted workflows. Local and hosted ordinary validation share `scripts/validate_ci.sh`; release preparation adds the clean-clone gate in `scripts/validate_release.sh`. The shared ordinary gate covers:
+The October 2026 evaluation notes describe a `go.sum` and `.github/workflows/ci.yml` workflow, but **neither file is present in this source archive**. The following list describes the documented *intended* `ubuntu-latest` gates; they cannot be verified from this archive as shipped:
 
-1. `go mod tidy -diff` so dependency metadata drift fails without rewriting files;
-2. the ordinary test suite plus `go vet`;
-3. the race detector;
-4. machine-independent algorithmic scaling budgets;
+1. `make modcheck` (`go mod tidy -diff`) so dependency metadata drift fails without rewriting files;
+2. `make check` for the ordinary test suite plus `go vet`;
+3. `make race`;
+4. `make perfcheck` for machine-independent algorithmic scaling budgets;
 5. a one-iteration `BenchmarkBuild...` smoke run;
-6. whole-module and standalone executable builds;
-7. release identity, documentation-link, performance-claim, and benchmark-evidence contract checks; and
-8. the dependency vulnerability scan.
+6. `make build` for the standalone executable.
 
-Ubuntu and macOS CI both invoke this shared script rather than carrying separate command lists. Release preparation additionally validates an exact clean clone, executes the documented quick start, and inspects an allowlisted source package derived from committed `HEAD`.
+This closes the earlier snapshot-level reproducibility gap where neither a checksum file nor a checked-in workflow was present.
 
 ## Machine-independent scaling budgets (added 2026-10-09)
 
@@ -200,15 +198,3 @@ CI now enforces algorithmic work budgets in addition to the benchmark smoke run.
 
 Run this gate directly with `make perfcheck`. The ordinary benchmark output also reports the same counters as `param-evals/build`, `ctor-evals/build`, `struct-cfg/build`, and `group-stmts/build`, alongside `ns/op` and allocations. These counters are intentionally hardware-independent and therefore suitable for hard CI thresholds now; elapsed-time, allocation, and RSS thresholds remain deferred until a supported-Go-1.25 baseline is recorded on a pinned runner.
 
-
-## Release performance-claim policy (0.2.0)
-
-The older timings in this document are retained as historical smoke
-measurements. They are not normative 0.2.0 performance claims because the
-historical record does not provide every field now required for a release
-claim, notably an exact source commit and a repeated median/p95 protocol.
-
-New release-facing performance claims must use the structured contract in
-`release/performance-claims.md` and identify the commit, platform, exact
-workload, repetition count, median, and p95. Raw samples and machine-specific
-paths remain generated evidence rather than committed source files.

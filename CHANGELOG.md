@@ -5,11 +5,6 @@
 ## 0.2.0 — 2026-11-14
 
 - Release hardening: establish a single checked release identity across source, current documentation, changelog, CLI output, and version-bearing golden output.
-- Release hardening: validate releases from an exact clean clone, execute the documented quick start, and package only allowlisted tracked files from committed `HEAD`.
-- Release hardening: add a release benchmark wrapper with clean-tree enforcement, VCS-stamped binary provenance, complete-matrix sample validation, and stale/partial/wrong-version evidence rejection.
-- Release hardening: route local and hosted validation through shared scripts on Ubuntu and macOS, with contract tests preventing command-list drift and only a short benchmark validator in ordinary CI.
-- Release hardening: add local Markdown-link validation, Go dependency vulnerability scanning, package allowlist enforcement, and a structured commit/platform/workload/repetitions/median/p95 contract for release performance claims.
-- Release hardening: add a tag-triggered v0.2.0 publication workflow that validates Linux and macOS, runs the complete benchmark matrix, inspects the committed source package, retains raw evidence as bounded CI artifacts, and publishes selected provenance with changelog notes only after all gates pass.
 
 - Fixed interprocedural resolution for instantiated generic methods: call targets are normalized through `types.Func.Origin()` before declaration-keyed summaries, dependency graphs, lifecycle facts, and constructor ownership lookups, preventing generic method calls from silently falling back to unverified transfer semantics.
 - Fixed vet/standalone test-file parity: `include_tests: false` now excludes `_test.go` lifecycle analysis in vet mode as well as standalone mode, while `include_tests: true` preserves vet diagnostics from test files.
@@ -17,7 +12,7 @@
 - Fixed vet/standalone path parity: relative explicit config paths and directory-bearing `ignore_paths` entries now resolve from the Go module root, so `go vet` package working directories cannot change their meaning.
 - Documentation: moved the historical `specification-original.md`, `spec-validation.md`, and `review-resolution.md` into `docs/archive/` and marked them as archived records.
 - Documentation: merged the two concatenated changelogs in this file into one, and folded the old "Unreleased"/"Earlier 0.1.1 development history" notes into the 0.1.2 section below.
-- Documentation: merged the duplicate README development sections and refreshed version references (0.1.2, fact schema 10) and unsupported-coverage wording in the specification, semantics, tutorial, and architecture docs; the 0.2.0 release-hardening work restores explicit checked-in module and CI reproducibility guarantees.
+- Documentation: merged the duplicate README development sections, removed the claim that `go.sum` is committed (it is absent from this archive), and refreshed version references (0.1.2, fact schema 10) and the unsupported-coverage wording in the specification, semantics, tutorial, and architecture docs.
 - Documentation: added the `examples/README.md` index that the README, tutorial, and integration tests already referred to.
 - Examples: removed byte-identical duplicates (`two_loops_one_unstoppable`, `nested_loops_mixed_resolution`) and the empty `cross_package_mixed_loop_resolution/consumer` stub package.
 - Examples: fixed stale configs (`dead_stop_then_continue` and `goto_skips_stop` named the old `cfg_diff_explicit` package; `ignore_path` matched a non-existent `ignored.go`) and the truncated package name in `unreachable_return_in_loop`.

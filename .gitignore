@@ -2,7 +2,3 @@
 /lifeline.json
 /lifeline.sarif
 .DS_Store
-/release-evidence/
-/benchmark-output/
-/validation-evidence/
-/dist/
