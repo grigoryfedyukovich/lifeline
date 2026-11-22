@@ -542,6 +542,11 @@ type Function struct {
 	ReturnFieldSites []ReturnFieldSite `json:"return_field_sites,omitempty"`
 }
 
+type Suppression struct {
+	Rules  []string
+	Reason string
+}
+
 type Program struct {
 	PackagePath   string     `json:"package_path"`
 	Functions     []Function `json:"functions"`
@@ -552,9 +557,10 @@ type Program struct {
 	// looked at, reported in the run status so a clean result is not read
 	// as covering it.
 	ExcludedFiles int `json:"excluded_files,omitempty"`
-	// Suppressions maps file -> source line -> suppressed rule IDs, derived
-	// from "//lifeline:ignore" comments. "*" means every rule is suppressed
-	// on that line. This is an internal control input for the engine, not
-	// part of the public report, so it is excluded from JSON output.
-	Suppressions map[string]map[int][]string `json:"-"`
+	// Suppressions maps file -> source line -> validated inline suppression
+	// directives. A directive with Rules == []string{"*"} suppresses every
+	// diagnostic on that line; Reason preserves optional "-- ..." audit text.
+	// This is an internal control input for the engine, not part of the public
+	// report, so it is excluded from JSON output.
+	Suppressions map[string]map[int][]Suppression `json:"-"`
 }

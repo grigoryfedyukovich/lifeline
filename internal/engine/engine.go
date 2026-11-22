@@ -322,7 +322,7 @@ func ignored(list []string, id string) bool {
 // in practice. suppressions is Program.Suppressions, a pure file -> line ->
 // rule-IDs index computed once during parsing (see internal/frontend);
 // this is a lookup only and performs no I/O of its own.
-func suppressedByComment(suppressions map[string]map[int][]string, d Diagnostic) bool {
+func suppressedByComment(suppressions map[string]map[int][]model.Suppression, d Diagnostic) bool {
 	if lineSuppressed(suppressions, d.Position.File, d.Position.StartLine, d.RuleID) {
 		return true
 	}
@@ -334,10 +334,12 @@ func suppressedByComment(suppressions map[string]map[int][]string, d Diagnostic)
 	return false
 }
 
-func lineSuppressed(suppressions map[string]map[int][]string, file string, line int, ruleID string) bool {
-	for _, id := range suppressions[file][line] {
-		if id == "*" || id == ruleID {
-			return true
+func lineSuppressed(suppressions map[string]map[int][]model.Suppression, file string, line int, ruleID string) bool {
+	for _, directive := range suppressions[file][line] {
+		for _, id := range directive.Rules {
+			if id == "*" || id == ruleID {
+				return true
+			}
 		}
 	}
 	return false

@@ -568,43 +568,98 @@ func FilterFiles(fset *token.FileSet, files []*ast.File, cfg config.Config, modu
 	return out
 }
 
-// suppressionPattern matches an inline suppression directive within a
-// comment, e.g. "//lifeline:ignore" (suppresses every rule reported on that
-// line) or "//lifeline:ignore LL1001,LL1002" (suppresses only those rules).
-// Free text may follow, e.g. "//lifeline:ignore LL1002 -- see TICKET-123".
-var suppressionPattern = regexp.MustCompile(`lifeline:ignore(?:\s+([A-Za-z0-9,]+))?`)
+// parseSuppressionComment accepts an inline suppression only when the
+// directive begins the comment body (after the comment delimiter and optional
+// whitespace). Rule lists are all-or-nothing: every listed ID must be a known
+// finding rule, and empty list elements are invalid. Optional audit text must
+// follow a "--" separator. Keeping the parsed reason with the directive avoids
+// turning near-miss prose or malformed rule lists into blanket suppressions.
+func parseSuppressionComment(text string) (model.Suppression, bool) {
+	text = strings.TrimSpace(text)
+	switch {
+	case strings.HasPrefix(text, "//"):
+		text = strings.TrimSpace(text[2:])
+	case strings.HasPrefix(text, "/*") && strings.HasSuffix(text, "*/"):
+		text = strings.TrimSpace(text[2 : len(text)-2])
+	default:
+		return model.Suppression{}, false
+	}
+	if strings.ContainsAny(text, "\r\n") {
+		return model.Suppression{}, false
+	}
 
-// collectSuppressions scans every comment in files for a suppression
-// directive and returns a file -> line -> rule-IDs index. A bare directive
-// with no rule list is recorded as "*", meaning every rule is suppressed on
-// that line. The directive is matched by the comment's own line, so it is
-// expected on the same source line as the construct it applies to (the
-// convention golangci-lint's "//nolint" uses), not the line before it.
-func collectSuppressions(fset *token.FileSet, files []*ast.File) map[string]map[int][]string {
-	out := map[string]map[int][]string{}
+	const prefix = "lifeline:ignore"
+	if !strings.HasPrefix(text, prefix) {
+		return model.Suppression{}, false
+	}
+	rest := text[len(prefix):]
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
+		return model.Suppression{}, false
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return model.Suppression{Rules: []string{"*"}}, true
+	}
+
+	ruleText, reason := rest, ""
+	if i := strings.Index(rest, "--"); i >= 0 {
+		if i > 0 && rest[i-1] != ' ' && rest[i-1] != '\t' {
+			return model.Suppression{}, false
+		}
+		if i+2 < len(rest) && rest[i+2] != ' ' && rest[i+2] != '\t' {
+			return model.Suppression{}, false
+		}
+		ruleText = strings.TrimSpace(rest[:i])
+		reason = strings.TrimSpace(rest[i+2:])
+	}
+	if ruleText == "" {
+		if !strings.HasPrefix(rest, "--") {
+			return model.Suppression{}, false
+		}
+		return model.Suppression{Rules: []string{"*"}, Reason: reason}, true
+	}
+
+	parts := strings.Split(ruleText, ",")
+	rules := make([]string, 0, len(parts))
+	for _, part := range parts {
+		id := strings.ToUpper(strings.TrimSpace(part))
+		if id == "" || !knownInlineSuppressionRule(id) {
+			return model.Suppression{}, false
+		}
+		rules = append(rules, id)
+	}
+	return model.Suppression{Rules: rules, Reason: reason}, true
+}
+
+func knownInlineSuppressionRule(id string) bool {
+	switch id {
+	case "LL1001", "LL1002", "LL1003", "LL1004", "LL1005":
+		return true
+	default:
+		return false
+	}
+}
+
+// collectSuppressions scans every comment in files for an anchored, valid
+// suppression directive and returns a file -> line -> directives index. The
+// directive is matched by the comment's own line, so it is expected on the
+// same source line as the construct it applies to.
+func collectSuppressions(fset *token.FileSet, files []*ast.File) map[string]map[int][]model.Suppression {
+	out := map[string]map[int][]model.Suppression{}
 	for _, file := range files {
 		for _, group := range file.Comments {
 			for _, c := range group.List {
-				m := suppressionPattern.FindStringSubmatch(c.Text)
-				if m == nil {
+				directive, ok := parseSuppressionComment(c.Text)
+				if !ok {
 					continue
 				}
 				pos := fset.Position(c.Pos())
 				byLine := out[pos.Filename]
 				if byLine == nil {
-					byLine = map[int][]string{}
+					byLine = map[int][]model.Suppression{}
 					out[pos.Filename] = byLine
 				}
-				if m[1] == "" {
-					byLine[pos.Line] = append(byLine[pos.Line], "*")
-					continue
-				}
-				for _, id := range strings.Split(m[1], ",") {
-					id = strings.ToUpper(strings.TrimSpace(id))
-					if id != "" {
-						byLine[pos.Line] = append(byLine[pos.Line], id)
-					}
-				}
+				byLine[pos.Line] = append(byLine[pos.Line], directive)
 			}
 		}
 	}

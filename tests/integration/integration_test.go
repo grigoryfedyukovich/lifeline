@@ -109,6 +109,24 @@ func TestExamples(t *testing.T) {
 	}
 }
 
+func TestInlineSuppressionRejectsNearMissesAndInvalidRuleLists(t *testing.T) {
+	root := repositoryRoot(t)
+	binary := buildBinary(t, root)
+	out, code := run(t, root, binary, "./tests/testdata/suppressions")
+	if code != 0 {
+		t.Fatalf("exit code %d\n%s", code, out)
+	}
+	if strings.Count(out, "[LL1001]") != 2 {
+		t.Fatalf("suppression fixture must keep the near-miss and invalid-rule findings visible:\n%s", out)
+	}
+	if strings.Contains(out, "suppression.go:6:") {
+		t.Fatalf("the valid anchored directive must suppress its own finding:\n%s", out)
+	}
+	if !strings.Contains(out, "suppression.go:11:") || !strings.Contains(out, "suppression.go:16:") {
+		t.Fatalf("near-miss and invalid-rule directives must not suppress findings:\n%s", out)
+	}
+}
+
 func TestCIPolicyIsOptIn(t *testing.T) {
 	root := repositoryRoot(t)
 	binary := buildBinary(t, root)
