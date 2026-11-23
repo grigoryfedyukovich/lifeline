@@ -69,6 +69,47 @@ func Start(ctx context.Context) { child, _ := context.WithCancel(ctx); go func()
 	}
 }
 
+func TestChannelSend_CallResultDoesNotTransferCancel(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func discardCancel(c context.CancelFunc) int { _ = c; return 1 }
+func Start(parent context.Context, ch chan int) {
+	_, cancel := context.WithCancel(parent)
+	ch <- discardCancel(cancel)
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("sending an unrelated call result must not transfer cancel ownership, got %#v", diags)
+	}
+}
+
+func TestChannelSend_DirectCancelStillTransfersOwnership(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func Start(parent context.Context, ch chan context.CancelFunc) {
+	_, cancel := context.WithCancel(parent)
+	ch <- cancel
+}
+`)
+	if len(diags) != 0 {
+		t.Fatalf("sending the cancel function itself is still an ownership transfer, got %#v", diags)
+	}
+}
+
+func TestChannelSend_CallResultInsideInvokedClosureDoesNotTransferCapture(t *testing.T) {
+	diags := analyzeSource(t, `package p
+import "context"
+func discardCancel(c context.CancelFunc) int { _ = c; return 1 }
+func Start(parent context.Context, ch chan int) {
+	_, cancel := context.WithCancel(parent)
+	func() { ch <- discardCancel(cancel) }()
+}
+`)
+	if len(diags) != 1 || diags[0].RuleID != "LL1001" {
+		t.Fatalf("a closure sending an unrelated call result must not transfer its captured cancel, got %#v", diags)
+	}
+}
+
 func TestWaitGroupWithoutWait(t *testing.T) {
 	diags := analyzeSource(t, `package p
 import "sync"

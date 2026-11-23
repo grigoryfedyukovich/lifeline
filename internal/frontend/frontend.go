@@ -1662,7 +1662,7 @@ func (b *builder) closureCaptureEffect(lit *ast.FuncLit, obj types.Object, kind 
 					opaque = true
 				}
 			case *ast.SendStmt:
-				if hasObject(objectsUsedInExpressions([]ast.Expr{x.Value}, b.in.Info, true), obj) {
+				if directlyTransferredObject(x.Value, b.in.Info) == obj {
 					opaque = true
 				}
 			}
@@ -1928,13 +1928,15 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		case *ast.AssignStmt:
 			b.observeEscapeAssignment(x, cancels, groups)
 		case *ast.SendStmt:
-			// Sending a cancel function through a channel transfers ownership to
-			// the receiver. We intentionally stop at this direct syntactic handoff:
-			// recovering the value at the other end would require the broader alias
-			// analysis that remains outside Lifeline's documented model.
-			used := objectsUsedInExpressions([]ast.Expr{x.Value}, b.in.Info, true)
+			// Sending the cancel function itself through a channel transfers
+			// ownership to the receiver. Merely mentioning it while computing a
+			// different sent value does not: `ch <- helper(cancel)` transfers the
+			// helper's result, not cancel. We intentionally stop at this direct
+			// syntactic handoff; recovering aliases at the receiving side would
+			// require the broader alias analysis outside Lifeline's model.
+			sentObj := directlyTransferredObject(x.Value, b.in.Info)
 			for _, c := range cancels {
-				if c.cancelObj == nil || !hasObject(used, c.cancelObj) {
+				if c.cancelObj == nil || sentObj != c.cancelObj {
 					continue
 				}
 				c.binding.Escapes = true
@@ -9428,6 +9430,31 @@ func selectorMethod(fun ast.Expr) string {
 		return ""
 	}
 	return sel.Sel.Name
+}
+
+// directlyTransferredObject returns the tracked object only when expr itself
+// denotes that value for an ownership handoff. It deliberately does not walk
+// into ordinary call arguments: a sent call result is a distinct value even
+// when the call mentions a tracked cancel function. A one-argument type
+// conversion preserves the value and is therefore transparent here.
+func directlyTransferredObject(expr ast.Expr, info *types.Info) types.Object {
+	switch x := expr.(type) {
+	case *ast.Ident:
+		return info.ObjectOf(x)
+	case *ast.ParenExpr:
+		return directlyTransferredObject(x.X, info)
+	case *ast.UnaryExpr:
+		if x.Op == token.AND {
+			return directlyTransferredObject(x.X, info)
+		}
+	case *ast.CallExpr:
+		if len(x.Args) == 1 {
+			if tv, ok := info.Types[x.Fun]; ok && tv.IsType() {
+				return directlyTransferredObject(x.Args[0], info)
+			}
+		}
+	}
+	return nil
 }
 
 func identObject(expr ast.Expr, info *types.Info) types.Object {
