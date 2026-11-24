@@ -15,3 +15,18 @@ Run the version-consistency check against a built CLI with:
 
 The check is intentionally strict. A release candidate is invalid if any
 current-version reference diverges, even if the executable itself still builds.
+
+Run the complete clean-clone release gate with:
+
+```bash
+./scripts/validate_release.sh
+```
+
+The release gate delegates its ordinary build/test checks to the same
+`scripts/validate_ci.sh` entry point used by hosted CI and `make ci`. Before a
+release run, the benchmark evidence validator can be checked without running
+the full benchmark matrix:
+
+```bash
+./scripts/benchmark_release.sh --self-test
+```

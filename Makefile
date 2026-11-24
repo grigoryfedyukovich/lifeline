@@ -1,4 +1,4 @@
-.PHONY: all build test race bench experiments perfcheck modcheck ci check vet demo clean
+.PHONY: all build test race bench experiments perfcheck modcheck ci release check vet demo clean
 
 EXPERIMENT_OUT ?= /tmp/lifeline-experiments-$(shell date -u +%Y%m%dT%H%M%SZ)
 
@@ -28,8 +28,11 @@ perfcheck:
 modcheck:
 	go mod tidy -diff
 
-ci: modcheck check race perfcheck build
-	go test -run '^$$' -bench 'BenchmarkBuild' -benchtime=1x ./internal/frontend
+ci:
+	./scripts/validate_ci.sh
+
+release:
+	./scripts/validate_release.sh
 
 check: test
 	go vet ./analyzer ./cmd/lifeline ./internal/...

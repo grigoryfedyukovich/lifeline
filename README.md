@@ -219,19 +219,27 @@ Every emitted fix is applied to source and type-checked in the test suite (`inte
 
 ## Development
 
-Dependency versions are pinned in `go.mod`. This source archive contains neither a `go.sum` nor a hosted CI workflow: run `go mod tidy` (or `go mod download`) once to generate `go.sum`, and run the checks locally. Dependencies are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
+Dependency versions are pinned in `go.mod` and checksums are committed in `go.sum`. Dependencies are fetched from their upstream module proxy on first build like any normal Go module; the repository does not vendor them. The project currently targets Go 1.25 or newer (see `go.mod`; this was raised from 1.22 because `go vet`'s rewritten driver in Go 1.26 is not compatible with the older pinned `golang.org/x/tools`, see `CHANGELOG.md`). Standalone root packages are analyzed by a deterministic worker pool bounded by `GOMAXPROCS`.
 
-The `Makefile` defines module-tidiness, test, vet, race, work-budget, benchmark, and build targets. Run the core verification with:
+For a fresh checkout, run the quick-start validation path:
 
 ```bash
-make modcheck
-make check
-make race
-make perfcheck
-make bench
+./scripts/quick_start.sh
 ```
 
-`make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
+The shared CI contract is `scripts/validate_ci.sh`; both hosted CI and the `Makefile` delegate to it. Run it with:
+
+```bash
+make ci
+```
+
+A release candidate is validated from a clean detached clone through `scripts/validate_release.sh`:
+
+```bash
+make release
+```
+
+Lower-level targets such as `make modcheck`, `make check`, `make race`, `make perfcheck`, and `make bench` remain available for focused development checks. `make modcheck` uses `go mod tidy -diff`, so it reports stale or missing `go.mod`/`go.sum` state without rewriting either file. `make perfcheck` enforces hardware-independent linear-work budgets for the synthetic scaling fixtures; `make bench` additionally reports those work counters beside timing/allocation metrics.
 
 See:
 

@@ -1,6 +1,6 @@
 # Limitations
 
-Lifeline 0.1.2 is intentionally conservative and bounded.
+Lifeline 0.2.0 is intentionally conservative and bounded.
 
 ## Unsupported or approximate cases
 
