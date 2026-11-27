@@ -102,3 +102,65 @@ for {}`,
 		}
 	}
 }
+
+func TestGoroutineLocalClosureTargets(t *testing.T) {
+	tests := []struct {
+		name        string
+		params      string
+		body        string
+		warnings    int
+		unsupported int
+	}{
+		{"short declaration", "", "worker := func() { for {} }; go worker()", 1, 0},
+		{"var declaration", "", "var worker = func() { for {} }; go (worker)()", 1, 0},
+		{"nested local", "", "func() { worker := func() { for {} }; go worker() }()", 1, 0},
+		{"reassigned", "", "worker := func() { for {} }; (worker) = func() {}; go worker()", 0, 1},
+		{"reassigned in closure", "", "worker := func() { for {} }; func() { worker = func() {} }(); go worker()", 0, 1},
+		{"address taken", "", "worker := func() { for {} }; p := &worker; *p = func() {}; go worker()", 0, 1},
+		{"range assignment", "", "worker := func() { for {} }; for _, worker = range []func(){func() {}} { go worker() }", 0, 1},
+		{"replaceable parameter", "worker func()", "go worker(); worker = func() { for {} }; _ = worker", 0, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			program := buildProgramFor(t, "package p\nfunc Start("+tt.params+") {\n"+tt.body+"\n}", nil)
+			diags, status := engine.AnalyzeWithStatus(program, config.Default())
+			if len(diags) != tt.warnings || len(diags) > 0 && diags[0].RuleID != "LL1002" {
+				t.Errorf("diagnostics = %#v, want %d LL1002", diags, tt.warnings)
+			}
+			if status.Unsupported.Targets != tt.unsupported {
+				t.Errorf("unsupported targets = %d, want %d", status.Unsupported.Targets, tt.unsupported)
+			}
+		})
+	}
+}
+
+func TestGoroutineLocalClosureCapturesStopContext(t *testing.T) {
+	program := buildProgramFor(t, `package p
+import "context"
+
+func Start(parent context.Context) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	worker := func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+	go worker()
+}
+`, nil)
+	diags, status := engine.AnalyzeWithStatus(program, config.Default())
+	if len(diags) != 0 || status.Unsupported.Targets != 0 {
+		t.Fatalf("stoppable local closure should be modeled and clean: diagnostics=%#v status=%#v", diags, status)
+	}
+	for _, fn := range program.Functions {
+		if len(fn.Cancels) > 0 && fn.Cancels[0].UsedByChild &&
+			len(fn.Goroutines) == 1 && fn.Goroutines[0].ContextStop {
+			return
+		}
+	}
+	t.Fatal("captured context was not credited as a child use and stop signal")
+}

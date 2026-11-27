@@ -1828,7 +1828,14 @@ func (b *builder) applyClosureInvocation(call *ast.CallExpr, lit *ast.FuncLit, a
 }
 
 func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Object]string, cancels []*cancelState, groups []*groupState, fn *model.Function, fnObj *types.Func) {
-	b.singleAssignTargets = singleAssignmentTargets(body, b.in.Info)
+	launchTargets := map[types.Object]ast.Expr{}
+	b.singleAssignTargets = collectAssignmentTargets(body, b.in.Info, launchTargets)
+	observeGo := func(stmt *ast.GoStmt) {
+		lit := closureCallTarget(stmt.Call, b.in.Info, launchTargets)
+		g := b.buildGoroutine(stmt, stmt.Call, lit, contexts, "go")
+		fn.Goroutines = append(fn.Goroutines, g)
+		b.markChildUses(stmt.Call, lit, cancels)
+	}
 	asyncClosureCalls := b.asyncCalls
 	// Field/constructor ownership tracking (docs/roadmap.md item 3): find
 	// every "stored struct" or "constructor" field-capture shape in body
@@ -1896,9 +1903,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		// its call site below (audit finding F5).
 		if funcDepth > 0 {
 			if x, ok := n.(*ast.GoStmt); ok {
-				g := b.buildGoroutine(x, x.Call, contexts, "go")
-				fn.Goroutines = append(fn.Goroutines, g)
-				b.markChildUses(x.Call, cancels)
+				observeGo(x)
 			}
 			return true
 		}
@@ -1918,9 +1923,9 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 			b.observeCall(x, cancels, groups, asyncClosureCalls[x])
 			if b.isConfigured(x, b.startWrappers) {
 				if target := firstStartTarget(x.Args, b.in.Info); target != nil {
-					g := b.buildGoroutine(x, &ast.CallExpr{Fun: target}, contexts, "configured-start")
+					g := b.buildGoroutine(x, &ast.CallExpr{Fun: target}, nil, contexts, "configured-start")
 					fn.Goroutines = append(fn.Goroutines, g)
-					b.markChildUses(x, cancels)
+					b.markChildUses(x, nil, cancels)
 				}
 			}
 		case *ast.ReturnStmt:
@@ -1947,9 +1952,7 @@ func (b *builder) observeFunctionBody(body *ast.BlockStmt, contexts map[types.Ob
 		case *ast.ValueSpec:
 			b.observeContainerEscape(x, cancels, groups, claimed)
 		case *ast.GoStmt:
-			g := b.buildGoroutine(x, x.Call, contexts, "go")
-			fn.Goroutines = append(fn.Goroutines, g)
-			b.markChildUses(x.Call, cancels)
+			observeGo(x)
 		}
 		return true
 	})
@@ -2835,17 +2838,36 @@ func compositeLitContainsObject(lit *ast.CompositeLit, obj types.Object, info *t
 // holds at any later use must be either that write's value or the
 // type's zero value (a nil func or nil slice, meaning any use through it
 // would already panic, or range over nothing, before this analysis is
-// ever consulted) -- there is no other value it could hold. Two call
-// sites currently consult this, each interpreting the recorded
-// expression narrowly for its own purpose (see resolveCalleeFunc and
-// compositeLitOf); neither attempts anything like general alias analysis
-// (docs/roadmap.md item 5, an optional full SSA-backed alias/call-graph
-// experiment, not this).
+// ever consulted). Consumers interpret the recorded expression narrowly
+// for their own purpose, without following arbitrary aliases.
 func singleAssignmentTargets(body *ast.BlockStmt, info *types.Info) map[types.Object]ast.Expr {
+	return collectAssignmentTargets(body, info, nil)
+}
+
+// collectAssignmentTargets optionally records the stricter subset used to
+// resolve a local closure at a go statement. Its only write must be a
+// declaration initialized by a literal. Reject address-taking and range
+// assignments as well: either can replace the stored value.
+func collectAssignmentTargets(body *ast.BlockStmt, info *types.Info, launchTargets map[types.Object]ast.Expr) map[types.Object]ast.Expr {
 	counts := map[types.Object]int{}
 	targets := map[types.Object]ast.Expr{}
+	var blocked map[types.Object]bool
+	if launchTargets != nil {
+		blocked = map[types.Object]bool{}
+	}
+	block := func(expr ast.Expr) {
+		id, ok := ast.Unparen(expr).(*ast.Ident)
+		if !ok {
+			return
+		}
+		if obj := info.ObjectOf(id); obj != nil {
+			if _, isFunc := obj.Type().Underlying().(*types.Signature); isFunc {
+				blocked[obj] = true
+			}
+		}
+	}
 	record := func(lhs, rhs ast.Expr) {
-		id, ok := lhs.(*ast.Ident)
+		id, ok := ast.Unparen(lhs).(*ast.Ident)
 		if !ok || id.Name == "_" {
 			return
 		}
@@ -2856,6 +2878,11 @@ func singleAssignmentTargets(body *ast.BlockStmt, info *types.Info) map[types.Ob
 		counts[obj]++
 		if counts[obj] == 1 && rhs != nil {
 			targets[obj] = rhs
+			if launchTargets != nil && info.Defs[id] == obj {
+				if _, ok := ast.Unparen(rhs).(*ast.FuncLit); ok {
+					launchTargets[obj] = rhs
+				}
+			}
 		} else {
 			delete(targets, obj)
 		}
@@ -2878,9 +2905,23 @@ func singleAssignmentTargets(body *ast.BlockStmt, info *types.Info) map[types.Ob
 					record(name, nil)
 				}
 			}
+		case *ast.RangeStmt:
+			if blocked != nil && x.Tok == token.ASSIGN {
+				block(x.Key)
+				block(x.Value)
+			}
+		case *ast.UnaryExpr:
+			if blocked != nil && x.Op == token.AND {
+				block(x.X)
+			}
 		}
 		return true
 	})
+	for obj := range launchTargets {
+		if targets[obj] == nil || blocked[obj] {
+			delete(launchTargets, obj)
+		}
+	}
 	return targets
 }
 
@@ -5722,8 +5763,16 @@ func (b *builder) setCallerVerdict(obj types.Object, key callerSiteKey, v caller
 	b.callerVerdicts[obj][key] = v
 }
 
-func (b *builder) markChildUses(call *ast.CallExpr, cancels []*cancelState) {
+func (b *builder) markChildUses(call *ast.CallExpr, target *ast.FuncLit, cancels []*cancelState) {
+	if len(cancels) == 0 {
+		return
+	}
 	used := objectsUsed(call, b.in.Info, false)
+	if target != nil && target != ast.Unparen(call.Fun) {
+		for obj := range objectsUsed(target, b.in.Info, false) {
+			used[obj] = struct{}{}
+		}
+	}
 	for _, c := range cancels {
 		if c.ctxObj != nil && hasObject(used, c.ctxObj) {
 			c.binding.UsedByChild = true
@@ -8741,9 +8790,12 @@ func (b *builder) computeOrdering(groups []*groupState, cancels []*cancelState, 
 	}
 }
 
-func (b *builder) buildGoroutine(site ast.Node, call *ast.CallExpr, callerContexts map[types.Object]string, kind string) model.Goroutine {
+func (b *builder) buildGoroutine(site ast.Node, call *ast.CallExpr, lit *ast.FuncLit, callerContexts map[types.Object]string, kind string) model.Goroutine {
 	siteSpan := b.span(site)
-	if lit, ok := call.Fun.(*ast.FuncLit); ok {
+	if lit == nil {
+		lit, _ = call.Fun.(*ast.FuncLit)
+	}
+	if lit != nil {
 		return b.analyzeLifecycleBody(lit.Body, callerContexts, kind, siteSpan)
 	}
 

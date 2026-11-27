@@ -23,10 +23,11 @@ func TestRecentFeatureCorpus(t *testing.T) {
 	var manifest struct {
 		SchemaVersion int `json:"schema_version"`
 		Cases         []struct {
-			Name      string   `json:"name"`
-			Rules     []string `json:"rules"`
-			Functions []string `json:"functions"`
-			HandedOff *int     `json:"handed_off"`
+			Name               string   `json:"name"`
+			Rules              []string `json:"rules"`
+			Functions          []string `json:"functions"`
+			HandedOff          *int     `json:"handed_off"`
+			UnsupportedTargets *int     `json:"unsupported_targets"`
 		} `json:"cases"`
 	}
 	if err := json.Unmarshal(data, &manifest); err != nil {
@@ -80,6 +81,9 @@ func TestRecentFeatureCorpus(t *testing.T) {
 			}
 			if tc.HandedOff != nil && bundle.Status.Unsupported.HandedOff != *tc.HandedOff {
 				t.Errorf("handed-off obligations=%d, want %d", bundle.Status.Unsupported.HandedOff, *tc.HandedOff)
+			}
+			if tc.UnsupportedTargets != nil && bundle.Status.Unsupported.Targets != *tc.UnsupportedTargets {
+				t.Errorf("unsupported targets=%d, want %d", bundle.Status.Unsupported.Targets, *tc.UnsupportedTargets)
 			}
 		})
 	}

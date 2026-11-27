@@ -48,7 +48,7 @@ def validate(result, expected):
     if result["incomplete"]:
         errors.append("incomplete analysis")
     if expected is not None:
-        for key in ("rules", "functions", "handed_off"):
+        for key in ("rules", "functions", "handed_off", "unsupported_targets"):
             if key in expected:
                 want = sorted(expected[key]) if isinstance(expected[key], list) else expected[key]
                 if result[key] != want:

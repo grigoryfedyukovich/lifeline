@@ -247,6 +247,18 @@
       "functions": [
         "Bad"
       ]
+    },
+    {
+      "name": "local_closure_goroutines",
+      "feature": "Goroutines launched through single-assignment local closures",
+      "source": "https://github.com/nats-io/nats-server/blob/ec0d7e315a2c2a5101d56b9a832bf2e6dd722b6b/server/jetstream_cluster.go#L1179",
+      "rules": [
+        "LL1002"
+      ],
+      "functions": [
+        "StartEndlessWorker"
+      ],
+      "unsupported_targets": 0
     }
   ]
 }

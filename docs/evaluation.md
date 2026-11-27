@@ -95,9 +95,10 @@ they include package loading, type checking, analysis, and report rendering.
 With only three samples, p95 is the maximum observed time, not a stable tail
 latency estimate.
 
-`examples/corpus.json` defines expectations for 27 added cases selected from
-Git history. `TestRecentFeatureCorpus` checks the same expectations through the
-standalone binary during ordinary integration tests. The additions cover:
+`examples/corpus.json` defines expectations for 28 added cases selected from
+Git history and the pinned real-repository benchmarks. `TestRecentFeatureCorpus`
+checks the same expectations through the standalone binary during ordinary
+integration tests. The additions cover:
 
 | Feature | History | Cases |
 |---|---|---|
@@ -106,6 +107,7 @@ standalone binary during ordinary integration tests. The additions cover:
 | Owner versus asynchronous helper joins | `892599f` | asynchronous / synchronous wait |
 | Captured closure cleanup | `6919920` | uninvoked / invoked |
 | Nested goroutine boundaries (review B1) | existing guard, expanded regression | inner loop / inner stop |
+| Local closure goroutine targets | [NATS Server v2.11.8](https://github.com/nats-io/nats-server/blob/ec0d7e315a2c2a5101d56b9a832bf2e6dd722b6b/server/jetstream_cluster.go#L1179) | finite closure launched twice / endless closure |
 | Promoted context fields | `da5a014` | late / early cancellation |
 | Stable pointer aliases | `efa4285` | late / early channel close |
 | Constant-index channel arrays | `b263883` | late / early channel close |

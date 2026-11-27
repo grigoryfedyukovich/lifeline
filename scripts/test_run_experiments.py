@@ -33,6 +33,10 @@ class ExperimentResultsTest(unittest.TestCase):
         self.assertEqual(validate(self.result(), {"rules": [], "handed_off": 1}), [])
         self.assertTrue(validate(self.result(), {"rules": [], "handed_off": 0}))
 
+    def test_unsupported_targets_checked_without_diagnostics(self):
+        self.assertEqual(validate(self.result(), {"rules": [], "unsupported_targets": 2}), [])
+        self.assertTrue(validate(self.result(), {"rules": [], "unsupported_targets": 0}))
+
     def test_incomplete_unlabeled_case_is_a_failure(self):
         result = self.result()
         result["incomplete"] = True

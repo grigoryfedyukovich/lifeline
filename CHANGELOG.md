@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Resolve goroutine launches through single-assignment local closures, including their captured context stop signals.
+
 ## 0.2.0 — 2026-11-14
 
 - Release hardening: establish a single checked release identity across source, current documentation, changelog, CLI output, and version-bearing golden output.

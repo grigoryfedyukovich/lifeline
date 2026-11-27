@@ -160,12 +160,13 @@ The **Expected** column lists results asserted by `tests/integration`. Examples 
 
 ## Recent-feature experiment corpus
 
-The 27 cases in [corpus.json](corpus.json) add paired warning/clean controls for
+The 28 cases in [corpus.json](corpus.json) add paired warning/clean controls for
 recent changes: local `var` cancellation, constant conditions, asynchronous
 joins, closure invocation, nested goroutines, richer stop-signal correlation,
-helper/wrapper join ordering, handoff status, and imported constructors.
-The manifest records the relevant commits and expected rules/status; ordinary
-integration tests enforce those expectations.
+helper/wrapper join ordering, handoff status, and imported constructors. The
+[local closure launch case](local_closure_goroutines/) pairs a finite worker
+started at two sites with an endless worker. The manifest records source
+provenance and expected rules/status, which integration tests enforce.
 
 Run `make experiments EXPERIMENT_OUT=/tmp/lifeline-experiments-current` for all
 examples plus `net/http`, or use `scripts/run_experiments.py --features-only`
